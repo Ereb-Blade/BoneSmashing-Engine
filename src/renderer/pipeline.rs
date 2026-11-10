@@ -1,4 +1,4 @@
-use crate::config::{DEPTH_FORMAT, MSAA_SAMPLES};
+use crate::config::DEPTH_FORMAT;
 use crate::renderer::mesh::{UvSetsVertex, Vertex};
 
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -873,6 +873,8 @@ pub struct RenderPipelineBundle {
     pub transparent_pipeline: wgpu::RenderPipeline,
     pub glass_pipeline: wgpu::RenderPipeline,
     pub skybox_pipeline: wgpu::RenderPipeline,
+    pub pipeline_layout: wgpu::PipelineLayout,
+    pub glass_pipeline_layout: wgpu::PipelineLayout,
     pub shadow_pipeline: wgpu::RenderPipeline,
     pub shared_bind_group_layout: wgpu::BindGroupLayout,
     pub shadow_bind_group_layout: wgpu::BindGroupLayout,
@@ -883,7 +885,14 @@ pub struct RenderPipelineBundle {
 }
 
 impl RenderPipelineBundle {
-    pub fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        surface_format: wgpu::TextureFormat,
+        sample_count: u32,
+    ) -> Self {
+        use crate::renderer::mesh::TangentVertex;
+        use crate::renderer::state::InstanceRaw;
+
         let shared_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("shared bgl"),
@@ -1208,64 +1217,14 @@ impl RenderPipelineBundle {
             push_constant_ranges: &[],
         });
 
-        // Импортируем InstanceRaw layout через супер-модуль state или определяем структуру
-        // Но проще передать макет или завязаться на state. Здесь используем супермодуль:
-        use crate::renderer::mesh::TangentVertex;
-        use crate::renderer::state::InstanceRaw;
-
-        let create_pipeline = |label, pipeline_layout, entry_point, blend, depth_write_enabled| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[
-                        Vertex::layout(),
-                        InstanceRaw::layout(),
-                        crate::renderer::mesh::SkinVertex::layout(),
-                        TangentVertex::layout(),
-                        UvSetsVertex::layout(),
-                    ],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(entry_point),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: HDR_FORMAT,
-                        blend,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled,
-                    depth_compare: wgpu::CompareFunction::Less,
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState {
-                    count: MSAA_SAMPLES,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview: None,
-                cache: None,
-            })
-        };
-        let pipeline = create_pipeline("opaque pipeline", &layout, "fs_main", None, true);
-        let transparent_pipeline = create_pipeline(
-            "transparent pipeline",
-            &layout,
-            "fs_main",
-            Some(wgpu::BlendState::ALPHA_BLENDING),
-            false,
-        );
-        let glass_pipeline =
-            create_pipeline("glass pipeline", &glass_layout, "fs_glass", None, false);
+        let (pipeline, transparent_pipeline, glass_pipeline, skybox_pipeline) =
+            Self::create_multisample_pipelines(
+                device,
+                &shader,
+                &layout,
+                &glass_layout,
+                sample_count,
+            );
         let postprocess_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("HDR tone mapping pipeline"),
             layout: Some(&postprocess_layout),
@@ -1288,41 +1247,6 @@ impl RenderPipelineBundle {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-        let skybox_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("environment background pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_skybox"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_skybox"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: HDR_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Always,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
             multiview: None,
             cache: None,
         });
@@ -1369,6 +1293,8 @@ impl RenderPipelineBundle {
             transparent_pipeline,
             glass_pipeline,
             skybox_pipeline,
+            pipeline_layout: layout,
+            glass_pipeline_layout: glass_layout,
             shadow_pipeline,
             shared_bind_group_layout,
             shadow_bind_group_layout,
@@ -1377,5 +1303,117 @@ impl RenderPipelineBundle {
             scene_color_bind_group_layout,
             postprocess_pipeline,
         }
+    }
+
+    pub fn create_multisample_pipelines(
+        device: &wgpu::Device,
+        shader: &wgpu::ShaderModule,
+        layout: &wgpu::PipelineLayout,
+        glass_layout: &wgpu::PipelineLayout,
+        sample_count: u32,
+    ) -> (
+        wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
+    ) {
+        use crate::renderer::mesh::TangentVertex;
+        use crate::renderer::state::InstanceRaw;
+
+        let create_pipeline = |label, pipeline_layout, entry_point, blend, depth_write_enabled| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[
+                        Vertex::layout(),
+                        InstanceRaw::layout(),
+                        crate::renderer::mesh::SkinVertex::layout(),
+                        TangentVertex::layout(),
+                        UvSetsVertex::layout(),
+                    ],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some(entry_point),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: HDR_FORMAT,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: sample_count,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview: None,
+                cache: None,
+            })
+        };
+        let pipeline = create_pipeline("opaque pipeline", layout, "fs_main", None, true);
+        let transparent_pipeline = create_pipeline(
+            "transparent pipeline",
+            layout,
+            "fs_main",
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+            false,
+        );
+        let glass_pipeline =
+            create_pipeline("glass pipeline", glass_layout, "fs_glass", None, false);
+        let skybox_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("environment background pipeline"),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_skybox"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fs_skybox"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
+        (
+            pipeline,
+            transparent_pipeline,
+            glass_pipeline,
+            skybox_pipeline,
+        )
     }
 }

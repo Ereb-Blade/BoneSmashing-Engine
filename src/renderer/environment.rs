@@ -1,5 +1,6 @@
 use half::f16;
 use std::path::Path;
+use std::sync::OnceLock;
 
 pub struct Environment {
     _texture: wgpu::Texture,
@@ -16,6 +17,91 @@ pub struct Environment {
 }
 
 impl Environment {
+    pub fn fallback(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        fn create_pixel_texture(
+            device: &wgpu::Device,
+            queue: &wgpu::Queue,
+            label: &str,
+            pixel: [u16; 4],
+        ) -> (wgpu::Texture, wgpu::TextureView) {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(&pixel),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(8),
+                    rows_per_image: Some(1),
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            (texture, view)
+        }
+
+        let neutral = [
+            f16::from_f32(0.12).to_bits(),
+            f16::from_f32(0.14).to_bits(),
+            f16::from_f32(0.18).to_bits(),
+            f16::ONE.to_bits(),
+        ];
+        let (texture, view) = create_pixel_texture(device, queue, "Fallback environment", neutral);
+        let (prefiltered_texture, prefiltered_view) =
+            create_pixel_texture(device, queue, "Fallback specular environment", neutral);
+        let (diffuse_texture, diffuse_view) =
+            create_pixel_texture(device, queue, "Fallback diffuse environment", neutral);
+        let (brdf_lut_texture, brdf_lut_view) = create_pixel_texture(
+            device,
+            queue,
+            "Fallback BRDF LUT",
+            [f16::ONE.to_bits(), 0, 0, f16::ONE.to_bits()],
+        );
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("HDR environment sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        Self {
+            _texture: texture,
+            view,
+            _prefiltered_texture: prefiltered_texture,
+            prefiltered_view,
+            _diffuse_texture: diffuse_texture,
+            diffuse_view,
+            _brdf_lut_texture: brdf_lut_texture,
+            brdf_lut_view,
+            sampler,
+            label: "Loading environment...".to_owned(),
+            mip_count: 1,
+        }
+    }
+
     pub fn studio(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
         let (width, height) = (512, 256);
         let mut pixels = Vec::with_capacity((width * height * 3) as usize);
@@ -479,18 +565,25 @@ fn create_brdf_lut(
 ) -> (wgpu::Texture, wgpu::TextureView) {
     const SIZE: u32 = 128;
     const SAMPLE_COUNT: u32 = 128;
-    let mut pixels = vec![0.0; (SIZE * SIZE * 4) as usize];
-    for y in 0..SIZE {
-        let roughness = (y as f32 + 0.5) / SIZE as f32;
-        for x in 0..SIZE {
-            let n_dot_v = ((x as f32 + 0.5) / SIZE as f32).max(0.001);
-            let (scale, bias) = integrate_brdf(n_dot_v, roughness, SAMPLE_COUNT);
-            let index = ((y * SIZE + x) * 4) as usize;
-            pixels[index] = scale;
-            pixels[index + 1] = bias;
-            pixels[index + 3] = 1.0;
+    static BRDF_LUT_PIXELS: OnceLock<Vec<u16>> = OnceLock::new();
+    let half_pixels = BRDF_LUT_PIXELS.get_or_init(|| {
+        let mut pixels = vec![0.0; (SIZE * SIZE * 4) as usize];
+        for y in 0..SIZE {
+            let roughness = (y as f32 + 0.5) / SIZE as f32;
+            for x in 0..SIZE {
+                let n_dot_v = ((x as f32 + 0.5) / SIZE as f32).max(0.001);
+                let (scale, bias) = integrate_brdf(n_dot_v, roughness, SAMPLE_COUNT);
+                let index = ((y * SIZE + x) * 4) as usize;
+                pixels[index] = scale;
+                pixels[index + 1] = bias;
+                pixels[index + 3] = 1.0;
+            }
         }
-    }
+        pixels
+            .iter()
+            .map(|value| f16::from_f32(*value).to_bits())
+            .collect()
+    });
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("GGX BRDF integration LUT"),
         size: wgpu::Extent3d {
@@ -505,10 +598,6 @@ fn create_brdf_lut(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    let half_pixels: Vec<u16> = pixels
-        .iter()
-        .map(|value| f16::from_f32(*value).to_bits())
-        .collect();
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture: &texture,
@@ -516,7 +605,7 @@ fn create_brdf_lut(
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        bytemuck::cast_slice(&half_pixels),
+        bytemuck::cast_slice(half_pixels),
         wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(SIZE * 8),

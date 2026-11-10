@@ -214,6 +214,15 @@ impl DebugUi {
         renderer: &mut Renderer,
         world: &mut World,
     ) {
+        if let Some(result) = renderer.poll_environment_load() {
+            match result {
+                Ok(Some(_)) => {
+                    self.status = Some(Ok("HDR environment loaded".to_owned()));
+                }
+                Ok(None) => {}
+                Err(error) => self.status = Some(Err(error)),
+            }
+        }
         let mut settings = renderer.settings();
         let material_count = renderer.material_count();
         self.selected_material = self.selected_material.min(material_count.saturating_sub(1));
@@ -660,6 +669,26 @@ impl DebugUi {
                                 .step_by(0.05)
                                 .text("Render resolution scale"),
                         );
+                        egui::ComboBox::from_label("Anti-aliasing (MSAA)")
+                            .selected_text(if settings.msaa_samples == 1 {
+                                "Off".to_owned()
+                            } else {
+                                format!("{}x", settings.msaa_samples)
+                            })
+                            .show_ui(ui, |ui| {
+                                for &sample_count in renderer.supported_msaa_samples() {
+                                    let label = if sample_count == 1 {
+                                        "Off".to_owned()
+                                    } else {
+                                        format!("{sample_count}x")
+                                    };
+                                    ui.selectable_value(
+                                        &mut settings.msaa_samples,
+                                        sample_count,
+                                        label,
+                                    );
+                                }
+                            });
                         if ui.button("Reset lighting").clicked() {
                             let defaults = crate::renderer::state::RendererSettings::default();
                             settings.key_light_yaw_degrees = defaults.key_light_yaw_degrees;
@@ -672,6 +701,12 @@ impl DebugUi {
                             settings.shadows_enabled = defaults.shadows_enabled;
                             settings.debug_view = defaults.debug_view;
                             settings.render_scale = defaults.render_scale;
+                            if renderer
+                                .supported_msaa_samples()
+                                .contains(&defaults.msaa_samples)
+                            {
+                                settings.msaa_samples = defaults.msaa_samples;
+                            }
                         }
                         egui::ComboBox::from_label("Debug view")
                             .selected_text(
@@ -717,7 +752,8 @@ impl DebugUi {
                         ui.horizontal(|ui| {
                             if ui
                                 .add_enabled(
-                                    self.environment_dialog.is_none(),
+                                    self.environment_dialog.is_none()
+                                        && !renderer.environment_is_loading(),
                                     egui::Button::new("Browse..."),
                                 )
                                 .clicked()
@@ -725,11 +761,20 @@ impl DebugUi {
                                 pick_environment = true;
                             }
                             ui.text_edit_singleline(&mut self.environment_path);
-                            if ui.button("Load .hdr").clicked() {
+                            if ui
+                                .add_enabled(
+                                    !renderer.environment_is_loading(),
+                                    egui::Button::new("Load .hdr"),
+                                )
+                                .clicked()
+                            {
                                 load_environment = true;
                             }
                         });
-                        if self.environment_dialog.is_some() {
+                        if renderer.environment_is_loading() {
+                            ui.spinner();
+                            ui.label("Preparing HDR environment...");
+                        } else if self.environment_dialog.is_some() {
                             ui.label("Waiting for file selection...");
                         }
                         ui.label("Equirectangular .hdr / .exr environment (2:1)");
@@ -849,8 +894,10 @@ impl DebugUi {
             renderer.set_material_params(self.selected_material, selected_params);
         }
         if load_environment && !self.environment_path.trim().is_empty() {
-            match renderer.load_environment(Path::new(self.environment_path.trim())) {
-                Ok(()) => self.status = Some(Ok("HDR environment loaded".to_owned())),
+            match renderer
+                .begin_environment_load(Path::new(self.environment_path.trim()).to_path_buf())
+            {
+                Ok(()) => self.status = Some(Ok("Loading HDR environment...".to_owned())),
                 Err(error) => self.status = Some(Err(error)),
             }
         }

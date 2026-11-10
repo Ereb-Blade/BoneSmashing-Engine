@@ -1,13 +1,13 @@
 use glam::{Mat4, Vec3};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, mpsc};
 use std::time::Instant;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 use crate::camera::{Camera, CameraUniform};
-use crate::config::{DEPTH_FORMAT, MSAA_SAMPLES};
+use crate::config::DEPTH_FORMAT;
 use crate::core::{MaterialId, MeshId};
 use crate::renderer::gltf::{GltfModelData, LoadedGltfModel};
 use crate::renderer::material::{Material, MaterialParams};
@@ -67,6 +67,34 @@ fn persisted_environment_path() -> Option<std::path::PathBuf> {
         .map(|path| path.join("MyEngine").join("environment.txt"))
 }
 
+fn supported_msaa_sample_counts(adapter: &wgpu::Adapter) -> Vec<u32> {
+    let hdr_flags = adapter.get_texture_format_features(HDR_FORMAT).flags;
+    let depth_flags = adapter.get_texture_format_features(DEPTH_FORMAT).flags;
+    supported_msaa_sample_counts_for_flags(hdr_flags, depth_flags)
+}
+
+fn supported_msaa_sample_counts_for_flags(
+    hdr_flags: wgpu::TextureFormatFeatureFlags,
+    depth_flags: wgpu::TextureFormatFeatureFlags,
+) -> Vec<u32> {
+    [1, 2, 4, 8]
+        .into_iter()
+        .filter(|&count| {
+            count == 1
+                || (hdr_flags.sample_count_supported(count)
+                    && hdr_flags.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_RESOLVE)
+                    && depth_flags.sample_count_supported(count))
+        })
+        .collect()
+}
+
+fn default_msaa_sample_count(supported: &[u32]) -> u32 {
+    [4, 2, 1]
+        .into_iter()
+        .find(|count| supported.contains(count))
+        .unwrap_or(1)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RendererSettings {
     pub key_light_yaw_degrees: f32,
@@ -79,6 +107,7 @@ pub struct RendererSettings {
     pub debug_view: u32,
     pub unlocked_fps: bool,
     pub render_scale: f32,
+    pub msaa_samples: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -102,6 +131,7 @@ impl Default for RendererSettings {
             debug_view: 0,
             unlocked_fps: false,
             render_scale: 1.0,
+            msaa_samples: 4,
         }
     }
 }
@@ -161,7 +191,12 @@ impl InstanceRaw {
     }
 }
 
-fn create_depth_view(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
+fn create_depth_view(
+    device: &wgpu::Device,
+    w: u32,
+    h: u32,
+    sample_count: u32,
+) -> wgpu::TextureView {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth"),
         size: wgpu::Extent3d {
@@ -170,7 +205,7 @@ fn create_depth_view(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
-        sample_count: MSAA_SAMPLES,
+        sample_count,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -184,6 +219,7 @@ fn create_scene_color_texture(
     w: u32,
     h: u32,
     format: wgpu::TextureFormat,
+    copy_usage: wgpu::TextureUsages,
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("opaque scene color"),
@@ -196,7 +232,9 @@ fn create_scene_color_texture(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | copy_usage,
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -238,7 +276,11 @@ fn create_msaa_color_view(
     w: u32,
     h: u32,
     format: wgpu::TextureFormat,
-) -> wgpu::TextureView {
+    sample_count: u32,
+) -> Option<wgpu::TextureView> {
+    if sample_count == 1 {
+        return None;
+    }
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("msaa_color"),
         size: wgpu::Extent3d {
@@ -247,13 +289,13 @@ fn create_msaa_color_view(
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
-        sample_count: MSAA_SAMPLES,
+        sample_count,
         dimension: wgpu::TextureDimension::D2,
         format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
-    tex.create_view(&Default::default())
+    Some(tex.create_view(&Default::default()))
 }
 
 fn create_shared_bind_group(
@@ -368,6 +410,8 @@ pub struct Renderer {
     skybox_pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     postprocess_pipeline: wgpu::RenderPipeline,
+    pipeline_layout: wgpu::PipelineLayout,
+    glass_pipeline_layout: wgpu::PipelineLayout,
     texture_bind_group_layout: wgpu::BindGroupLayout,
     shared_bind_group_layout: wgpu::BindGroupLayout,
     shadow_bind_group_layout: wgpu::BindGroupLayout,
@@ -397,8 +441,9 @@ pub struct Renderer {
     environment_bind_group_layout: wgpu::BindGroupLayout,
     scene_color_bind_group_layout: wgpu::BindGroupLayout,
     settings: RendererSettings,
+    supported_msaa_samples: Vec<u32>,
     depth_view: wgpu::TextureView,
-    msaa_view: wgpu::TextureView,
+    msaa_view: Option<wgpu::TextureView>,
     missing_mesh_warnings: HashSet<MeshId>,
     missing_material_warnings: HashSet<MaterialId>,
     batches: HashMap<(MeshId, MaterialId), Vec<InstanceRaw>>,
@@ -412,6 +457,7 @@ pub struct Renderer {
     cached_shadow_matrix: Mat4,
     shadow_cache_valid: bool,
     timings: RenderTimings,
+    environment_load: Option<mpsc::Receiver<(Option<PathBuf>, Result<Environment, String>)>>,
 }
 
 fn create_environment_bind_group(
@@ -462,10 +508,21 @@ impl Renderer {
             .await
             .expect("нет подходящего GPU-адаптера");
 
+        let mut device_descriptor = wgpu::DeviceDescriptor::default();
+        let adapter_features = adapter.features();
+        if adapter_features.contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES) {
+            device_descriptor.required_features |=
+                wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+        }
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&device_descriptor)
             .await
             .expect("не удалось создать device");
+        let supported_msaa_samples = supported_msaa_sample_counts(&adapter);
+        let mut settings = RendererSettings::default();
+        if !supported_msaa_samples.contains(&settings.msaa_samples) {
+            settings.msaa_samples = default_msaa_sample_count(&supported_msaa_samples);
+        }
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -487,12 +544,29 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let depth_view = create_depth_view(&device, config.width, config.height);
-        let msaa_view = create_msaa_color_view(&device, config.width, config.height, HDR_FORMAT);
-        let (scene_color_texture, scene_color_view) =
-            create_scene_color_texture(&device, config.width, config.height, HDR_FORMAT);
-        let (hdr_output_texture, hdr_output_view) =
-            create_scene_color_texture(&device, config.width, config.height, HDR_FORMAT);
+        let depth_view =
+            create_depth_view(&device, config.width, config.height, settings.msaa_samples);
+        let msaa_view = create_msaa_color_view(
+            &device,
+            config.width,
+            config.height,
+            HDR_FORMAT,
+            settings.msaa_samples,
+        );
+        let (scene_color_texture, scene_color_view) = create_scene_color_texture(
+            &device,
+            config.width,
+            config.height,
+            HDR_FORMAT,
+            wgpu::TextureUsages::COPY_SRC,
+        );
+        let (hdr_output_texture, hdr_output_view) = create_scene_color_texture(
+            &device,
+            config.width,
+            config.height,
+            HDR_FORMAT,
+            wgpu::TextureUsages::COPY_DST,
+        );
 
         let camera_uniform = CameraUniform::new();
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -501,7 +575,6 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let settings = RendererSettings::default();
         let key_direction = settings.key_light_direction();
         let light_uniform = LightUniform {
             direction_intensity: [
@@ -523,26 +596,8 @@ impl Renderer {
         });
 
         // Создаем пайплайн и бинд-групп лейауты через модуль pipeline
-        let pipeline_bundle = RenderPipelineBundle::new(&device, format);
-        let mut environment = Environment::studio(&device, &queue);
-        if let Some(path) = persisted_environment_path() {
-            if let Ok(saved_path) = std::fs::read_to_string(&path) {
-                let saved_path = Path::new(saved_path.trim());
-                if saved_path.is_file() {
-                    match Environment::load(
-                        &device,
-                        &queue,
-                        saved_path,
-                        device.limits().max_texture_dimension_2d,
-                    ) {
-                        Ok(saved_environment) => environment = saved_environment,
-                        Err(error) => {
-                            eprintln!("Could not restore saved HDR environment: {error}")
-                        }
-                    }
-                }
-            }
-        }
+        let pipeline_bundle = RenderPipelineBundle::new(&device, format, settings.msaa_samples);
+        let environment = Environment::fallback(&device, &queue);
         let environment_bind_group = create_environment_bind_group(
             &device,
             &pipeline_bundle.environment_bind_group_layout,
@@ -711,7 +766,7 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
-        Self {
+        let mut renderer = Self {
             surface,
             device,
             queue,
@@ -720,6 +775,8 @@ impl Renderer {
             transparent_pipeline: pipeline_bundle.transparent_pipeline,
             glass_pipeline: pipeline_bundle.glass_pipeline,
             skybox_pipeline: pipeline_bundle.skybox_pipeline,
+            pipeline_layout: pipeline_bundle.pipeline_layout,
+            glass_pipeline_layout: pipeline_bundle.glass_pipeline_layout,
             shadow_pipeline: pipeline_bundle.shadow_pipeline,
             postprocess_pipeline: pipeline_bundle.postprocess_pipeline,
             texture_bind_group_layout: pipeline_bundle.texture_bind_group_layout,
@@ -743,6 +800,7 @@ impl Renderer {
             environment_bind_group_layout: pipeline_bundle.environment_bind_group_layout,
             scene_color_bind_group_layout: pipeline_bundle.scene_color_bind_group_layout,
             settings,
+            supported_msaa_samples,
             depth_view,
             msaa_view,
             _scene_color_texture: scene_color_texture,
@@ -766,7 +824,10 @@ impl Renderer {
             cached_shadow_matrix: Mat4::IDENTITY,
             shadow_cache_valid: false,
             timings: RenderTimings::default(),
-        }
+            environment_load: None,
+        };
+        renderer.start_initial_environment_load();
+        renderer
     }
 
     pub fn resize(&mut self, w: u32, h: u32) {
@@ -782,17 +843,26 @@ impl Renderer {
     fn resize_render_targets(&mut self) {
         let w = scaled_render_dimension(self.config.width, self.settings.render_scale);
         let h = scaled_render_dimension(self.config.height, self.settings.render_scale);
-        self.depth_view = create_depth_view(&self.device, w, h);
-        self.msaa_view = create_msaa_color_view(&self.device, w, h, HDR_FORMAT);
-        let (scene_color_texture, scene_color_view) =
-            create_scene_color_texture(&self.device, w, h, HDR_FORMAT);
+        self.resize_msaa_targets(w, h);
+        let (scene_color_texture, scene_color_view) = create_scene_color_texture(
+            &self.device,
+            w,
+            h,
+            HDR_FORMAT,
+            wgpu::TextureUsages::COPY_SRC,
+        );
         let (scene_color_sampler, scene_color_bind_group) = create_scene_color_bind_group(
             &self.device,
             &self.scene_color_bind_group_layout,
             &scene_color_view,
         );
-        let (hdr_output_texture, hdr_output_view) =
-            create_scene_color_texture(&self.device, w, h, HDR_FORMAT);
+        let (hdr_output_texture, hdr_output_view) = create_scene_color_texture(
+            &self.device,
+            w,
+            h,
+            HDR_FORMAT,
+            wgpu::TextureUsages::COPY_DST,
+        );
         let (postprocess_sampler, postprocess_bind_group) = create_scene_color_bind_group(
             &self.device,
             &self.scene_color_bind_group_layout,
@@ -806,6 +876,12 @@ impl Renderer {
         self.hdr_output_view = hdr_output_view;
         self._postprocess_sampler = postprocess_sampler;
         self.postprocess_bind_group = postprocess_bind_group;
+    }
+
+    fn resize_msaa_targets(&mut self, w: u32, h: u32) {
+        self.depth_view = create_depth_view(&self.device, w, h, self.settings.msaa_samples);
+        self.msaa_view =
+            create_msaa_color_view(&self.device, w, h, HDR_FORMAT, self.settings.msaa_samples);
     }
 
     pub fn surface_format(&self) -> wgpu::TextureFormat {
@@ -823,7 +899,11 @@ impl Renderer {
         } else {
             self.settings.render_scale
         };
+        if !self.supported_msaa_samples.contains(&settings.msaa_samples) {
+            settings.msaa_samples = self.settings.msaa_samples;
+        }
         let render_scale_changed = self.settings.render_scale != settings.render_scale;
+        let msaa_samples_changed = self.settings.msaa_samples != settings.msaa_samples;
         if self.settings.unlocked_fps != settings.unlocked_fps {
             self.config.present_mode = if settings.unlocked_fps {
                 wgpu::PresentMode::AutoNoVsync
@@ -835,7 +915,33 @@ impl Renderer {
         self.settings = settings;
         if render_scale_changed {
             self.resize_render_targets();
+        } else if msaa_samples_changed {
+            let shader = self
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("shader"),
+                    source: wgpu::ShaderSource::Wgsl(crate::renderer::pipeline::SHADER.into()),
+                });
+            let (pipeline, transparent_pipeline, glass_pipeline, skybox_pipeline) =
+                RenderPipelineBundle::create_multisample_pipelines(
+                    &self.device,
+                    &shader,
+                    &self.pipeline_layout,
+                    &self.glass_pipeline_layout,
+                    settings.msaa_samples,
+                );
+            self.pipeline = pipeline;
+            self.transparent_pipeline = transparent_pipeline;
+            self.glass_pipeline = glass_pipeline;
+            self.skybox_pipeline = skybox_pipeline;
+            let w = scaled_render_dimension(self.config.width, settings.render_scale);
+            let h = scaled_render_dimension(self.config.height, settings.render_scale);
+            self.resize_msaa_targets(w, h);
         }
+    }
+
+    pub fn supported_msaa_samples(&self) -> &[u32] {
+        &self.supported_msaa_samples
     }
 
     pub fn material_count(&self) -> usize {
@@ -940,6 +1046,127 @@ impl Renderer {
         self.environment.mip_count
     }
 
+    pub fn environment_is_loading(&self) -> bool {
+        self.environment_load.is_some()
+    }
+
+    pub fn begin_environment_load(&mut self, path: PathBuf) -> Result<(), String> {
+        if self.environment_load.is_some() {
+            return Err("An HDR environment is already loading".to_owned());
+        }
+
+        let worker_path = path.clone();
+        self.start_environment_task(Some(path), move |device, queue| {
+            Environment::load(
+                device,
+                queue,
+                &worker_path,
+                device.limits().max_texture_dimension_2d,
+            )
+        })
+    }
+
+    fn start_initial_environment_load(&mut self) {
+        let result = self.start_environment_task(None, move |device, queue| {
+            if let Some(settings_path) = persisted_environment_path() {
+                match std::fs::read_to_string(&settings_path) {
+                    Ok(saved_path) => {
+                        let saved_path = PathBuf::from(saved_path.trim());
+                        if saved_path.is_file() {
+                            match Environment::load(
+                                device,
+                                queue,
+                                &saved_path,
+                                device.limits().max_texture_dimension_2d,
+                            ) {
+                                Ok(environment) => return Ok(environment),
+                                Err(error) => {
+                                    eprintln!("Could not restore saved HDR environment: {error}");
+                                }
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        eprintln!(
+                            "Could not read saved HDR environment path {}: {error}",
+                            settings_path.display()
+                        );
+                    }
+                }
+            }
+            Ok(Environment::studio(device, queue))
+        });
+        if let Err(error) = result {
+            eprintln!("Could not start initial environment loader: {error}");
+        }
+    }
+
+    fn start_environment_task(
+        &mut self,
+        path: Option<PathBuf>,
+        load: impl FnOnce(&wgpu::Device, &wgpu::Queue) -> Result<Environment, String> + Send + 'static,
+    ) -> Result<(), String> {
+        if self.environment_load.is_some() {
+            return Err("An HDR environment is already loading".to_owned());
+        }
+        let device = self.device.clone();
+        let queue = self.queue.clone();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("hdr-environment-loader".to_owned())
+            .spawn(move || {
+                let result = load(&device, &queue);
+                let _ = sender.send((path, result));
+            })
+            .map_err(|error| format!("Could not start HDR environment loader: {error}"))?;
+        self.environment_load = Some(receiver);
+        Ok(())
+    }
+
+    pub fn poll_environment_load(&mut self) -> Option<Result<Option<PathBuf>, String>> {
+        let result = match self.environment_load.as_ref()?.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.environment_load = None;
+                return Some(Err("HDR environment loader stopped unexpectedly".to_owned()));
+            }
+        };
+        self.environment_load = None;
+
+        let (path, environment) = match result {
+            (path, Ok(environment)) => (path, environment),
+            (_, Err(error)) => return Some(Err(error)),
+        };
+        let bind_group = create_environment_bind_group(
+            &self.device,
+            &self.environment_bind_group_layout,
+            &environment,
+        );
+        self.environment = environment;
+        self.environment_bind_group = bind_group;
+        if let Some(path) = path {
+            if let Some(settings_path) = persisted_environment_path() {
+                let result = settings_path
+                    .parent()
+                    .map(std::fs::create_dir_all)
+                    .transpose()
+                    .and_then(|_| {
+                        std::fs::write(&settings_path, path.to_string_lossy().as_bytes())
+                    });
+                if let Err(error) = result {
+                    eprintln!(
+                        "HDR environment loaded but its path could not be saved to {}: {error}",
+                        settings_path.display()
+                    );
+                }
+            }
+            return Some(Ok(Some(path)));
+        }
+        Some(Ok(None))
+    }
+
     pub fn use_studio_environment(&mut self) -> Result<(), String> {
         if let Some(settings_path) = persisted_environment_path() {
             match std::fs::remove_file(&settings_path) {
@@ -961,36 +1188,6 @@ impl Renderer {
         );
         self.environment = environment;
         self.environment_bind_group = bind_group;
-        Ok(())
-    }
-
-    pub fn load_environment(&mut self, path: &Path) -> Result<(), String> {
-        let environment = Environment::load(
-            &self.device,
-            &self.queue,
-            path,
-            self.device.limits().max_texture_dimension_2d,
-        )?;
-        let bind_group = create_environment_bind_group(
-            &self.device,
-            &self.environment_bind_group_layout,
-            &environment,
-        );
-        self.environment = environment;
-        self.environment_bind_group = bind_group;
-        if let Some(settings_path) = persisted_environment_path() {
-            let result = settings_path
-                .parent()
-                .map(std::fs::create_dir_all)
-                .transpose()
-                .and_then(|_| std::fs::write(&settings_path, path.to_string_lossy().as_bytes()));
-            if let Err(error) = result {
-                eprintln!(
-                    "HDR environment loaded but its path could not be saved to {}: {error}",
-                    settings_path.display()
-                );
-            }
-        }
         Ok(())
     }
 
@@ -1602,12 +1799,23 @@ impl Renderer {
             self.shadow_cache_valid = true;
         }
 
+        let multisampled = self.settings.msaa_samples > 1;
         {
+            let (color_view, resolve_target) = if multisampled {
+                (
+                    self.msaa_view
+                        .as_ref()
+                        .expect("MSAA color target exists for multisampled rendering"),
+                    Some(&self.scene_color_view),
+                )
+            } else {
+                (&self.scene_color_view, None)
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("opaque scene pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.msaa_view,
-                    resolve_target: Some(&self.scene_color_view),
+                    view: color_view,
+                    resolve_target,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.05,
@@ -1678,12 +1886,44 @@ impl Renderer {
             }
         }
 
+        if !multisampled {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self._scene_color_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self._hdr_output_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: scaled_render_dimension(self.config.width, self.settings.render_scale),
+                    height: scaled_render_dimension(self.config.height, self.settings.render_scale),
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
         {
+            let (color_view, resolve_target) = if multisampled {
+                (
+                    self.msaa_view
+                        .as_ref()
+                        .expect("MSAA color target exists for multisampled rendering"),
+                    Some(&self.hdr_output_view),
+                )
+            } else {
+                (&self.hdr_output_view, None)
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("transparent scene pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.msaa_view,
-                    resolve_target: Some(&self.hdr_output_view),
+                    view: color_view,
+                    resolve_target,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
@@ -1795,6 +2035,35 @@ mod tests {
         assert_eq!(scaled_render_dimension(1680, 1.0), 1680);
         assert_eq!(scaled_render_dimension(1680, 0.75), 1260);
         assert_eq!(scaled_render_dimension(1, 0.5), 1);
+    }
+
+    #[test]
+    fn msaa_modes_require_color_resolve_and_depth_support() {
+        let hdr_flags = wgpu::TextureFormatFeatureFlags::MULTISAMPLE_RESOLVE
+            | wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X2
+            | wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X4;
+        let depth_flags = wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X2
+            | wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X4
+            | wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X8;
+
+        assert_eq!(
+            supported_msaa_sample_counts_for_flags(hdr_flags, depth_flags),
+            [1, 2, 4]
+        );
+        assert_eq!(
+            supported_msaa_sample_counts_for_flags(
+                wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X4,
+                depth_flags,
+            ),
+            [1]
+        );
+    }
+
+    #[test]
+    fn default_msaa_prefers_four_samples_and_never_exceeds_it() {
+        assert_eq!(default_msaa_sample_count(&[1, 2, 4, 8]), 4);
+        assert_eq!(default_msaa_sample_count(&[1, 2]), 2);
+        assert_eq!(default_msaa_sample_count(&[1]), 1);
     }
 
     #[test]

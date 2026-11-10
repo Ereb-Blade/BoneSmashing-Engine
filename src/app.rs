@@ -20,7 +20,7 @@ use crate::input::Input;
 use crate::renderer::debug_ui::DebugUi;
 use crate::renderer::gltf::{GltfPrimitiveInstance, LoadedGltfModel};
 use crate::renderer::state::{LoadedAsset, ParsedAsset, Renderer};
-use crate::scene::{ObjectId, RenderObject, Transform, World};
+use crate::scene::{ObjectId, RenderObject, SceneFile, Transform, World, build_world};
 
 pub struct App {
     window: Option<Arc<Window>>,
@@ -94,28 +94,121 @@ impl App {
         match renderer.load_parsed_asset(parsed, path)? {
             LoadedAsset::Gltf(model) => {
                 let count = model.instances.len();
-                for instance in &model.instances {
-                    world.add_object(
-                        RenderObject::new(
-                            Transform::from_translation(position),
-                            instance.mesh_id,
-                            instance.material_id,
+                let name = path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("Model");
+                let group = world.add_model_group(
+                    name,
+                    path.to_path_buf(),
+                    Transform::from_translation(position),
+                );
+                for (instance_index, instance) in model.instances.iter().enumerate() {
+                    world
+                        .add_group_object(
+                            group,
+                            RenderObject::new(
+                                Transform::default(),
+                                instance.mesh_id,
+                                instance.material_id,
+                            )
+                            .with_name(instance.name.clone())
+                            .with_local_matrix(instance.node_transform)
+                            .with_skin_matrices(instance.skin_matrices.clone())
+                            .with_asset_source(path.to_path_buf(), instance_index),
                         )
-                        .with_local_matrix(instance.node_transform)
-                        .with_skin_matrices(instance.skin_matrices.clone()),
-                    );
+                        .ok_or_else(|| {
+                            format!("Could not create model group for {}", path.display())
+                        })?;
                 }
                 Ok(format!("Imported {count} model parts"))
             }
             LoadedAsset::Obj(mesh_id) => {
-                world.add_object(RenderObject::new(
+                let group = world.add_model_group(
+                    path.file_stem()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("Model"),
+                    path.to_path_buf(),
                     Transform::from_translation(position),
-                    mesh_id,
-                    MATERIAL_DEFAULT,
-                ));
+                );
+                world
+                    .add_group_object(
+                        group,
+                        RenderObject::new(Transform::default(), mesh_id, MATERIAL_DEFAULT)
+                            .with_name(
+                                path.file_stem()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("Model"),
+                            )
+                            .with_asset_source(path.to_path_buf(), 0),
+                    )
+                    .ok_or_else(|| {
+                        format!("Could not create model group for {}", path.display())
+                    })?;
                 Ok("Imported OBJ model".to_owned())
             }
         }
+    }
+
+    fn restore_scene(
+        renderer: &mut Renderer,
+        loaded: crate::scene::LoadedScene,
+    ) -> Result<World, String> {
+        let original_mesh_count = renderer.meshes.len();
+        let original_material_count = renderer.materials.len();
+        let result = (|| {
+            let mut asset_instances = std::collections::HashMap::with_capacity(loaded.assets.len());
+            for (path, parsed) in loaded.assets {
+                let instances = match renderer.load_parsed_asset(parsed, &path)? {
+                    LoadedAsset::Gltf(model) => model
+                        .instances
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, instance)| {
+                            RenderObject::new(
+                                Transform::default(),
+                                instance.mesh_id,
+                                instance.material_id,
+                            )
+                            .with_name(instance.name)
+                            .with_local_matrix(instance.node_transform)
+                            .with_skin_matrices(instance.skin_matrices)
+                            .with_asset_source(path.clone(), index)
+                        })
+                        .collect(),
+                    LoadedAsset::Obj(mesh_id) => vec![
+                        RenderObject::new(
+                            Transform::default(),
+                            mesh_id,
+                            crate::core::MATERIAL_DEFAULT,
+                        )
+                        .with_name(
+                            path.file_stem()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("Model"),
+                        )
+                        .with_asset_source(path.clone(), 0),
+                    ],
+                };
+                asset_instances.insert(path, instances);
+            }
+            let mut world = build_world(
+                &loaded.file,
+                crate::core::MESH_SPHERE.0 + 1,
+                crate::core::MATERIAL_GLASS.0 + 1,
+                asset_instances,
+            )?;
+            renderer.retain_scene_assets(
+                world.objects_mut(),
+                crate::core::MESH_SPHERE.0 + 1,
+                crate::core::MATERIAL_GLASS.0 + 1,
+            )?;
+            Ok(world)
+        })();
+        if result.is_err() {
+            renderer.discard_assets_after(original_mesh_count, original_material_count);
+        }
+        result
     }
 }
 
@@ -205,21 +298,34 @@ impl ApplicationHandler for App {
                 if let Some(renderer) = self.renderer.as_mut() {
                     match renderer.load_gltf(&sample_model) {
                         Ok(model) => {
-                            for instance in &model.instances {
-                                let id = self.world.add_object(
+                            let group = self.world.add_model_group(
+                                sample_model
+                                    .file_stem()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("Model"),
+                                sample_model.clone(),
+                                Transform::new(
+                                    Vec3::new(0.0, 1.5, -4.0),
+                                    Quat::IDENTITY,
+                                    Vec3::splat(0.75),
+                                ),
+                            );
+                            for (instance_index, instance) in model.instances.iter().enumerate() {
+                                let id = self.world.add_group_object(
+                                    group,
                                     RenderObject::new(
-                                        Transform::new(
-                                            Vec3::new(0.0, 1.5, -4.0),
-                                            Quat::IDENTITY,
-                                            Vec3::splat(0.75),
-                                        ),
+                                        Transform::default(),
                                         instance.mesh_id,
                                         instance.material_id,
                                     )
+                                    .with_name(instance.name.clone())
                                     .with_local_matrix(instance.node_transform)
-                                    .with_skin_matrices(instance.skin_matrices.clone()),
+                                    .with_skin_matrices(instance.skin_matrices.clone())
+                                    .with_asset_source(sample_model.clone(), instance_index),
                                 );
-                                self.animated_object_ids.push(id);
+                                if let Some(id) = id {
+                                    self.animated_object_ids.push(id);
+                                }
                             }
                             if let Some(animation) = model.animations.first() {
                                 eprintln!(
@@ -238,15 +344,21 @@ impl ApplicationHandler for App {
                         .join("sample.obj");
                     match renderer.load_obj(&obj_model) {
                         Ok(mesh_id) => {
-                            self.world.add_object(RenderObject::new(
+                            let group = self.world.add_model_group(
+                                "sample",
+                                obj_model.clone(),
                                 Transform::new(
                                     Vec3::new(4.0, 0.0, -4.0),
                                     Quat::IDENTITY,
                                     Vec3::splat(0.6),
                                 ),
-                                mesh_id,
-                                MATERIAL_DEFAULT,
-                            ));
+                            );
+                            self.world.add_group_object(
+                                group,
+                                RenderObject::new(Transform::default(), mesh_id, MATERIAL_DEFAULT)
+                                    .with_name("sample")
+                                    .with_asset_source(obj_model, 0),
+                            );
                         }
                         Err(error) => eprintln!("Не удалось загрузить OBJ-модель: {error}"),
                     }
@@ -381,6 +493,26 @@ impl ApplicationHandler for App {
                 }
 
                 if let Some(debug_ui) = self.debug_ui.as_mut() {
+                    if let Some(path) = debug_ui.take_scene_save_request() {
+                        let result = SceneFile::from_world(&self.world, &path)
+                            .and_then(|scene| scene.write(&path))
+                            .map(|()| format!("Saved scene to {}", path.display()));
+                        debug_ui.set_scene_status(result);
+                    }
+                    if let Some(loaded) = debug_ui.take_scene_load_request() {
+                        match loaded.and_then(|loaded| Self::restore_scene(renderer, loaded)) {
+                            Ok(world) => {
+                                self.world = world;
+                                self.animated_model = None;
+                                self.animated_object_ids.clear();
+                                self.animated_instances.clear();
+                                self.animation_time = 0.0;
+                                debug_ui.scene_loaded();
+                                debug_ui.set_scene_status(Ok("Scene loaded".to_owned()));
+                            }
+                            Err(error) => debug_ui.set_scene_status(Err(error)),
+                        }
+                    }
                     if let Some((path, parsed)) = debug_ui.take_asset_request() {
                         let result = parsed.and_then(|parsed| {
                             Self::import_asset(
@@ -396,7 +528,7 @@ impl ApplicationHandler for App {
                     let render_started = Instant::now();
                     renderer.render(
                         &self.camera,
-                        self.world.objects(),
+                        &mut self.world,
                         debug_ui,
                         window,
                         dt,

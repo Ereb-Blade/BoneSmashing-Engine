@@ -26,6 +26,23 @@ pub struct GltfImageData {
     pub emissive_mip_levels: Option<Vec<Vec<u8>>>,
 }
 
+fn instance_name(node: &gltf::Node<'_>, mesh: &gltf::Mesh<'_>, primitive_index: usize) -> String {
+    let node_name = node.name().map(str::trim).filter(|name| !name.is_empty());
+    let mesh_name = mesh.name().map(str::trim).filter(|name| !name.is_empty());
+    let base_name = match (node_name, mesh_name) {
+        (Some(node_name), Some(mesh_name)) if node_name != mesh_name => {
+            format!("{node_name} / {mesh_name}")
+        }
+        (Some(name), _) | (_, Some(name)) => name.to_owned(),
+        (None, None) => format!("Node {}", node.index() + 1),
+    };
+    if mesh.primitives().len() > 1 {
+        format!("{base_name} - primitive {}", primitive_index + 1)
+    } else {
+        base_name
+    }
+}
+
 #[derive(Debug)]
 pub struct GltfMaterialData {
     pub base_color_factor: [f32; 4],
@@ -177,6 +194,7 @@ pub struct GltfPrimitiveData {
 
 #[derive(Debug)]
 pub struct GltfPrimitiveInstance {
+    pub name: String,
     pub mesh_id: MeshId,
     pub material_id: MaterialId,
     pub node_transform: Mat4,
@@ -278,6 +296,7 @@ struct SkinData {
 
 #[derive(Debug)]
 struct AnimationInstanceData {
+    name: String,
     primitive_index: usize,
     node_index: usize,
     skin_index: Option<usize>,
@@ -336,6 +355,7 @@ impl GltfAnimationData {
                     Vec::new()
                 };
                 Ok(GltfPrimitiveInstance {
+                    name: instance.name.clone(),
                     mesh_id: self.mesh_ids[instance.primitive_index],
                     material_id: self.material_ids[instance.primitive_index],
                     node_transform,
@@ -376,6 +396,7 @@ impl GltfAnimationData {
             let node_transform = self.sample_globals[instance.node_index];
             if index == output.len() {
                 output.push(GltfPrimitiveInstance {
+                    name: instance.name.clone(),
                     mesh_id: self.mesh_ids[instance.primitive_index],
                     material_id: self.material_ids[instance.primitive_index],
                     node_transform,
@@ -517,6 +538,10 @@ pub struct GltfModelData {
 }
 
 impl GltfModelData {
+    pub fn instance_count(&self) -> usize {
+        self.instances.len()
+    }
+
     pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
         let (document, buffers, images) =
@@ -1275,6 +1300,7 @@ impl GltfModelData {
             parents.push(None);
             for primitive_index in 0..primitives.len() {
                 instances.push(AnimationInstanceData {
+                    name: format!("Mesh {}", primitive_index + 1),
                     primitive_index,
                     node_index: synthetic_node,
                     skin_index: None,
@@ -1864,6 +1890,7 @@ fn build_instances(
                 .get(instance.primitive_index)
                 .ok_or_else(|| "model primitive references a missing material".to_owned())?;
             Ok(GltfPrimitiveInstance {
+                name: instance.name.clone(),
                 mesh_id,
                 material_id,
                 node_transform,
@@ -1921,6 +1948,7 @@ fn collect_node_instances(
                 }
             }
             instances.push(AnimationInstanceData {
+                name: instance_name(&node, &mesh, primitive_index),
                 primitive_index: primitive_data_index,
                 node_index,
                 skin_index,
@@ -2043,6 +2071,14 @@ mod tests {
 
         assert_eq!(model.primitives.len(), 2);
         assert_eq!(model.instances.len(), 2);
+        assert_eq!(
+            model.instances[0].name,
+            "two_material_triangles - primitive 1"
+        );
+        assert_eq!(
+            model.instances[1].name,
+            "two_material_triangles - primitive 2"
+        );
         assert_eq!(model.materials.len(), 3);
         assert!(model.materials[0].unlit);
         assert!(!model.materials[1].unlit);

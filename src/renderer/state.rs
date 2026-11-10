@@ -14,7 +14,7 @@ use crate::renderer::material::{Material, MaterialParams};
 use crate::renderer::mesh::{Mesh, MeshData};
 use crate::renderer::pipeline::{HDR_FORMAT, RenderPipelineBundle};
 use crate::renderer::{debug_ui::DebugUi, environment::Environment};
-use crate::scene::RenderObject;
+use crate::scene::{RenderObject, World};
 
 #[derive(Debug)]
 pub enum ParsedAsset {
@@ -842,6 +842,74 @@ impl Renderer {
         self.materials.len()
     }
 
+    pub fn discard_assets_after(&mut self, mesh_count: usize, material_count: usize) {
+        self.meshes.truncate(mesh_count);
+        self.materials.truncate(material_count);
+        self.missing_mesh_warnings
+            .retain(|mesh_id| mesh_id.0 < mesh_count);
+        self.missing_material_warnings
+            .retain(|material_id| material_id.0 < material_count);
+        self.batches.clear();
+        self.draw_batches.clear();
+        self.transparent_objects.clear();
+        self.shadow_cache_valid = false;
+    }
+
+    pub fn retain_scene_assets(
+        &mut self,
+        objects: &mut [RenderObject],
+        built_in_mesh_count: usize,
+        built_in_material_count: usize,
+    ) -> Result<(), String> {
+        if built_in_mesh_count > self.meshes.len()
+            || built_in_material_count > self.materials.len()
+            || objects.iter().any(|object| {
+                object.mesh_id.0 >= self.meshes.len()
+                    || object.material_id.0 >= self.materials.len()
+            })
+        {
+            return Err("Scene references a mesh or material that is not loaded".to_owned());
+        }
+
+        let used_meshes = objects
+            .iter()
+            .map(|object| object.mesh_id.0)
+            .collect::<HashSet<_>>();
+        let used_materials = objects
+            .iter()
+            .map(|object| object.material_id.0)
+            .collect::<HashSet<_>>();
+        let mut mesh_remap = vec![0; self.meshes.len()];
+        let mut meshes = Vec::with_capacity(built_in_mesh_count + used_meshes.len());
+        for (old_index, mesh) in std::mem::take(&mut self.meshes).into_iter().enumerate() {
+            if old_index < built_in_mesh_count || used_meshes.contains(&old_index) {
+                mesh_remap[old_index] = meshes.len();
+                meshes.push(mesh);
+            }
+        }
+        let mut material_remap = vec![0; self.materials.len()];
+        let mut materials = Vec::with_capacity(built_in_material_count + used_materials.len());
+        for (old_index, material) in std::mem::take(&mut self.materials).into_iter().enumerate() {
+            if old_index < built_in_material_count || used_materials.contains(&old_index) {
+                material_remap[old_index] = materials.len();
+                materials.push(material);
+            }
+        }
+        for object in objects {
+            object.mesh_id = MeshId(mesh_remap[object.mesh_id.0]);
+            object.material_id = MaterialId(material_remap[object.material_id.0]);
+        }
+        self.meshes = meshes;
+        self.materials = materials;
+        self.missing_mesh_warnings.clear();
+        self.missing_material_warnings.clear();
+        self.batches.clear();
+        self.draw_batches.clear();
+        self.transparent_objects.clear();
+        self.shadow_cache_valid = false;
+        Ok(())
+    }
+
     pub fn material_label(&self, index: usize) -> Option<&str> {
         self.materials
             .get(index)
@@ -1248,7 +1316,7 @@ impl Renderer {
     pub fn render(
         &mut self,
         camera: &Camera,
-        objects: &[RenderObject],
+        world: &mut World,
         debug_ui: &mut DebugUi,
         window: &Window,
         frame_time: f32,
@@ -1262,11 +1330,12 @@ impl Renderer {
             frame_time,
             fps,
             cpu_frame_time,
-            objects.len(),
             previous_timings,
             self,
+            world,
         );
         self.timings.ui_cpu_ms = ui_started.elapsed().as_secs_f32() * 1000.0;
+        let objects = world.objects();
         let scene_started = Instant::now();
         let key_direction = self.settings.key_light_direction();
         let light_uniform = LightUniform {
@@ -1305,7 +1374,7 @@ impl Renderer {
         self.skin_matrices.clear();
         self.skin_matrices.push(Mat4::IDENTITY);
         for (object_index, obj) in objects.iter().enumerate() {
-            let model_matrix = obj.model_matrix();
+            let model_matrix = world.group_model_matrix(obj);
             let Ok(skin_offset) = u32::try_from(self.skin_matrices.len()) else {
                 eprintln!("Не удалось отрисовать объект: превышен диапазон индексов скелета");
                 continue;

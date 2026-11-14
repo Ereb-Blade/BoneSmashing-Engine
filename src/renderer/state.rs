@@ -666,6 +666,7 @@ impl Renderer {
                 base_color: [1.0, 1.0, 1.0, 1.0],
                 roughness: 0.92,
                 metallic: 0.0,
+                specular_factor: 0.0,
                 ..Default::default()
             },
             Some("dark grey floor"),
@@ -1165,30 +1166,6 @@ impl Renderer {
             return Some(Ok(Some(path)));
         }
         Some(Ok(None))
-    }
-
-    pub fn use_studio_environment(&mut self) -> Result<(), String> {
-        if let Some(settings_path) = persisted_environment_path() {
-            match std::fs::remove_file(&settings_path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "Could not clear saved HDR environment path {}: {error}",
-                        settings_path.display()
-                    ));
-                }
-            }
-        }
-        let environment = Environment::studio(&self.device, &self.queue);
-        let bind_group = create_environment_bind_group(
-            &self.device,
-            &self.environment_bind_group_layout,
-            &environment,
-        );
-        self.environment = environment;
-        self.environment_bind_group = bind_group;
-        Ok(())
     }
 
     pub fn load_obj(&mut self, path: impl AsRef<Path>) -> Result<MeshId, String> {

@@ -215,6 +215,7 @@ pub struct GltfAnimationInfo {
 }
 
 impl LoadedGltfModel {
+    #[cfg(test)]
     pub fn sample_animation(
         &self,
         animation_index: usize,
@@ -319,6 +320,7 @@ struct GltfAnimationData {
 }
 
 impl GltfAnimationData {
+    #[cfg(test)]
     fn sample(
         &self,
         animation_index: usize,

@@ -820,23 +820,6 @@ impl Material {
         texture
     }
 
-    pub fn from_image_bytes(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        layout: &wgpu::BindGroupLayout,
-        bytes: &[u8],
-        params: MaterialParams,
-        label: Option<&str>,
-    ) -> Result<Self, image::ImageError> {
-        use image::GenericImageView;
-        let img = image::load_from_memory(bytes)?;
-        let rgba = img.to_rgba8();
-        let (width, height) = img.dimensions();
-        Ok(Self::from_rgba(
-            device, queue, layout, &rgba, width, height, params, label,
-        ))
-    }
-
     pub(crate) fn from_image_bytes_with_linear_gain(
         device: &wgpu::Device,
         queue: &wgpu::Queue,

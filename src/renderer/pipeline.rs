@@ -146,6 +146,7 @@ fn evaluate_direct_light(
     metallic: f32,
     roughness: f32,
     f0: vec3<f32>,
+    specular_weight: vec3<f32>,
 ) -> vec3<f32> {
     let n_dot_l = max(dot(normal, light_dir), 0.0);
     let n_dot_v = max(dot(normal, view_dir), 0.0);
@@ -156,7 +157,7 @@ fn evaluate_direct_light(
     let half_dir = safe_normalize(view_dir + light_dir, normal);
     let n_dot_h = max(dot(normal, half_dir), 0.0);
     let h_dot_v = max(dot(half_dir, view_dir), 0.0);
-    let fresnel = fresnel_schlick(h_dot_v, f0);
+    let fresnel = fresnel_schlick(h_dot_v, f0) * specular_weight;
     let distribution = distribution_ggx(n_dot_h, roughness);
     let geometry = geometry_schlick_ggx(n_dot_v, roughness)
         * geometry_schlick_ggx(n_dot_l, roughness);
@@ -185,7 +186,7 @@ fn sample_prefiltered_environment(direction: vec3<f32>, roughness: f32) -> vec3<
         t_prefiltered_environment,
         s_environment,
         environment_uv(direction),
-        roughness * max_mip,
+        min(roughness * max_mip + 1.0, max_mip),
     ).rgb;
 }
 
@@ -611,12 +612,19 @@ fn fs_glass(
     if debug_view == 3u {
         return vec4<f32>(roughness, material.metallic, 0.0, surface_color.a);
     }
-    let dielectric_f0 = pow((material.ior - 1.0) / (material.ior + 1.0), 2.0)
-        * material.specular_factor * textureSample(t_specular, s_diffuse, specular_uv).a;
-    let f0 = vec3<f32>(dielectric_f0)
-        * material.specular_color_factor
-        * textureSample(t_specular_color, s_diffuse, specular_color_uv).rgb;
-    let glass_fresnel = fresnel_schlick(max(dot(normal, view_dir), 0.0), f0);
+    let specular_texture = textureSample(t_specular, s_diffuse, specular_uv);
+    let specular_color_texture = textureSample(t_specular_color, s_diffuse, specular_color_uv);
+    let dielectric_f0 = pow((material.ior - 1.0) / (material.ior + 1.0), 2.0);
+    let f0 = vec3<f32>(dielectric_f0);
+    let specular_weight = clamp(
+        material.specular_color_factor
+            * specular_color_texture.rgb
+            * (material.specular_factor * specular_texture.a),
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
+    let glass_fresnel =
+        fresnel_schlick(max(dot(normal, view_dir), 0.0), f0) * specular_weight;
     let key_dir = safe_normalize(-light.direction_intensity.xyz, normal);
     let fill_dir = safe_normalize(-light.fill_direction_intensity.xyz, normal);
     let key_radiance = light.color.rgb * light.direction_intensity.w;
@@ -634,6 +642,7 @@ fn fs_glass(
         0.0,
         roughness,
         f0,
+        specular_weight,
     ) * key_visibility
         + evaluate_direct_light(
             normal,
@@ -644,6 +653,7 @@ fn fs_glass(
             0.0,
             roughness,
             f0,
+            specular_weight,
         );
     let reflected_environment =
         sample_prefiltered_environment(reflect(-view_dir, normal), roughness) * light.ambient_top.a;
@@ -796,15 +806,20 @@ fn fs_main(
         return surface_color;
     }
     let ior_f0 = pow((material.ior - 1.0) / (material.ior + 1.0), 2.0);
-    var dielectric_f0 = vec3<f32>(ior_f0)
-        * material.specular_color_factor
-        * material.specular_factor
-        * textureSample(t_specular, s_diffuse, specular_uv).a
-        * textureSample(t_specular_color, s_diffuse, specular_color_uv).rgb;
+    var dielectric_f0 = vec3<f32>(ior_f0);
+    var dielectric_specular_weight = clamp(
+        material.specular_color_factor
+            * textureSample(t_specular_color, s_diffuse, specular_color_uv).rgb
+            * (material.specular_factor * textureSample(t_specular, s_diffuse, specular_uv).a),
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
     if material.pbr_workflow == 1u {
         dielectric_f0 = material.specular_color_factor * specular_glossiness.rgb;
+        dielectric_specular_weight = vec3<f32>(1.0);
     }
     let f0 = mix(dielectric_f0, surface_color.rgb, metallic);
+    let specular_weight = mix(dielectric_specular_weight, vec3<f32>(1.0), metallic);
 
     let key_dir = safe_normalize(-light.direction_intensity.xyz, normal);
     let fill_dir = safe_normalize(-light.fill_direction_intensity.xyz, normal);
@@ -816,16 +831,33 @@ fn fs_main(
         key_visibility = shadow_visibility(v.world_pos, normal, key_dir);
     }
     var radiance = evaluate_direct_light(
-        normal, view_dir, key_dir, key_radiance, surface_color.rgb, metallic, roughness, f0,
+        normal,
+        view_dir,
+        key_dir,
+        key_radiance,
+        surface_color.rgb,
+        metallic,
+        roughness,
+        f0,
+        specular_weight,
     ) * key_visibility;
     radiance += evaluate_direct_light(
-        normal, view_dir, fill_dir, fill_radiance, surface_color.rgb, metallic, roughness, f0,
+        normal,
+        view_dir,
+        fill_dir,
+        fill_radiance,
+        surface_color.rgb,
+        metallic,
+        roughness,
+        f0,
+        specular_weight,
     );
 
     let n_dot_v = max(dot(normal, view_dir), 0.0);
-    let fresnel_roughness = f0
-        + (max(vec3<f32>(1.0 - roughness), f0) - f0)
-            * pow(1.0 - n_dot_v, 5.0);
+    let fresnel_roughness = (
+        f0 + (max(vec3<f32>(1.0 - roughness), f0) - f0)
+            * pow(1.0 - n_dot_v, 5.0)
+    ) * specular_weight;
     let diffuse_weight = (vec3<f32>(1.0) - fresnel_roughness) * (1.0 - metallic);
     let env_intensity = light.ambient_top.a;
     let ambient_occlusion = mix(
@@ -839,13 +871,18 @@ fn fs_main(
     let reflection_dir = reflect(-view_dir, normal);
     let environment = sample_prefiltered_environment(reflection_dir, roughness);
     let brdf = textureSampleLevel(t_brdf_lut, s_environment, vec2<f32>(n_dot_v, roughness), 0.0).rg;
-    let single_scatter = f0 * brdf.x + vec3<f32>(brdf.y);
-    let single_scatter_energy = brdf.x + brdf.y;
-    let average_fresnel = f0 + (vec3<f32>(1.0) - f0) * 0.047619;
+    let single_scatter = (f0 * brdf.x + vec3<f32>(brdf.y)) * specular_weight;
+    let single_scatter_energy = vec3<f32>(brdf.x + brdf.y) * specular_weight;
+    let average_fresnel =
+        (f0 + (vec3<f32>(1.0) - f0) * 0.047619) * specular_weight;
     let multiple_scatter = single_scatter
         * average_fresnel
-        * (1.0 - single_scatter_energy)
-        / max(vec3<f32>(1.0) - average_fresnel * (1.0 - single_scatter_energy), vec3<f32>(1e-4));
+        * (vec3<f32>(1.0) - single_scatter_energy)
+        / max(
+            vec3<f32>(1.0)
+                - average_fresnel * (vec3<f32>(1.0) - single_scatter_energy),
+            vec3<f32>(1e-4),
+        );
     let specular_ambient =
         environment * (single_scatter + multiple_scatter) * env_intensity
             * clamp(

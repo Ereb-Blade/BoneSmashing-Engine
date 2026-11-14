@@ -2,6 +2,9 @@ use half::f16;
 use std::path::Path;
 use std::sync::OnceLock;
 
+const DIFFUSE_IRRADIANCE_WIDTH: u32 = 128;
+const DIFFUSE_IRRADIANCE_HEIGHT: u32 = 64;
+
 pub struct Environment {
     _texture: wgpu::Texture,
     pub view: wgpu::TextureView,
@@ -203,7 +206,6 @@ impl Environment {
                 1.0,
             ]);
         }
-        let irradiance = convolve_diffuse(&base, width, height);
         let mut levels = vec![base];
         let mut mip_width = width;
         let mut mip_height = height;
@@ -236,6 +238,7 @@ impl Environment {
             mip_width = next_width;
             mip_height = next_height;
         }
+        let irradiance = convolve_diffuse(&levels, width, height);
 
         fn sanitize_hdr(value: f32) -> f32 {
             if value.is_finite() {
@@ -295,7 +298,7 @@ impl Environment {
         });
         let (prefiltered_width, prefiltered_height) = (512, 256);
         let prefiltered_levels = prefilter_specular(
-            levels.first().expect("base level is always present"),
+            &levels,
             width,
             height,
             prefiltered_width,
@@ -349,13 +352,11 @@ impl Environment {
             mip_level_count: Some(prefiltered_levels.len() as u32),
             ..Default::default()
         });
-        let diffuse_width = 64;
-        let diffuse_height = 32;
         let diffuse_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("HDR diffuse irradiance"),
             size: wgpu::Extent3d {
-                width: diffuse_width,
-                height: diffuse_height,
+                width: DIFFUSE_IRRADIANCE_WIDTH,
+                height: DIFFUSE_IRRADIANCE_HEIGHT,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -379,12 +380,12 @@ impl Environment {
             bytemuck::cast_slice(&half_irradiance),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(diffuse_width * 8),
-                rows_per_image: Some(diffuse_height),
+                bytes_per_row: Some(DIFFUSE_IRRADIANCE_WIDTH * 8),
+                rows_per_image: Some(DIFFUSE_IRRADIANCE_HEIGHT),
             },
             wgpu::Extent3d {
-                width: diffuse_width,
-                height: diffuse_height,
+                width: DIFFUSE_IRRADIANCE_WIDTH,
+                height: DIFFUSE_IRRADIANCE_HEIGHT,
                 depth_or_array_layers: 1,
             },
         );
@@ -416,15 +417,23 @@ impl Environment {
 }
 
 fn prefilter_specular(
-    source: &[f32],
+    source_mips: &[Vec<f32>],
     width: u32,
     height: u32,
     output_width: u32,
     output_height: u32,
 ) -> Vec<Vec<f32>> {
-    const SAMPLE_COUNT: u32 = 64;
+    const SAMPLE_COUNT: u32 = 512;
+    let source_dimensions: Vec<_> = (0..source_mips.len())
+        .scan((width, height), |(mip_width, mip_height), _| {
+            let dimensions = (*mip_width, *mip_height);
+            *mip_width = (*mip_width / 2).max(1);
+            *mip_height = (*mip_height / 2).max(1);
+            Some(dimensions)
+        })
+        .collect();
     let mut levels = vec![resample_equirectangular(
-        source,
+        source_mips.first().expect("source mip chain is not empty"),
         width,
         height,
         output_width,
@@ -438,9 +447,8 @@ fn prefilter_specular(
         mip_height = (mip_height / 2).max(1);
         let roughness = mip as f32 / (mip_count - 1) as f32;
         levels.push(prefilter_specular_level(
-            levels.first().expect("base level is always present"),
-            output_width,
-            output_height,
+            source_mips,
+            &source_dimensions,
             mip_width,
             mip_height,
             roughness,
@@ -476,9 +484,8 @@ fn resample_equirectangular(
 }
 
 fn prefilter_specular_level(
-    source: &[f32],
-    source_width: u32,
-    source_height: u32,
+    source_mips: &[Vec<f32>],
+    source_dimensions: &[(u32, u32)],
     output_width: u32,
     output_height: u32,
     roughness: f32,
@@ -508,15 +515,26 @@ fn prefilter_specular_level(
                 let view_dot_half = dot(view, half_vector).max(0.0);
                 let light = normalize(subtract(scale(half_vector, 2.0 * view_dot_half), view));
                 let normal_dot_light = dot(normal, light).max(0.0);
-                if normal_dot_light > 0.0 {
+                if normal_dot_light > 0.0 && view_dot_half > 1e-5 {
+                    let normal_dot_half = dot(normal, half_vector).max(0.0);
+                    let light_latitude = light[1].clamp(-1.0, 1.0).asin();
+                    let sample_lod = specular_sample_lod(
+                        normal_dot_half,
+                        view_dot_half,
+                        roughness,
+                        sample_count,
+                        source_dimensions[0],
+                        light_latitude,
+                        (source_mips.len() - 1) as f32,
+                    );
                     let sample_u = light[2].atan2(light[0]) / (2.0 * std::f32::consts::PI) + 0.5;
                     let sample_v = light[1].clamp(-1.0, 1.0).acos() / std::f32::consts::PI;
-                    let sample_color = sample_equirectangular(
-                        source,
-                        source_width,
-                        source_height,
+                    let sample_color = sample_equirectangular_mips(
+                        source_mips,
+                        source_dimensions,
                         sample_u,
                         sample_v,
+                        sample_lod,
                     );
                     for channel in 0..3 {
                         color[channel] += sample_color[channel] * normal_dot_light;
@@ -532,6 +550,71 @@ fn prefilter_specular_level(
         }
     }
     output
+}
+
+fn specular_sample_lod(
+    normal_dot_half: f32,
+    view_dot_half: f32,
+    roughness: f32,
+    sample_count: u32,
+    source_dimensions: (u32, u32),
+    latitude: f32,
+    max_mip: f32,
+) -> f32 {
+    let alpha = roughness * roughness;
+    let alpha_squared = alpha * alpha;
+    let denominator = normal_dot_half * normal_dot_half * (alpha_squared - 1.0) + 1.0;
+    let distribution = alpha_squared / (std::f32::consts::PI * denominator * denominator).max(1e-8);
+    let pdf = distribution * normal_dot_half / (4.0 * view_dot_half).max(1e-8);
+    let sample_solid_angle = 1.0 / (sample_count as f32 * pdf).max(1e-8);
+    environment_sample_lod(sample_solid_angle, source_dimensions, latitude, max_mip)
+}
+
+fn environment_sample_lod(
+    sample_solid_angle: f32,
+    source_dimensions: (u32, u32),
+    latitude: f32,
+    max_mip: f32,
+) -> f32 {
+    let texel_solid_angle = (2.0 * std::f32::consts::PI.powi(2) * latitude.cos().abs().max(1e-4)
+        / (source_dimensions.0 * source_dimensions.1) as f32)
+        .max(1e-8);
+    (0.5 * (sample_solid_angle / texel_solid_angle).log2()).clamp(0.0, max_mip)
+}
+
+fn sample_equirectangular_mips(
+    source_mips: &[Vec<f32>],
+    source_dimensions: &[(u32, u32)],
+    u: f32,
+    v: f32,
+    lod: f32,
+) -> [f32; 3] {
+    let lod = lod.clamp(0.0, (source_mips.len() - 1) as f32);
+    let lower_mip = lod.floor() as usize;
+    let upper_mip = lod.ceil() as usize;
+    let lower = sample_equirectangular(
+        &source_mips[lower_mip],
+        source_dimensions[lower_mip].0,
+        source_dimensions[lower_mip].1,
+        u,
+        v,
+    );
+    if lower_mip == upper_mip {
+        return lower;
+    }
+    let upper = sample_equirectangular(
+        &source_mips[upper_mip],
+        source_dimensions[upper_mip].0,
+        source_dimensions[upper_mip].1,
+        u,
+        v,
+    );
+    let blend = lod - lower_mip as f32;
+    [
+        lower[0] * (1.0 - blend) + upper[0] * blend,
+        lower[1] * (1.0 - blend) + upper[1] * blend,
+        lower[2] * (1.0 - blend) + upper[2] * blend,
+    ]
 }
 
 fn importance_sample_ggx(xi: [f32; 2], roughness: f32, normal: [f32; 3]) -> [f32; 3] {
@@ -659,57 +742,116 @@ fn geometry_schlick_ggx_ibl(n_dot_direction: f32, roughness: f32) -> f32 {
     n_dot_direction / (n_dot_direction * (1.0 - k) + k).max(1e-5)
 }
 
-fn convolve_diffuse(source: &[f32], width: u32, height: u32) -> Vec<f32> {
-    const OUTPUT_WIDTH: u32 = 64;
-    const OUTPUT_HEIGHT: u32 = 32;
-    const SAMPLE_COUNT: u32 = 64;
-    let mut irradiance = vec![0.0; (OUTPUT_WIDTH * OUTPUT_HEIGHT * 4) as usize];
-    for y in 0..OUTPUT_HEIGHT {
-        let v = (y as f32 + 0.5) / OUTPUT_HEIGHT as f32;
+fn convolve_diffuse(source_mips: &[Vec<f32>], width: u32, height: u32) -> Vec<f32> {
+    let source = source_mips.first().expect("source mip chain is not empty");
+    let mut coefficients = [[0.0_f32; 3]; 9];
+    let longitude_step = 2.0 * std::f32::consts::PI / width as f32;
+    let row_solid_angles: Vec<_> = (0..height)
+        .map(|y| {
+            let v0 = y as f32 / height as f32;
+            let v1 = (y + 1) as f32 / height as f32;
+            longitude_step
+                * (((0.5 - v0) * std::f32::consts::PI).sin()
+                    - ((0.5 - v1) * std::f32::consts::PI).sin())
+        })
+        .collect();
+    let reference_color = [source[0], source[1], source[2]];
+    let mut average_offset = [0.0_f32; 3];
+    for y in 0..height {
+        let solid_angle = row_solid_angles[y as usize];
+        for x in 0..width {
+            let index = ((y * width + x) * 4) as usize;
+            for channel in 0..3 {
+                average_offset[channel] +=
+                    (source[index + channel] - reference_color[channel]) * solid_angle;
+            }
+        }
+    }
+    let average_color = average_offset.map(|offset| offset / (4.0 * std::f32::consts::PI));
+    let average_color = [
+        average_color[0] + reference_color[0],
+        average_color[1] + reference_color[1],
+        average_color[2] + reference_color[2],
+    ];
+    for y in 0..height {
+        let latitude = (0.5 - (y as f32 + 0.5) / height as f32) * std::f32::consts::PI;
+        let row_solid_angle = row_solid_angles[y as usize];
+        for x in 0..width {
+            let longitude = ((x as f32 + 0.5) / width as f32 - 0.5) * 2.0 * std::f32::consts::PI;
+            let direction = [
+                latitude.cos() * longitude.cos(),
+                latitude.sin(),
+                latitude.cos() * longitude.sin(),
+            ];
+            let basis = diffuse_sh_basis(direction);
+            let index = ((y * width + x) * 4) as usize;
+            for coefficient in 0..basis.len() {
+                for channel in 0..3 {
+                    coefficients[coefficient][channel] += (source[index + channel]
+                        - average_color[channel])
+                        * basis[coefficient]
+                        * row_solid_angle;
+                }
+            }
+        }
+    }
+
+    let mut irradiance =
+        vec![0.0; (DIFFUSE_IRRADIANCE_WIDTH * DIFFUSE_IRRADIANCE_HEIGHT * 4) as usize];
+    for y in 0..DIFFUSE_IRRADIANCE_HEIGHT {
+        let v = (y as f32 + 0.5) / DIFFUSE_IRRADIANCE_HEIGHT as f32;
         let latitude = (0.5 - v) * std::f32::consts::PI;
-        for x in 0..OUTPUT_WIDTH {
-            let u = (x as f32 + 0.5) / OUTPUT_WIDTH as f32;
+        for x in 0..DIFFUSE_IRRADIANCE_WIDTH {
+            let u = (x as f32 + 0.5) / DIFFUSE_IRRADIANCE_WIDTH as f32;
             let longitude = (u - 0.5) * 2.0 * std::f32::consts::PI;
             let normal = [
                 latitude.cos() * longitude.cos(),
                 latitude.sin(),
                 latitude.cos() * longitude.sin(),
             ];
-            let helper = if normal[1].abs() > 0.98 {
-                [1.0, 0.0, 0.0]
-            } else {
-                [0.0, 1.0, 0.0]
-            };
-            let tangent = normalize(cross(helper, normal));
-            let bitangent = cross(normal, tangent);
-            let mut color = [0.0; 3];
-            for sample in 0..SAMPLE_COUNT {
-                let xi = (sample as f32 + 0.5) / SAMPLE_COUNT as f32;
-                let radius = xi.sqrt();
-                let local_height = (1.0 - xi).sqrt();
-                let angle = sample as f32 * 2.39996323;
-                let direction = add(
-                    add(
-                        scale(tangent, radius * angle.cos()),
-                        scale(bitangent, radius * angle.sin()),
-                    ),
-                    scale(normal, local_height),
-                );
-                let sample_u =
-                    direction[2].atan2(direction[0]) / (2.0 * std::f32::consts::PI) + 0.5;
-                let sample_v = direction[1].clamp(-1.0, 1.0).acos() / std::f32::consts::PI;
-                let sample_color =
-                    sample_equirectangular(source, width, height, sample_u, sample_v);
+            let basis = diffuse_sh_basis(normal);
+            let band_factors = [
+                1.0,
+                2.0 / 3.0,
+                2.0 / 3.0,
+                2.0 / 3.0,
+                0.25,
+                0.25,
+                0.25,
+                0.25,
+                0.25,
+            ];
+            let mut color = average_color;
+            for coefficient in 0..basis.len() {
                 for channel in 0..3 {
-                    color[channel] += sample_color[channel] / SAMPLE_COUNT as f32;
+                    color[channel] += coefficients[coefficient][channel]
+                        * basis[coefficient]
+                        * band_factors[coefficient];
                 }
             }
-            let index = ((y * OUTPUT_WIDTH + x) * 4) as usize;
-            irradiance[index..index + 3].copy_from_slice(&color);
+            let index = ((y * DIFFUSE_IRRADIANCE_WIDTH + x) * 4) as usize;
+            for channel in 0..3 {
+                irradiance[index + channel] = color[channel].max(0.0);
+            }
             irradiance[index + 3] = 1.0;
         }
     }
     irradiance
+}
+
+fn diffuse_sh_basis(direction: [f32; 3]) -> [f32; 9] {
+    let [x, y, z] = direction;
+    [
+        0.282095,
+        0.488603 * y,
+        0.488603 * z,
+        0.488603 * x,
+        1.092548 * x * y,
+        1.092548 * y * z,
+        0.315392 * (3.0 * z * z - 1.0),
+        1.092548 * x * z,
+        0.546274 * (x * x - y * y),
+    ]
 }
 
 fn sample_equirectangular(source: &[f32], width: u32, height: u32, u: f32, v: f32) -> [f32; 3] {
@@ -786,14 +928,25 @@ mod tests {
 
     #[test]
     fn ggx_prefilter_preserves_a_constant_environment() {
-        let source = [2.0, 1.0, 0.5, 1.0];
-        let filtered = prefilter_specular_level(&source, 1, 1, 4, 2, 0.8, 32);
+        let source = vec![2.0, 1.0, 0.5, 1.0];
+        let filtered = prefilter_specular_level(&[source], &[(1, 1)], 4, 2, 0.8, 32);
         for pixel in filtered.chunks_exact(4) {
             assert!((pixel[0] - 2.0).abs() < 1e-5);
             assert!((pixel[1] - 1.0).abs() < 1e-5);
             assert!((pixel[2] - 0.5).abs() < 1e-5);
             assert_eq!(pixel[3], 1.0);
         }
+    }
+
+    #[test]
+    fn rougher_specular_samples_use_blurrier_environment_mips() {
+        let dimensions = (1024, 512);
+        let max_mip = 10.0;
+        let lod =
+            |roughness| specular_sample_lod(1.0, 1.0, roughness, 64, dimensions, 0.0, max_mip);
+
+        assert!(lod(0.8) > lod(0.2));
+        assert!(lod(0.8) > 0.0);
     }
 
     #[test]
@@ -808,12 +961,58 @@ mod tests {
 
     #[test]
     fn diffuse_convolution_preserves_a_constant_environment() {
-        let irradiance = convolve_diffuse(&[2.0, 1.0, 0.5, 1.0], 1, 1);
+        let irradiance = convolve_diffuse(&[vec![2.0, 1.0, 0.5, 1.0]], 1, 1);
+        assert_eq!(
+            irradiance.len(),
+            (DIFFUSE_IRRADIANCE_WIDTH * DIFFUSE_IRRADIANCE_HEIGHT * 4) as usize
+        );
         for pixel in irradiance.chunks_exact(4) {
             assert!((pixel[0] - 2.0).abs() < 1e-5);
             assert!((pixel[1] - 1.0).abs() < 1e-5);
             assert!((pixel[2] - 0.5).abs() < 1e-5);
             assert_eq!(pixel[3], 1.0);
+        }
+    }
+
+    #[test]
+    fn diffuse_convolution_preserves_smooth_directional_lighting() {
+        let (width, height) = (64, 32);
+        let mut source = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            let latitude = (0.5 - (y as f32 + 0.5) / height as f32) * std::f32::consts::PI;
+            for x in 0..width {
+                let longitude =
+                    ((x as f32 + 0.5) / width as f32 - 0.5) * 2.0 * std::f32::consts::PI;
+                let direction = [
+                    latitude.cos() * longitude.cos(),
+                    latitude.sin(),
+                    latitude.cos() * longitude.sin(),
+                ];
+                source.extend_from_slice(&[
+                    1.0 + 0.5 * direction[0],
+                    1.0 + 0.5 * direction[1],
+                    1.0 + 0.5 * direction[2],
+                    1.0,
+                ]);
+            }
+        }
+
+        let irradiance = convolve_diffuse(&[source], width, height);
+        for (x, y) in [(32, 32), (96, 32)] {
+            let u = (x as f32 + 0.5) / DIFFUSE_IRRADIANCE_WIDTH as f32;
+            let v = (y as f32 + 0.5) / DIFFUSE_IRRADIANCE_HEIGHT as f32;
+            let latitude = (0.5 - v) * std::f32::consts::PI;
+            let longitude = (u - 0.5) * 2.0 * std::f32::consts::PI;
+            let normal = [
+                latitude.cos() * longitude.cos(),
+                latitude.sin(),
+                latitude.cos() * longitude.sin(),
+            ];
+            let index = ((y * DIFFUSE_IRRADIANCE_WIDTH + x) * 4) as usize;
+            for channel in 0..3 {
+                let expected = 1.0 + normal[channel] / 3.0;
+                assert!((irradiance[index + channel] - expected).abs() < 0.01);
+            }
         }
     }
 }

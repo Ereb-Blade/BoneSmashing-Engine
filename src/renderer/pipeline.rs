@@ -186,7 +186,7 @@ fn sample_prefiltered_environment(direction: vec3<f32>, roughness: f32) -> vec3<
         t_prefiltered_environment,
         s_environment,
         environment_uv(direction),
-        min(roughness * max_mip + 1.0, max_mip),
+        roughness * max_mip,
     ).rgb;
 }
 

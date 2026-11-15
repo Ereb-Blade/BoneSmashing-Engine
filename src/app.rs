@@ -19,7 +19,7 @@ use crate::core::{
 use crate::input::Input;
 use crate::renderer::debug_ui::{CameraControlMode, CameraLookButton, DebugUi};
 use crate::renderer::gltf::{GltfPrimitiveInstance, LoadedGltfModel};
-use crate::renderer::state::{LoadedAsset, ParsedAsset, Renderer};
+use crate::renderer::state::{LoadedAsset, ParsedAsset, Renderer, RendererSettings};
 use crate::scene::{ObjectId, RenderObject, SceneFile, Transform, World, build_world};
 
 pub struct App {
@@ -156,12 +156,13 @@ impl App {
     fn restore_scene(
         renderer: &mut Renderer,
         loaded: crate::scene::LoadedScene,
-    ) -> Result<World, String> {
+    ) -> Result<(World, SceneFile), String> {
         let original_mesh_count = renderer.meshes.len();
         let original_material_count = renderer.materials.len();
+        let crate::scene::LoadedScene { file, assets } = loaded;
         let result = (|| {
-            let mut asset_instances = std::collections::HashMap::with_capacity(loaded.assets.len());
-            for (path, parsed) in loaded.assets {
+            let mut asset_instances = std::collections::HashMap::with_capacity(assets.len());
+            for (path, parsed) in assets {
                 let instances = match renderer.load_parsed_asset(parsed, &path)? {
                     LoadedAsset::Gltf(model) => model
                         .instances
@@ -197,7 +198,7 @@ impl App {
                 asset_instances.insert(path, instances);
             }
             let mut world = build_world(
-                &loaded.file,
+                &file,
                 crate::core::MESH_SPHERE.0 + 1,
                 crate::core::MATERIAL_GLASS.0 + 1,
                 asset_instances,
@@ -207,7 +208,23 @@ impl App {
                 crate::core::MESH_SPHERE.0 + 1,
                 crate::core::MATERIAL_GLASS.0 + 1,
             )?;
-            Ok(world)
+            for (saved_object, object) in file.objects.iter().zip(world.objects()) {
+                if let Some(material_override) = saved_object.material_override {
+                    let mut params =
+                        renderer
+                            .material_params(object.material_id.0)
+                            .ok_or_else(|| {
+                                format!(
+                                    "Scene object '{}' references a missing material",
+                                    saved_object.name
+                                )
+                            })?;
+                    params.roughness = material_override.roughness;
+                    params.metallic = material_override.metallic;
+                    renderer.set_material_params(object.material_id.0, params);
+                }
+            }
+            Ok((world, file))
         })();
         if result.is_err() {
             renderer.discard_assets_after(original_mesh_count, original_material_count);
@@ -523,21 +540,74 @@ impl ApplicationHandler for App {
 
                 if let Some(debug_ui) = self.debug_ui.as_mut() {
                     if let Some(path) = debug_ui.take_scene_save_request() {
-                        let result = SceneFile::from_world(&self.world, &path)
-                            .and_then(|scene| scene.write(&path))
-                            .map(|()| format!("Saved scene to {}", path.display()));
+                        let result = (|| {
+                            let material_params = self
+                                .world
+                                .objects()
+                                .iter()
+                                .map(|object| {
+                                    renderer.material_params(object.material_id.0).ok_or_else(
+                                        || {
+                                            format!(
+                                                "Object '{}' references a missing material",
+                                                object.name
+                                            )
+                                        },
+                                    )
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let mut scene = SceneFile::from_world(&self.world, &path)?;
+                            scene.capture_editor_state(
+                                &self.world,
+                                &path,
+                                &self.camera,
+                                renderer.settings(),
+                                renderer.environment_path(),
+                                &material_params,
+                            )?;
+                            scene.write(&path)?;
+                            Ok(format!("Saved scene to {}", path.display()))
+                        })();
                         debug_ui.set_scene_status(result);
                     }
                     if let Some(loaded) = debug_ui.take_scene_load_request() {
                         match loaded.and_then(|loaded| Self::restore_scene(renderer, loaded)) {
-                            Ok(world) => {
+                            Ok((world, file)) => {
                                 self.world = world;
                                 self.animated_model = None;
                                 self.animated_object_ids.clear();
                                 self.animated_instances.clear();
                                 self.animation_time = 0.0;
-                                debug_ui.scene_loaded();
-                                debug_ui.set_scene_status(Ok("Scene loaded".to_owned()));
+                                if let Some(camera) = &file.camera {
+                                    camera.apply_to(&mut self.camera);
+                                }
+                                let mut status = "Scene loaded".to_owned();
+                                if let Some(settings) = file.renderer_settings {
+                                    let mut settings: RendererSettings = settings.into();
+                                    if !renderer
+                                        .supported_msaa_samples()
+                                        .contains(&settings.msaa_samples)
+                                    {
+                                        let requested = settings.msaa_samples;
+                                        settings.msaa_samples = renderer
+                                            .supported_msaa_samples()
+                                            .iter()
+                                            .copied()
+                                            .filter(|&samples| samples < requested)
+                                            .max()
+                                            .or_else(|| {
+                                                renderer.supported_msaa_samples().first().copied()
+                                            })
+                                            .unwrap_or(1);
+                                        status = format!(
+                                            "Scene loaded; MSAA {requested}x unavailable, using {}x",
+                                            settings.msaa_samples
+                                        );
+                                    }
+                                    renderer.set_settings(settings);
+                                }
+                                debug_ui.scene_loaded(file.environment.clone());
+                                debug_ui.set_scene_status(Ok(status));
                             }
                             Err(error) => debug_ui.set_scene_status(Err(error)),
                         }

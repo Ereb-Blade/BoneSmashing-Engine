@@ -1,5 +1,7 @@
+use crate::camera::Camera;
 use crate::core::{MaterialId, MeshId};
-use crate::renderer::state::{ParsedAsset, parse_asset};
+use crate::renderer::material::MaterialParams;
+use crate::renderer::state::{ParsedAsset, RendererSettings, parse_asset};
 use crate::scene::{ModelGroupId, RenderObject, Transform, World};
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
@@ -7,7 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const SCENE_FORMAT_VERSION: u32 = 2;
+const SCENE_FORMAT_VERSION: u32 = 3;
 const MAX_SCENE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SCENE_OBJECTS: usize = 100_000;
 const MAX_SCENE_ASSETS: usize = 256;
@@ -20,6 +22,12 @@ pub struct SceneFile {
     #[serde(default)]
     pub groups: Vec<SceneGroup>,
     pub objects: Vec<SceneObject>,
+    #[serde(default)]
+    pub camera: Option<SceneCamera>,
+    #[serde(default)]
+    pub renderer_settings: Option<SceneRendererSettings>,
+    #[serde(default)]
+    pub environment: Option<SceneEnvironment>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -43,6 +51,100 @@ pub struct SceneObject {
     pub position: [f32; 3],
     pub rotation: [f32; 4],
     pub scale: [f32; 3],
+    #[serde(default)]
+    pub material_override: Option<SceneMaterialOverride>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SceneCamera {
+    pub position: [f32; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+    pub up: [f32; 3],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SceneRendererSettings {
+    pub key_light_yaw_degrees: f32,
+    pub key_light_elevation_degrees: f32,
+    pub key_light_intensity: f32,
+    pub fill_light_intensity: f32,
+    pub environment_intensity: f32,
+    pub exposure_ev: f32,
+    pub shadows_enabled: bool,
+    pub debug_view: u32,
+    pub unlocked_fps: bool,
+    pub render_scale: f32,
+    pub msaa_samples: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SceneEnvironment {
+    pub path: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SceneMaterialOverride {
+    pub roughness: f32,
+    pub metallic: f32,
+}
+
+impl From<RendererSettings> for SceneRendererSettings {
+    fn from(settings: RendererSettings) -> Self {
+        Self {
+            key_light_yaw_degrees: settings.key_light_yaw_degrees,
+            key_light_elevation_degrees: settings.key_light_elevation_degrees,
+            key_light_intensity: settings.key_light_intensity,
+            fill_light_intensity: settings.fill_light_intensity,
+            environment_intensity: settings.environment_intensity,
+            exposure_ev: settings.exposure_ev,
+            shadows_enabled: settings.shadows_enabled,
+            debug_view: settings.debug_view,
+            unlocked_fps: settings.unlocked_fps,
+            render_scale: settings.render_scale,
+            msaa_samples: settings.msaa_samples,
+        }
+    }
+}
+
+impl From<SceneRendererSettings> for RendererSettings {
+    fn from(settings: SceneRendererSettings) -> Self {
+        Self {
+            key_light_yaw_degrees: settings.key_light_yaw_degrees,
+            key_light_elevation_degrees: settings.key_light_elevation_degrees,
+            key_light_intensity: settings.key_light_intensity,
+            fill_light_intensity: settings.fill_light_intensity,
+            environment_intensity: settings.environment_intensity,
+            exposure_ev: settings.exposure_ev,
+            shadows_enabled: settings.shadows_enabled,
+            debug_view: settings.debug_view,
+            unlocked_fps: settings.unlocked_fps,
+            render_scale: settings.render_scale,
+            msaa_samples: settings.msaa_samples,
+        }
+    }
+}
+
+impl SceneCamera {
+    pub fn from_camera(camera: &Camera) -> Self {
+        Self {
+            position: camera.eye.to_array(),
+            yaw: camera.yaw,
+            pitch: camera.pitch,
+            up: camera.up.to_array(),
+        }
+    }
+
+    pub fn apply_to(&self, camera: &mut Camera) {
+        camera.eye = Vec3::from_array(self.position);
+        camera.yaw = self.yaw;
+        camera.pitch = self.pitch;
+        camera.up = Vec3::from_array(self.up).normalize();
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -152,15 +254,60 @@ impl SceneFile {
                 position: object.transform.position.to_array(),
                 rotation: object.transform.rotation.to_array(),
                 scale: object.transform.scale.to_array(),
+                material_override: None,
             });
         }
         let file = Self {
             version: SCENE_FORMAT_VERSION,
             groups,
             objects,
+            camera: None,
+            renderer_settings: None,
+            environment: None,
         };
         file.validate()?;
         Ok(file)
+    }
+
+    pub fn capture_editor_state(
+        &mut self,
+        world: &World,
+        scene_path: &Path,
+        camera: &Camera,
+        renderer_settings: RendererSettings,
+        environment_path: Option<&Path>,
+        material_params: &[MaterialParams],
+    ) -> Result<(), String> {
+        if self.objects.len() != world.objects().len()
+            || material_params.len() != world.objects().len()
+        {
+            return Err("Scene objects and material overrides are out of sync".to_owned());
+        }
+        let scene_directory = scene_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let scene_directory = fs::canonicalize(scene_directory).map_err(|error| {
+            format!(
+                "Could not resolve scene directory {}: {error}",
+                scene_directory.display()
+            )
+        })?;
+        self.camera = Some(SceneCamera::from_camera(camera));
+        self.renderer_settings = Some(renderer_settings.into());
+        self.environment = Some(SceneEnvironment {
+            path: environment_path
+                .map(|path| store_scene_path(path, &scene_directory))
+                .transpose()?,
+        });
+        for (saved_object, params) in self.objects.iter_mut().zip(material_params) {
+            saved_object.material_override = Some(SceneMaterialOverride {
+                roughness: params.roughness,
+                metallic: params.metallic,
+            });
+        }
+        self.validate()?;
+        Ok(())
     }
 
     pub fn write(&self, path: &Path) -> Result<(), String> {
@@ -194,6 +341,32 @@ impl SceneFile {
                 "Scene contains too many model groups (maximum: {MAX_SCENE_GROUPS})"
             ));
         }
+        if let Some(camera) = &self.camera {
+            let position = Vec3::from_array(camera.position);
+            let up = Vec3::from_array(camera.up);
+            if !position.is_finite()
+                || !camera.yaw.is_finite()
+                || !camera.pitch.is_finite()
+                || !(-89.0_f32.to_radians()..=89.0_f32.to_radians()).contains(&camera.pitch)
+                || !up.is_finite()
+                || up.length_squared() <= f32::EPSILON
+            {
+                return Err("Scene camera has invalid data".to_owned());
+            }
+        }
+        if let Some(settings) = self.renderer_settings
+            && !settings.is_valid()
+        {
+            return Err("Scene render settings have invalid data".to_owned());
+        }
+        if self.environment.as_ref().is_some_and(|environment| {
+            environment
+                .path
+                .as_ref()
+                .is_some_and(|path| path.trim().is_empty())
+        }) {
+            return Err("Scene environment path is empty".to_owned());
+        }
         for (index, object) in self.objects.iter().enumerate() {
             let position = Vec3::from_array(object.position);
             let rotation = Quat::from_array(object.rotation);
@@ -205,6 +378,16 @@ impl SceneFile {
                 || !scale.is_finite()
             {
                 return Err(format!("Scene object {index} has an invalid transform"));
+            }
+            if object.material_override.is_some_and(|material| {
+                !material.roughness.is_finite()
+                    || !(0.0..=1.0).contains(&material.roughness)
+                    || !material.metallic.is_finite()
+                    || !(0.0..=1.0).contains(&material.metallic)
+            }) {
+                return Err(format!(
+                    "Scene object {index} has an invalid material override"
+                ));
             }
             if let SceneObjectSource::Asset { path, .. } = &object.source {
                 let path = Path::new(path);
@@ -251,6 +434,31 @@ impl SceneFile {
     }
 }
 
+impl SceneRendererSettings {
+    fn is_valid(self) -> bool {
+        [
+            self.key_light_yaw_degrees,
+            self.key_light_elevation_degrees,
+            self.key_light_intensity,
+            self.fill_light_intensity,
+            self.environment_intensity,
+            self.exposure_ev,
+            self.render_scale,
+        ]
+        .iter()
+        .all(|value| value.is_finite())
+            && (-180.0..=180.0).contains(&self.key_light_yaw_degrees)
+            && (-89.0..=-5.0).contains(&self.key_light_elevation_degrees)
+            && (0.0..=8.0).contains(&self.key_light_intensity)
+            && (0.0..=4.0).contains(&self.fill_light_intensity)
+            && (0.0..=2.0).contains(&self.environment_intensity)
+            && (-10.0..=3.0).contains(&self.exposure_ev)
+            && (0.5..=1.0).contains(&self.render_scale)
+            && self.debug_view <= 5
+            && [1, 2, 4, 8].contains(&self.msaa_samples)
+    }
+}
+
 impl SceneObject {
     pub fn transform(&self) -> Transform {
         Transform::new(
@@ -283,7 +491,7 @@ pub fn load_scene(path: &Path) -> Result<LoadedScene, String> {
     let mut file: SceneFile = serde_json::from_slice(&bytes)
         .map_err(|error| format!("Could not parse scene {}: {error}", path.display()))?;
     let legacy_scene = file.version == 1;
-    if legacy_scene {
+    if matches!(file.version, 1 | 2) {
         file.version = SCENE_FORMAT_VERSION;
     }
     file.validate()?;
@@ -291,6 +499,29 @@ pub fn load_scene(path: &Path) -> Result<LoadedScene, String> {
     let scene_directory = path
         .parent()
         .ok_or_else(|| format!("Scene path has no parent directory: {}", path.display()))?;
+    if let Some(environment_path) = file
+        .environment
+        .as_mut()
+        .and_then(|environment| environment.path.as_mut())
+    {
+        let resolved_path = resolve_asset_path(environment_path, scene_directory)
+            .map_err(|error| format!("Scene references an unavailable HDR environment: {error}"))?;
+        if !resolved_path.is_file() {
+            return Err(format!(
+                "Scene HDR environment is not a file: {}",
+                resolved_path.display()
+            ));
+        }
+        *environment_path = resolved_path
+            .to_str()
+            .ok_or_else(|| {
+                format!(
+                    "HDR environment path is not valid UTF-8: {}",
+                    resolved_path.display()
+                )
+            })?
+            .to_owned();
+    }
     let mut assets = BTreeMap::new();
     let mut referenced_assets = BTreeMap::<PathBuf, ()>::new();
     for (index, group) in file.groups.iter_mut().enumerate() {
@@ -440,6 +671,16 @@ fn resolve_asset_path(path: &str, scene_directory: &Path) -> Result<PathBuf, Str
         scene_directory.join(path)
     };
     fs::canonicalize(&path).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn store_scene_path(path: &Path, scene_directory: &Path) -> Result<String, String> {
+    let path = fs::canonicalize(path)
+        .map_err(|error| format!("Could not resolve scene asset {}: {error}", path.display()))?;
+    path.strip_prefix(scene_directory)
+        .unwrap_or(&path)
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("Scene asset path is not valid UTF-8: {}", path.display()))
 }
 
 impl SceneGroup {
@@ -664,6 +905,85 @@ mod tests {
     }
 
     #[test]
+    fn saves_and_loads_camera_render_material_and_environment_settings() {
+        let scene_directory = std::env::temp_dir().join(format!(
+            "bone-smashing-editor-state-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&scene_directory).unwrap();
+        let environment_path = scene_directory.join("studio.hdr");
+        fs::write(&environment_path, b"test environment path").unwrap();
+        let scene_path = scene_directory.join("scene.bse-scene");
+        let camera = Camera {
+            eye: Vec3::new(1.0, 3.0, 5.0),
+            yaw: -1.2,
+            pitch: -0.25,
+            up: Vec3::Y,
+            aspect: 16.0 / 9.0,
+        };
+        let mut settings = RendererSettings::default();
+        settings.exposure_ev = 1.25;
+        settings.render_scale = 0.75;
+        let mut params = MaterialParams::default();
+        params.roughness = 0.37;
+        params.metallic = 0.62;
+        let mut world = World::new();
+        world.add_object(RenderObject::new(
+            Transform::default(),
+            MeshId(0),
+            MaterialId(0),
+        ));
+
+        let mut file = SceneFile::from_world(&world, &scene_path).unwrap();
+        file.capture_editor_state(
+            &world,
+            &scene_path,
+            &camera,
+            settings,
+            Some(&environment_path),
+            &[params],
+        )
+        .unwrap();
+        assert_eq!(
+            file.environment.as_ref().unwrap().path.as_deref(),
+            Some("studio.hdr")
+        );
+        file.write(&scene_path).unwrap();
+
+        let loaded = load_scene(&scene_path).unwrap();
+        let saved_camera = loaded.file.camera.as_ref().unwrap();
+        assert_eq!(saved_camera.position, camera.eye.to_array());
+        assert_eq!(saved_camera.yaw, camera.yaw);
+        assert_eq!(saved_camera.pitch, camera.pitch);
+        assert_eq!(
+            loaded.file.renderer_settings.unwrap(),
+            SceneRendererSettings::from(settings)
+        );
+        assert_eq!(
+            loaded.file.objects[0].material_override.unwrap().roughness,
+            0.37
+        );
+        assert_eq!(
+            loaded.file.objects[0].material_override.unwrap().metallic,
+            0.62
+        );
+        assert_eq!(
+            loaded.file.environment.unwrap().path.as_deref(),
+            Some(
+                fs::canonicalize(environment_path)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            )
+        );
+        fs::remove_dir_all(scene_directory).unwrap();
+    }
+
+    #[test]
     fn rebuilds_builtin_objects_from_scene_data() {
         let file = SceneFile {
             version: SCENE_FORMAT_VERSION,
@@ -678,7 +998,11 @@ mod tests {
                 position: [1.0, 2.0, 3.0],
                 rotation: Quat::IDENTITY.to_array(),
                 scale: [2.0, 2.0, 2.0],
+                material_override: None,
             }],
+            camera: None,
+            renderer_settings: None,
+            environment: None,
         };
         let world = build_world(&file, 3, 6, HashMap::new()).unwrap();
 
@@ -697,6 +1021,9 @@ mod tests {
             version: SCENE_FORMAT_VERSION + 1,
             groups: Vec::new(),
             objects: Vec::new(),
+            camera: None,
+            renderer_settings: None,
+            environment: None,
         };
         assert!(
             file.validate()
@@ -715,6 +1042,7 @@ mod tests {
             position: [f32::NAN, 0.0, 0.0],
             rotation: Quat::IDENTITY.to_array(),
             scale: Vec3::ONE.to_array(),
+            material_override: None,
         });
         assert!(file.validate().unwrap_err().contains("invalid transform"));
     }
@@ -734,7 +1062,11 @@ mod tests {
                 position: Vec3::ZERO.to_array(),
                 rotation: Quat::IDENTITY.to_array(),
                 scale: Vec3::ONE.to_array(),
+                material_override: None,
             }],
+            camera: None,
+            renderer_settings: None,
+            environment: None,
         };
         assert!(file.validate().unwrap_err().contains("unknown model group"));
     }
@@ -773,6 +1105,29 @@ mod tests {
         assert!(loaded.file.groups.is_empty());
         assert_eq!(loaded.file.objects.len(), 1);
         assert_eq!(loaded.file.objects[0].model_group, None);
+    }
+
+    #[test]
+    fn migrates_version_two_scene_without_editor_state() {
+        let scene_directory = std::env::temp_dir().join(format!(
+            "bone-smashing-v2-scene-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&scene_directory).unwrap();
+        let scene_path = scene_directory.join("version-2.bse-scene");
+        fs::write(&scene_path, r#"{"version":2,"groups":[],"objects":[]}"#).unwrap();
+
+        let loaded = load_scene(&scene_path).unwrap();
+
+        assert_eq!(loaded.file.version, SCENE_FORMAT_VERSION);
+        assert!(loaded.file.camera.is_none());
+        assert!(loaded.file.renderer_settings.is_none());
+        assert!(loaded.file.environment.is_none());
+        fs::remove_dir_all(scene_directory).unwrap();
     }
 
     #[test]

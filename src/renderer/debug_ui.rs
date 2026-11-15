@@ -2,7 +2,8 @@ use crate::camera::Camera;
 use crate::core::{MATERIAL_DEFAULT, MESH_CUBE};
 use crate::renderer::state::{ParsedAsset, RenderTimings, Renderer, parse_asset};
 use crate::scene::{
-    LoadedScene, ModelGroupId, ObjectId, RenderObject, Transform, World, load_scene,
+    LoadedScene, ModelGroupId, ObjectId, RenderObject, SceneEnvironment, Transform, World,
+    load_scene,
 };
 use glam::{EulerRot, Mat4, Quat, Vec3};
 use std::path::{Path, PathBuf};
@@ -90,6 +91,7 @@ pub struct DebugUi {
     scene_loading: Option<mpsc::Receiver<Result<LoadedScene, String>>>,
     scene_save_request: Option<PathBuf>,
     scene_load_request: Option<Result<LoadedScene, String>>,
+    scene_environment_request: Option<Option<PathBuf>>,
     selected_scene_item: Option<SceneSelection>,
     gizmo_mode: GizmoMode,
     gizmo_drag: Option<GizmoDrag>,
@@ -581,6 +583,7 @@ impl DebugUi {
             scene_loading: None,
             scene_save_request: None,
             scene_load_request: None,
+            scene_environment_request: None,
             selected_scene_item: None,
             gizmo_mode: GizmoMode::Move,
             gizmo_drag: None,
@@ -680,8 +683,16 @@ impl DebugUi {
         self.scene_status = Some(status);
     }
 
-    pub fn scene_loaded(&mut self) {
+    pub fn scene_loaded(&mut self, environment: Option<SceneEnvironment>) {
         self.selected_scene_item = None;
+        self.scene_environment_request =
+            environment.map(|environment| environment.path.map(PathBuf::from));
+        if let Some(path) = self.scene_environment_request.as_ref() {
+            self.environment_path = path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default();
+        }
     }
 
     pub fn prepare_frame(
@@ -702,6 +713,17 @@ impl DebugUi {
                 }
                 Ok(None) => {}
                 Err(error) => self.status = Some(Err(error)),
+            }
+        }
+        if !renderer.environment_is_loading()
+            && let Some(path) = self.scene_environment_request.take()
+        {
+            let result = match path {
+                Some(path) => renderer.begin_environment_load(path),
+                None => renderer.begin_default_environment_load(),
+            };
+            if let Err(error) = result {
+                self.status = Some(Err(error));
             }
         }
 

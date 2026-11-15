@@ -1,5 +1,5 @@
 use half::f16;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 const DIFFUSE_IRRADIANCE_WIDTH: u32 = 128;
@@ -17,6 +17,7 @@ pub struct Environment {
     pub sampler: wgpu::Sampler,
     pub label: String,
     pub mip_count: u32,
+    pub source_path: Option<PathBuf>,
 }
 
 impl Environment {
@@ -102,6 +103,7 @@ impl Environment {
             sampler,
             label: "Loading environment...".to_owned(),
             mip_count: 1,
+            source_path: None,
         }
     }
 
@@ -179,14 +181,16 @@ impl Environment {
                 path.display()
             ));
         }
-        Ok(Self::from_rgb32f(
+        let mut environment = Self::from_rgb32f(
             device,
             queue,
             width,
             height,
             image.into_raw(),
             &path.display().to_string(),
-        ))
+        );
+        environment.source_path = Some(path.to_path_buf());
+        Ok(environment)
     }
 
     fn from_rgb32f(
@@ -412,6 +416,7 @@ impl Environment {
             sampler,
             label: label.to_owned(),
             mip_count: prefiltered_levels.len() as u32,
+            source_path: None,
         }
     }
 }

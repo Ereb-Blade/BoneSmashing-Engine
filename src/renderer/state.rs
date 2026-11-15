@@ -1055,6 +1055,10 @@ impl Renderer {
         &self.environment.label
     }
 
+    pub fn environment_path(&self) -> Option<&Path> {
+        self.environment.source_path.as_deref()
+    }
+
     pub fn environment_mip_count(&self) -> u32 {
         self.environment.mip_count
     }
@@ -1077,6 +1081,10 @@ impl Renderer {
                 device.limits().max_texture_dimension_2d,
             )
         })
+    }
+
+    pub fn begin_default_environment_load(&mut self) -> Result<(), String> {
+        self.start_environment_task(None, |device, queue| Ok(Environment::studio(device, queue)))
     }
 
     fn start_initial_environment_load(&mut self) {

@@ -66,6 +66,115 @@ struct GizmoDrag {
     last_pointer: egui::Pos2,
 }
 
+struct SceneSnapshot {
+    world: World,
+    selection: Option<SceneSelection>,
+}
+
+#[derive(Default)]
+struct UndoHistory {
+    undo: Vec<SceneSnapshot>,
+    redo: Vec<SceneSnapshot>,
+    active_transform_selection: Option<SceneSelection>,
+}
+
+impl UndoHistory {
+    const MAX_STEPS: usize = 32;
+
+    fn record(&mut self, world: &World, selection: Option<SceneSelection>) {
+        self.record_snapshot(world.clone(), selection);
+    }
+
+    fn record_snapshot(&mut self, world: World, selection: Option<SceneSelection>) {
+        Self::push_snapshot(&mut self.undo, SceneSnapshot { world, selection });
+        self.redo.clear();
+        self.active_transform_selection = None;
+    }
+
+    fn record_transform(
+        &mut self,
+        world: &World,
+        selection: Option<SceneSelection>,
+        transform_selection: SceneSelection,
+        pointer_down: bool,
+    ) {
+        if !pointer_down || self.active_transform_selection != Some(transform_selection) {
+            Self::push_snapshot(
+                &mut self.undo,
+                SceneSnapshot {
+                    world: world.clone(),
+                    selection,
+                },
+            );
+            self.redo.clear();
+        }
+        self.active_transform_selection = pointer_down.then_some(transform_selection);
+    }
+
+    fn undo(&mut self, world: &mut World, selection: &mut Option<SceneSelection>) -> bool {
+        let Some(snapshot) = self.undo.pop() else {
+            return false;
+        };
+        let id_sequences = world.id_sequences();
+        Self::push_snapshot(
+            &mut self.redo,
+            SceneSnapshot {
+                world: world.clone(),
+                selection: *selection,
+            },
+        );
+        *world = snapshot.world;
+        world.preserve_id_sequences(id_sequences);
+        *selection = snapshot
+            .selection
+            .filter(|selected| selection_is_valid(world, *selected));
+        self.active_transform_selection = None;
+        true
+    }
+
+    fn redo(&mut self, world: &mut World, selection: &mut Option<SceneSelection>) -> bool {
+        let Some(snapshot) = self.redo.pop() else {
+            return false;
+        };
+        let id_sequences = world.id_sequences();
+        Self::push_snapshot(
+            &mut self.undo,
+            SceneSnapshot {
+                world: world.clone(),
+                selection: *selection,
+            },
+        );
+        *world = snapshot.world;
+        world.preserve_id_sequences(id_sequences);
+        *selection = snapshot
+            .selection
+            .filter(|selected| selection_is_valid(world, *selected));
+        self.active_transform_selection = None;
+        true
+    }
+
+    fn clear(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+        self.active_transform_selection = None;
+    }
+
+    fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    fn push_snapshot(stack: &mut Vec<SceneSnapshot>, snapshot: SceneSnapshot) {
+        if stack.len() == Self::MAX_STEPS {
+            stack.remove(0);
+        }
+        stack.push(snapshot);
+    }
+}
+
 pub struct DebugUi {
     context: egui::Context,
     platform: egui_winit::State,
@@ -85,14 +194,17 @@ pub struct DebugUi {
     asset_dialog: Option<mpsc::Receiver<Option<PathBuf>>>,
     asset_import: Option<mpsc::Receiver<(PathBuf, Result<ParsedAsset, String>)>>,
     scene_path: String,
+    scene_dirty: bool,
     scene_status: Option<Result<String, String>>,
     scene_save_dialog: Option<mpsc::Receiver<Option<PathBuf>>>,
     scene_load_dialog: Option<mpsc::Receiver<Option<PathBuf>>>,
-    scene_loading: Option<mpsc::Receiver<Result<LoadedScene, String>>>,
+    scene_loading: Option<(PathBuf, mpsc::Receiver<Result<LoadedScene, String>>)>,
     scene_save_request: Option<PathBuf>,
-    scene_load_request: Option<Result<LoadedScene, String>>,
+    scene_load_request: Option<(PathBuf, Result<LoadedScene, String>)>,
     scene_environment_request: Option<Option<PathBuf>>,
+    scene_environment_load_pending: bool,
     selected_scene_item: Option<SceneSelection>,
+    history: UndoHistory,
     gizmo_mode: GizmoMode,
     gizmo_drag: Option<GizmoDrag>,
     viewport_rect: Option<egui::Rect>,
@@ -100,11 +212,12 @@ pub struct DebugUi {
     prepared: Option<PreparedFrame>,
 }
 
-fn edit_transform(ui: &mut egui::Ui, transform: &mut Transform) {
+fn edit_transform(ui: &mut egui::Ui, transform: &mut Transform) -> bool {
     let (mut pitch, mut yaw, mut roll) = transform.rotation.to_euler(EulerRot::XYZ);
     pitch = pitch.to_degrees();
     yaw = yaw.to_degrees();
     roll = roll.to_degrees();
+    let mut changed = false;
     let mut rotation_changed = false;
     egui::Grid::new("transform-inspector")
         .num_columns(4)
@@ -117,28 +230,34 @@ fn edit_transform(ui: &mut egui::Ui, transform: &mut Transform) {
             ui.end_row();
 
             ui.label("Position");
-            ui.add_sized(
-                [72.0, 26.0],
-                egui::DragValue::new(&mut transform.position.x)
-                    .speed(0.1)
-                    .range(-100_000.0..=100_000.0),
-            );
-            ui.add_sized(
-                [72.0, 26.0],
-                egui::DragValue::new(&mut transform.position.y)
-                    .speed(0.1)
-                    .range(-100_000.0..=100_000.0),
-            );
-            ui.add_sized(
-                [72.0, 26.0],
-                egui::DragValue::new(&mut transform.position.z)
-                    .speed(0.1)
-                    .range(-100_000.0..=100_000.0),
-            );
+            changed |= ui
+                .add_sized(
+                    [72.0, 26.0],
+                    egui::DragValue::new(&mut transform.position.x)
+                        .speed(0.1)
+                        .range(-100_000.0..=100_000.0),
+                )
+                .changed();
+            changed |= ui
+                .add_sized(
+                    [72.0, 26.0],
+                    egui::DragValue::new(&mut transform.position.y)
+                        .speed(0.1)
+                        .range(-100_000.0..=100_000.0),
+                )
+                .changed();
+            changed |= ui
+                .add_sized(
+                    [72.0, 26.0],
+                    egui::DragValue::new(&mut transform.position.z)
+                        .speed(0.1)
+                        .range(-100_000.0..=100_000.0),
+                )
+                .changed();
             ui.end_row();
 
             ui.label("Rotation");
-            rotation_changed |= ui
+            let value_changed = ui
                 .add_sized(
                     [72.0, 26.0],
                     egui::DragValue::new(&mut pitch)
@@ -147,7 +266,9 @@ fn edit_transform(ui: &mut egui::Ui, transform: &mut Transform) {
                         .suffix("°"),
                 )
                 .changed();
-            rotation_changed |= ui
+            rotation_changed |= value_changed;
+            changed |= value_changed;
+            let value_changed = ui
                 .add_sized(
                     [72.0, 26.0],
                     egui::DragValue::new(&mut yaw)
@@ -156,7 +277,9 @@ fn edit_transform(ui: &mut egui::Ui, transform: &mut Transform) {
                         .suffix("°"),
                 )
                 .changed();
-            rotation_changed |= ui
+            rotation_changed |= value_changed;
+            changed |= value_changed;
+            let value_changed = ui
                 .add_sized(
                     [72.0, 26.0],
                     egui::DragValue::new(&mut roll)
@@ -165,27 +288,35 @@ fn edit_transform(ui: &mut egui::Ui, transform: &mut Transform) {
                         .suffix("°"),
                 )
                 .changed();
+            rotation_changed |= value_changed;
+            changed |= value_changed;
             ui.end_row();
 
             ui.label("Scale");
-            ui.add_sized(
-                [72.0, 26.0],
-                egui::DragValue::new(&mut transform.scale.x)
-                    .speed(0.05)
-                    .range(-1_000.0..=1_000.0),
-            );
-            ui.add_sized(
-                [72.0, 26.0],
-                egui::DragValue::new(&mut transform.scale.y)
-                    .speed(0.05)
-                    .range(-1_000.0..=1_000.0),
-            );
-            ui.add_sized(
-                [72.0, 26.0],
-                egui::DragValue::new(&mut transform.scale.z)
-                    .speed(0.05)
-                    .range(-1_000.0..=1_000.0),
-            );
+            changed |= ui
+                .add_sized(
+                    [72.0, 26.0],
+                    egui::DragValue::new(&mut transform.scale.x)
+                        .speed(0.05)
+                        .range(-1_000.0..=1_000.0),
+                )
+                .changed();
+            changed |= ui
+                .add_sized(
+                    [72.0, 26.0],
+                    egui::DragValue::new(&mut transform.scale.y)
+                        .speed(0.05)
+                        .range(-1_000.0..=1_000.0),
+                )
+                .changed();
+            changed |= ui
+                .add_sized(
+                    [72.0, 26.0],
+                    egui::DragValue::new(&mut transform.scale.z)
+                        .speed(0.05)
+                        .range(-1_000.0..=1_000.0),
+                )
+                .changed();
             ui.end_row();
         });
     if rotation_changed {
@@ -196,6 +327,7 @@ fn edit_transform(ui: &mut egui::Ui, transform: &mut Transform) {
             roll.to_radians(),
         );
     }
+    changed
 }
 
 fn project_to_screen(
@@ -234,6 +366,13 @@ fn selected_transform_mut(
             world.get_object_mut(id).map(|object| &mut object.transform)
         }
         None => None,
+    }
+}
+
+fn selection_is_valid(world: &World, selected: SceneSelection) -> bool {
+    match selected {
+        SceneSelection::Model(id) => world.model_group(id).is_some(),
+        SceneSelection::Part(id) | SceneSelection::Object(id) => world.get_object(id).is_some(),
     }
 }
 
@@ -326,7 +465,8 @@ fn paint_scene_gizmo(
     selected: &mut Option<SceneSelection>,
     mode: GizmoMode,
     drag_state: &mut Option<GizmoDrag>,
-) {
+) -> bool {
+    let mut changed = false;
     let context = ui.ctx();
     let pointer = context.input(|input| input.pointer.latest_pos());
     let primary_pressed =
@@ -429,6 +569,7 @@ fn paint_scene_gizmo(
             let pointer_delta = pointer_position - drag.last_pointer;
             let amount = pointer_delta.dot(drag.screen_direction) * drag.world_per_pixel;
             if let Some(transform) = selected_transform_mut(world, *selected) {
+                changed |= amount != 0.0;
                 match drag.mode {
                     GizmoMode::Move => transform.position += axis_vector(drag.axis) * amount,
                     GizmoMode::Rotate => {
@@ -450,13 +591,13 @@ fn paint_scene_gizmo(
     }
 
     let Some(position) = selected_world_position(world, *selected) else {
-        return;
+        return changed;
     };
     let Some(center) = project_to_screen(position, view_projection, screen_rect) else {
-        return;
+        return changed;
     };
     if !viewport_rect.contains(center) {
-        return;
+        return changed;
     }
 
     let painter = ui.painter().with_clip_rect(viewport_rect);
@@ -475,7 +616,7 @@ fn paint_scene_gizmo(
                 painter.add(egui::Shape::line(points, egui::Stroke::new(2.5_f32, color)));
             }
         }
-        return;
+        return changed;
     }
 
     let world_length =
@@ -512,6 +653,7 @@ fn paint_scene_gizmo(
         }
     }
     painter.circle_filled(center, 4.0, egui::Color32::WHITE);
+    changed
 }
 
 impl DebugUi {
@@ -577,6 +719,7 @@ impl DebugUi {
             asset_dialog: None,
             asset_import: None,
             scene_path: String::new(),
+            scene_dirty: false,
             scene_status: None,
             scene_save_dialog: None,
             scene_load_dialog: None,
@@ -584,7 +727,9 @@ impl DebugUi {
             scene_save_request: None,
             scene_load_request: None,
             scene_environment_request: None,
+            scene_environment_load_pending: false,
             selected_scene_item: None,
+            history: UndoHistory::default(),
             gizmo_mode: GizmoMode::Move,
             gizmo_drag: None,
             viewport_rect: None,
@@ -675,7 +820,7 @@ impl DebugUi {
         self.scene_save_request.take()
     }
 
-    pub fn take_scene_load_request(&mut self) -> Option<Result<LoadedScene, String>> {
+    pub fn take_scene_load_request(&mut self) -> Option<(PathBuf, Result<LoadedScene, String>)> {
         self.scene_load_request.take()
     }
 
@@ -683,8 +828,24 @@ impl DebugUi {
         self.scene_status = Some(status);
     }
 
-    pub fn scene_loaded(&mut self, environment: Option<SceneEnvironment>) {
+    pub fn scene_save_finished(&mut self, path: PathBuf, result: Result<String, String>) {
+        if result.is_ok() {
+            self.scene_path = path.display().to_string();
+            self.scene_dirty = false;
+        }
+        self.scene_status = Some(result);
+    }
+
+    pub fn mark_scene_dirty(&mut self) {
+        self.scene_dirty = true;
+    }
+
+    pub fn scene_loaded(&mut self, path: PathBuf, environment: Option<SceneEnvironment>) {
+        self.scene_path = path.display().to_string();
+        self.scene_dirty = false;
         self.selected_scene_item = None;
+        self.history.clear();
+        self.scene_environment_load_pending = false;
         self.scene_environment_request =
             environment.map(|environment| environment.path.map(PathBuf::from));
         if let Some(path) = self.scene_environment_request.as_ref() {
@@ -693,6 +854,11 @@ impl DebugUi {
                 .map(|path| path.display().to_string())
                 .unwrap_or_default();
         }
+    }
+
+    pub fn record_undo_snapshot(&mut self, world: World) {
+        self.history
+            .record_snapshot(world, self.selected_scene_item);
     }
 
     pub fn prepare_frame(
@@ -710,9 +876,19 @@ impl DebugUi {
             match result {
                 Ok(Some(_)) => {
                     self.status = Some(Ok("HDR environment loaded".to_owned()));
+                    if self.scene_environment_load_pending
+                        || self.scene_environment_request.is_some()
+                    {
+                        self.scene_environment_load_pending = false;
+                    } else {
+                        self.mark_scene_dirty();
+                    }
                 }
                 Ok(None) => {}
-                Err(error) => self.status = Some(Err(error)),
+                Err(error) => {
+                    self.scene_environment_load_pending = false;
+                    self.status = Some(Err(error));
+                }
             }
         }
         if !renderer.environment_is_loading()
@@ -722,8 +898,12 @@ impl DebugUi {
                 Some(path) => renderer.begin_environment_load(path),
                 None => renderer.begin_default_environment_load(),
             };
-            if let Err(error) = result {
-                self.status = Some(Err(error));
+            match result {
+                Ok(()) => self.scene_environment_load_pending = true,
+                Err(error) => {
+                    self.scene_environment_load_pending = false;
+                    self.status = Some(Err(error));
+                }
             }
         }
 
@@ -733,6 +913,8 @@ impl DebugUi {
         let mut selected_params = renderer
             .material_params(self.selected_material)
             .unwrap_or_default();
+        let settings_before = settings;
+        let selected_params_before = selected_params;
         let mut load_environment = false;
         let mut pick_environment = false;
         let mut pick_asset = false;
@@ -741,13 +923,15 @@ impl DebugUi {
         let mut add_cube = false;
         let mut duplicate_selection = false;
         let mut delete_selection = false;
-        let selection_is_valid = match self.selected_scene_item {
-            Some(SceneSelection::Model(id)) => world.model_group(id).is_some(),
-            Some(SceneSelection::Part(id) | SceneSelection::Object(id)) => {
-                world.get_object(id).is_some()
-            }
-            None => false,
-        };
+        let mut undo_requested = false;
+        let mut redo_requested = false;
+        let mut save_requested = false;
+        let mut save_current = false;
+        let mut scene_modified = false;
+        let mut transform_change = None;
+        let selection_is_valid = self
+            .selected_scene_item
+            .is_some_and(|selected| selection_is_valid(world, selected));
         let mut selected_scene_item = if selection_is_valid {
             self.selected_scene_item
         } else {
@@ -811,7 +995,6 @@ impl DebugUi {
         if let Some(dialog) = &self.scene_save_dialog {
             match dialog.try_recv() {
                 Ok(Some(path)) => {
-                    self.scene_path = path.display().to_string();
                     self.scene_save_request = Some(path);
                     self.scene_save_dialog = None;
                 }
@@ -827,10 +1010,9 @@ impl DebugUi {
         if let Some(dialog) = &self.scene_load_dialog {
             match dialog.try_recv() {
                 Ok(Some(path)) => {
-                    self.scene_path = path.display().to_string();
-                    match Self::load_scene_in_background(path) {
+                    match Self::load_scene_in_background(path.clone()) {
                         Ok(receiver) => {
-                            self.scene_loading = Some(receiver);
+                            self.scene_loading = Some((path, receiver));
                             self.scene_status =
                                 Some(Ok("Reading scene and model files...".to_owned()));
                         }
@@ -850,10 +1032,10 @@ impl DebugUi {
                 }
             }
         }
-        if let Some(loading) = &self.scene_loading {
+        if let Some((path, loading)) = &self.scene_loading {
             match loading.try_recv() {
                 Ok(result) => {
-                    self.scene_load_request = Some(result);
+                    self.scene_load_request = Some((path.clone(), result));
                     self.scene_loading = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -869,6 +1051,18 @@ impl DebugUi {
             if !self.visible {
                 return;
             }
+            let wants_keyboard_input = context.wants_keyboard_input();
+            context.input_mut(|input| {
+                if !wants_keyboard_input {
+                    undo_requested |= input.consume_key(egui::Modifiers::COMMAND, egui::Key::Z);
+                    redo_requested |= input.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
+                        || input.consume_key(
+                            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                            egui::Key::Z,
+                        );
+                }
+                save_requested |= input.consume_key(egui::Modifiers::COMMAND, egui::Key::S);
+            });
             let scene_io_enabled = self.scene_loading.is_none()
                 && self.scene_save_dialog.is_none()
                 && self.scene_load_dialog.is_none()
@@ -877,6 +1071,13 @@ impl DebugUi {
                 && self.asset_dialog.is_none()
                 && self.asset_import.is_none()
                 && self.asset_request.is_none();
+            if save_requested && scene_io_enabled {
+                if self.scene_path.is_empty() {
+                    pick_scene_to_save = true;
+                } else {
+                    save_current = true;
+                }
+            }
             let import_enabled = self.asset_dialog.is_none()
                 && self.asset_import.is_none()
                 && self.scene_loading.is_none()
@@ -899,6 +1100,20 @@ impl DebugUi {
                             if ui
                                 .add_enabled(
                                     scene_io_enabled,
+                                    egui::Button::new("Save scene").shortcut_text("Ctrl+S"),
+                                )
+                                .clicked()
+                            {
+                                if self.scene_path.is_empty() {
+                                    pick_scene_to_save = true;
+                                } else {
+                                    save_current = true;
+                                }
+                                ui.close();
+                            }
+                            if ui
+                                .add_enabled(
+                                    scene_io_enabled,
                                     egui::Button::new("Save scene as..."),
                                 )
                                 .clicked()
@@ -907,6 +1122,24 @@ impl DebugUi {
                                 ui.close();
                             }
                         });
+                        if ui
+                            .add_enabled(
+                                self.history.can_undo(),
+                                egui::Button::new("Undo").shortcut_text("Ctrl+Z"),
+                            )
+                            .clicked()
+                        {
+                            undo_requested = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                self.history.can_redo(),
+                                egui::Button::new("Redo").shortcut_text("Ctrl+Y"),
+                            )
+                            .clicked()
+                        {
+                            redo_requested = true;
+                        }
                         if ui
                             .add_enabled(import_enabled, egui::Button::new("Import model"))
                             .clicked()
@@ -1000,22 +1233,37 @@ impl DebugUi {
                                 egui::CollapsingHeader::new("Hierarchy")
                                     .default_open(true)
                                     .show(ui, |ui| {
-                                        if !self.scene_path.is_empty() {
+                                        let scene_name = Path::new(&self.scene_path)
+                                            .file_name()
+                                            .and_then(|name| name.to_str())
+                                            .filter(|_| !self.scene_path.is_empty())
+                                            .unwrap_or("Untitled scene");
+                                        ui.horizontal(|ui| {
                                             ui.add(
                                                 egui::Label::new(
                                                     egui::RichText::new(format!(
-                                                        "Scene: {}",
-                                                        Path::new(&self.scene_path)
-                                                            .file_name()
-                                                            .and_then(|name| name.to_str())
-                                                            .unwrap_or(&self.scene_path)
+                                                        "Scene: {scene_name}"
                                                     ))
                                                     .small(),
                                                 )
                                                 .truncate(),
                                             )
                                             .on_hover_text(&self.scene_path);
-                                        }
+                                            if self.scene_dirty {
+                                                let (rect, response) = ui.allocate_exact_size(
+                                                    egui::vec2(8.0, 8.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                ui.painter().circle_filled(
+                                                    rect.center(),
+                                                    3.0,
+                                                    egui::Color32::YELLOW,
+                                                );
+                                                response.on_hover_text(
+                                                    "Unsaved changes — press Ctrl+S to save",
+                                                );
+                                            }
+                                        });
                                         if self.scene_loading.is_some()
                                             || self.scene_load_dialog.is_some()
                                             || self.scene_save_dialog.is_some()
@@ -1261,14 +1509,26 @@ impl DebugUi {
                                                             world.model_group_mut(group_id)
                                                         {
                                                             ui.label("Model");
-                                                            ui.text_edit_singleline(
-                                                                &mut group.name,
-                                                            );
+                                                            if ui
+                                                                .text_edit_singleline(
+                                                                    &mut group.name,
+                                                                )
+                                                                .changed()
+                                                            {
+                                                                scene_modified = true;
+                                                            }
                                                             ui.separator();
-                                                            edit_transform(
+                                                            let before = group.transform;
+                                                            if edit_transform(
                                                                 ui,
                                                                 &mut group.transform,
-                                                            );
+                                                            ) {
+                                                                transform_change = Some((
+                                                                    SceneSelection::Model(group_id),
+                                                                    before,
+                                                                ));
+                                                                scene_modified = true;
+                                                            }
                                                         }
                                                     }
                                                     Some(
@@ -1279,14 +1539,26 @@ impl DebugUi {
                                                             world.get_object_mut(object_id)
                                                         {
                                                             ui.label("Object");
-                                                            ui.text_edit_singleline(
-                                                                &mut object.name,
-                                                            );
+                                                            if ui
+                                                                .text_edit_singleline(
+                                                                    &mut object.name,
+                                                                )
+                                                                .changed()
+                                                            {
+                                                                scene_modified = true;
+                                                            }
                                                             ui.separator();
-                                                            edit_transform(
+                                                            let before = object.transform;
+                                                            if edit_transform(
                                                                 ui,
                                                                 &mut object.transform,
-                                                            );
+                                                            ) {
+                                                                transform_change = Some((
+                                                                    SceneSelection::Part(object_id),
+                                                                    before,
+                                                                ));
+                                                                scene_modified = true;
+                                                            }
                                                         }
                                                     }
                                                     None => {
@@ -1555,7 +1827,8 @@ impl DebugUi {
                 .show(context, |ui| {
                     let viewport_rect = ui.max_rect();
                     self.viewport_rect = Some(viewport_rect);
-                    paint_scene_gizmo(
+                    let had_gizmo_drag = self.gizmo_drag.is_some();
+                    scene_modified |= paint_scene_gizmo(
                         ui,
                         viewport_rect,
                         context.screen_rect(),
@@ -1565,6 +1838,9 @@ impl DebugUi {
                         self.gizmo_mode,
                         &mut self.gizmo_drag,
                     );
+                    if !had_gizmo_drag && self.gizmo_drag.is_some() {
+                        self.history.record(world, selected_scene_item);
+                    }
                 });
 
             if self.visible && self.show_camera_settings {
@@ -1627,7 +1903,40 @@ impl DebugUi {
                     });
             }
         });
+        scene_modified |= settings != settings_before || selected_params != selected_params_before;
+        if save_current {
+            self.scene_save_request = Some(PathBuf::from(&self.scene_path));
+            self.scene_status = None;
+        }
+        if let Some((transform_selection, before)) = transform_change {
+            if let Some(after) = selected_transform_mut(world, Some(transform_selection)).copied() {
+                if let Some(transform) = selected_transform_mut(world, Some(transform_selection)) {
+                    *transform = before;
+                }
+                let pointer_down = self.context.input(|input| input.pointer.any_down());
+                self.history.record_transform(
+                    world,
+                    selected_scene_item,
+                    transform_selection,
+                    pointer_down,
+                );
+                if let Some(transform) = selected_transform_mut(world, Some(transform_selection)) {
+                    *transform = after;
+                }
+            }
+        }
+        if !self.context.input(|input| input.pointer.any_down()) {
+            self.history.active_transform_selection = None;
+        }
+        if undo_requested {
+            scene_modified |= self.history.undo(world, &mut selected_scene_item);
+            self.gizmo_drag = None;
+        } else if redo_requested {
+            scene_modified |= self.history.redo(world, &mut selected_scene_item);
+            self.gizmo_drag = None;
+        }
         if add_cube {
+            self.history.record(world, selected_scene_item);
             let forward = Vec3::new(
                 camera.yaw.cos() * camera.pitch.cos(),
                 camera.pitch.sin(),
@@ -1643,33 +1952,46 @@ impl DebugUi {
                 .with_name("Cube"),
             );
             selected_scene_item = Some(SceneSelection::Object(id));
+            scene_modified = true;
         }
         if duplicate_selection {
-            selected_scene_item = match selected_scene_item {
-                Some(SceneSelection::Model(id)) => {
-                    world.duplicate_model_group(id).map(SceneSelection::Model)
-                }
-                Some(SceneSelection::Part(id)) => {
-                    world.duplicate_object(id).map(SceneSelection::Part)
-                }
-                Some(SceneSelection::Object(id)) => {
-                    world.duplicate_object(id).map(SceneSelection::Object)
-                }
-                None => None,
-            };
+            if selected_scene_item.is_some() {
+                self.history.record(world, selected_scene_item);
+                let duplicate = match selected_scene_item {
+                    Some(SceneSelection::Model(id)) => {
+                        world.duplicate_model_group(id).map(SceneSelection::Model)
+                    }
+                    Some(SceneSelection::Part(id)) => {
+                        world.duplicate_object(id).map(SceneSelection::Part)
+                    }
+                    Some(SceneSelection::Object(id)) => {
+                        world.duplicate_object(id).map(SceneSelection::Object)
+                    }
+                    None => None,
+                };
+                scene_modified |= duplicate.is_some();
+                selected_scene_item = duplicate;
+            }
         }
         if delete_selection {
-            match selected_scene_item {
-                Some(SceneSelection::Model(id)) => {
-                    world.remove_model_group(id);
+            if selected_scene_item.is_some() {
+                self.history.record(world, selected_scene_item);
+                match selected_scene_item {
+                    Some(SceneSelection::Model(id)) => {
+                        world.remove_model_group(id);
+                    }
+                    Some(SceneSelection::Part(id) | SceneSelection::Object(id)) => {
+                        world.remove_object(id);
+                    }
+                    None => {}
                 }
-                Some(SceneSelection::Part(id) | SceneSelection::Object(id)) => {
-                    world.remove_object(id);
-                }
-                None => {}
+                selected_scene_item = None;
+                self.gizmo_drag = None;
+                scene_modified = true;
             }
-            selected_scene_item = None;
-            self.gizmo_drag = None;
+        }
+        if scene_modified {
+            self.mark_scene_dirty();
         }
         self.selected_scene_item = selected_scene_item;
         self.platform
@@ -1911,5 +2233,99 @@ mod tests {
             pick_scene_object(sphere_center, screen_rect, &camera, &world),
             Some(SceneSelection::Part(id)) if id == sphere_id
         ));
+    }
+
+    #[test]
+    fn undo_redo_restores_objects_without_reusing_ids() {
+        let mut world = World::new();
+        world.add_object(RenderObject::new(
+            Transform::default(),
+            MeshId(0),
+            MaterialId(0),
+        ));
+        let mut history = UndoHistory::default();
+        history.record(&world, None);
+
+        let group =
+            world.add_model_group("Model", PathBuf::from("model.glb"), Transform::default());
+        let added = world
+            .add_group_object(
+                group,
+                RenderObject::new(Transform::default(), MeshId(1), MaterialId(0)),
+            )
+            .unwrap();
+        let mut selection = Some(SceneSelection::Part(added));
+
+        assert!(history.undo(&mut world, &mut selection));
+        assert!(world.get_object(added).is_none());
+        assert!(world.model_group(group).is_none());
+        assert_eq!(world.objects().len(), 1);
+        assert!(selection.is_none());
+
+        assert!(history.redo(&mut world, &mut selection));
+        assert!(world.get_object(added).is_some());
+        assert!(world.model_group(group).is_some());
+        assert!(selection == Some(SceneSelection::Part(added)));
+
+        assert!(history.undo(&mut world, &mut selection));
+        let branched_group = world.add_model_group(
+            "Branched",
+            PathBuf::from("branched.glb"),
+            Transform::default(),
+        );
+        let branched = world.add_object(RenderObject::new(
+            Transform::default(),
+            MeshId(2),
+            MaterialId(0),
+        ));
+        assert_ne!(branched, added);
+        assert_ne!(branched_group, group);
+    }
+
+    #[test]
+    fn undo_redo_restores_transform_changes() {
+        let mut world = World::new();
+        let id = world.add_object(RenderObject::new(
+            Transform::default(),
+            MeshId(0),
+            MaterialId(0),
+        ));
+        let mut history = UndoHistory::default();
+        history.record_transform(
+            &world,
+            Some(SceneSelection::Object(id)),
+            SceneSelection::Object(id),
+            false,
+        );
+        world.get_object_mut(id).unwrap().transform.position = Vec3::X;
+        let mut selection = Some(SceneSelection::Object(id));
+
+        assert!(history.undo(&mut world, &mut selection));
+        assert_eq!(world.get_object(id).unwrap().transform.position, Vec3::ZERO);
+        assert!(history.redo(&mut world, &mut selection));
+        assert_eq!(world.get_object(id).unwrap().transform.position, Vec3::X);
+    }
+
+    #[test]
+    fn recording_after_undo_clears_the_redo_branch() {
+        let mut world = World::new();
+        world.add_object(RenderObject::new(
+            Transform::default(),
+            MeshId(0),
+            MaterialId(0),
+        ));
+        let mut history = UndoHistory::default();
+        history.record(&world, None);
+        world.add_object(RenderObject::new(
+            Transform::default(),
+            MeshId(1),
+            MaterialId(0),
+        ));
+        let mut selection = None;
+
+        assert!(history.undo(&mut world, &mut selection));
+        assert!(history.can_redo());
+        history.record(&world, selection);
+        assert!(!history.can_redo());
     }
 }

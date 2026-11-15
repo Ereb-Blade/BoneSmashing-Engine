@@ -504,8 +504,14 @@ impl ApplicationHandler for App {
                     self.fps_elapsed = 0.0;
                 }
 
+                let camera_before = (self.camera.eye, self.camera.yaw, self.camera.pitch);
                 self.camera_controller
                     .update_camera(&mut self.camera, &self.input, dt);
+                if camera_before != (self.camera.eye, self.camera.yaw, self.camera.pitch)
+                    && let Some(debug_ui) = self.debug_ui.as_mut()
+                {
+                    debug_ui.mark_scene_dirty();
+                }
                 self.input.reset_mouse_delta();
 
                 self.world.update(dt);
@@ -568,9 +574,9 @@ impl ApplicationHandler for App {
                             scene.write(&path)?;
                             Ok(format!("Saved scene to {}", path.display()))
                         })();
-                        debug_ui.set_scene_status(result);
+                        debug_ui.scene_save_finished(path, result);
                     }
-                    if let Some(loaded) = debug_ui.take_scene_load_request() {
+                    if let Some((path, loaded)) = debug_ui.take_scene_load_request() {
                         match loaded.and_then(|loaded| Self::restore_scene(renderer, loaded)) {
                             Ok((world, file)) => {
                                 self.world = world;
@@ -606,22 +612,31 @@ impl ApplicationHandler for App {
                                     }
                                     renderer.set_settings(settings);
                                 }
-                                debug_ui.scene_loaded(file.environment.clone());
+                                debug_ui.scene_loaded(path, file.environment.clone());
                                 debug_ui.set_scene_status(Ok(status));
                             }
                             Err(error) => debug_ui.set_scene_status(Err(error)),
                         }
                     }
                     if let Some((path, parsed)) = debug_ui.take_asset_request() {
-                        let result = parsed.and_then(|parsed| {
-                            Self::import_asset(
-                                renderer,
-                                &mut self.world,
-                                &self.camera,
-                                &path,
-                                parsed,
-                            )
-                        });
+                        let result = match parsed {
+                            Ok(parsed) => {
+                                let snapshot = self.world.clone();
+                                let result = Self::import_asset(
+                                    renderer,
+                                    &mut self.world,
+                                    &self.camera,
+                                    &path,
+                                    parsed,
+                                );
+                                if result.is_ok() {
+                                    debug_ui.record_undo_snapshot(snapshot);
+                                    debug_ui.mark_scene_dirty();
+                                }
+                                result
+                            }
+                            Err(error) => Err(error),
+                        };
                         debug_ui.set_asset_status(result);
                     }
                     let render_started = Instant::now();

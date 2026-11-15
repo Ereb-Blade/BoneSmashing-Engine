@@ -64,6 +64,11 @@ impl CameraController {
     }
 
     pub fn update_camera(&self, camera: &mut Camera, input: &Input, dt: f32) {
+        if input.is_key_pressed(KeyCode::ControlLeft) || input.is_key_pressed(KeyCode::ControlRight)
+        {
+            return;
+        }
+
         if input.cursor_locked {
             camera.yaw += input.mouse_delta.0 as f32 * self.sensitivity;
             camera.pitch -= input.mouse_delta.1 as f32 * self.sensitivity;
@@ -101,5 +106,45 @@ impl CameraController {
         }
 
         camera.eye += movement.normalize_or_zero() * self.speed * dt;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_camera() -> Camera {
+        Camera {
+            eye: Vec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+            up: Vec3::Y,
+            aspect: 1.0,
+        }
+    }
+
+    #[test]
+    fn control_shortcuts_do_not_move_the_camera() {
+        let controller = CameraController::new(5.0, 0.1);
+        let mut camera = test_camera();
+        let mut input = Input::new();
+        input.process_key(KeyCode::ControlLeft, true);
+        input.process_key(KeyCode::KeyS, true);
+
+        controller.update_camera(&mut camera, &input, 1.0);
+
+        assert_eq!(camera.eye, Vec3::ZERO);
+    }
+
+    #[test]
+    fn s_still_moves_the_camera_without_control() {
+        let controller = CameraController::new(5.0, 0.1);
+        let mut camera = test_camera();
+        let mut input = Input::new();
+        input.process_key(KeyCode::KeyS, true);
+
+        controller.update_camera(&mut camera, &input, 1.0);
+
+        assert_ne!(camera.eye, Vec3::ZERO);
     }
 }

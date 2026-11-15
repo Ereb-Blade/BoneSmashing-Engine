@@ -19,6 +19,7 @@ pub struct ModelGroup {
     pub(crate) objects: Vec<ObjectId>,
 }
 
+#[derive(Clone)]
 pub struct World {
     objects: Vec<RenderObject>,
     object_ids: Vec<ObjectId>,
@@ -247,6 +248,15 @@ impl World {
             self.add_group_object(copy_id, object)?;
         }
         Some(copy_id)
+    }
+
+    pub(crate) fn id_sequences(&self) -> (usize, usize) {
+        (self.next_object_id, self.next_model_group_id)
+    }
+
+    pub(crate) fn preserve_id_sequences(&mut self, sequences: (usize, usize)) {
+        self.next_object_id = self.next_object_id.max(sequences.0);
+        self.next_model_group_id = self.next_model_group_id.max(sequences.1);
     }
 
     pub fn update(&mut self, dt: f32) {

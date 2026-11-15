@@ -147,4 +147,13 @@ mod tests {
 
         assert_ne!(camera.eye, Vec3::ZERO);
     }
+
+    #[test]
+    fn distant_geometry_remains_inside_the_camera_far_plane() {
+        let camera = test_camera();
+        let clip = camera.build_view_projection_matrix() * Vec3::new(500.0, 0.0, 0.0).extend(1.0);
+        let depth = clip.z / clip.w;
+
+        assert!((0.0..1.0).contains(&depth));
+    }
 }

@@ -16,7 +16,36 @@ pub struct ModelGroup {
     pub name: String,
     pub transform: Transform,
     pub source_path: PathBuf,
+    pub animation_clips: Vec<ModelAnimationClip>,
+    pub animation: Option<ModelAnimationPlayback>,
     pub(crate) objects: Vec<ObjectId>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelAnimationClip {
+    pub name: String,
+    pub duration: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ModelAnimationPlayback {
+    pub clip_index: usize,
+    pub time: f32,
+    pub speed: f32,
+    pub looping: bool,
+    pub playing: bool,
+}
+
+impl Default for ModelAnimationPlayback {
+    fn default() -> Self {
+        Self {
+            clip_index: 0,
+            time: 0.0,
+            speed: 1.0,
+            looping: true,
+            playing: false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -91,6 +120,8 @@ impl World {
             name: name.into(),
             transform,
             source_path,
+            animation_clips: Vec::new(),
+            animation: None,
             objects: Vec::new(),
         });
         id
@@ -244,6 +275,10 @@ impl World {
             source.source_path,
             transform,
         );
+        if let Some(copy) = self.model_group_mut(copy_id) {
+            copy.animation_clips = source.animation_clips;
+            copy.animation = source.animation;
+        }
         for object in objects {
             self.add_group_object(copy_id, object)?;
         }

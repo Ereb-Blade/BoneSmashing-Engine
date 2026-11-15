@@ -6,4 +6,4 @@ pub mod world;
 pub use entity::RenderObject;
 pub use io::{LoadedScene, SceneEnvironment, SceneFile, build_world, load_scene};
 pub use transform::Transform;
-pub use world::{ModelGroupId, ObjectId, World};
+pub use world::{ModelAnimationClip, ModelAnimationPlayback, ModelGroupId, ObjectId, World};

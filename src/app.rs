@@ -1,5 +1,7 @@
 use glam::{Quat, Vec3};
+use std::collections::HashMap;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use winit::{
@@ -20,7 +22,30 @@ use crate::input::Input;
 use crate::renderer::debug_ui::{CameraControlMode, CameraLookButton, DebugUi};
 use crate::renderer::gltf::{GltfPrimitiveInstance, LoadedGltfModel};
 use crate::renderer::state::{LoadedAsset, ParsedAsset, Renderer, RendererSettings};
-use crate::scene::{ObjectId, RenderObject, SceneFile, Transform, World, build_world};
+use crate::scene::{
+    ModelAnimationClip, ModelAnimationPlayback, RenderObject, SceneFile, Transform, World,
+    build_world,
+};
+
+fn advance_animation_playback(playback: &mut ModelAnimationPlayback, duration: f32, dt: f32) {
+    if !playback.playing {
+        return;
+    }
+    if duration <= 0.0 {
+        playback.time = 0.0;
+        playback.playing = false;
+        return;
+    }
+    playback.time += dt * playback.speed;
+    if playback.time >= duration {
+        if playback.looping {
+            playback.time %= duration;
+        } else {
+            playback.time = duration;
+            playback.playing = false;
+        }
+    }
+}
 
 pub struct App {
     window: Option<Arc<Window>>,
@@ -30,10 +55,8 @@ pub struct App {
     camera_controller: CameraController,
     last_time: Instant,
     world: World,
-    animated_model: Option<LoadedGltfModel>,
-    animated_object_ids: Vec<ObjectId>,
+    animation_models: HashMap<PathBuf, LoadedGltfModel>,
     animated_instances: Vec<GltfPrimitiveInstance>,
-    animation_time: f32,
     debug_ui: Option<DebugUi>,
     fps_frames: u32,
     fps_elapsed: f32,
@@ -63,10 +86,8 @@ impl App {
             camera_controller: CameraController::new(CAMERA_SPEED, CAMERA_SENSITIVITY),
             last_time: Instant::now(),
             world: World::new(),
-            animated_model: None,
-            animated_object_ids: Vec::new(),
+            animation_models: HashMap::new(),
             animated_instances: Vec::new(),
-            animation_time: 0.0,
             debug_ui: None,
             fps_frames: 0,
             fps_elapsed: 0.0,
@@ -78,6 +99,7 @@ impl App {
     fn import_asset(
         renderer: &mut Renderer,
         world: &mut World,
+        animation_models: &mut HashMap<PathBuf, LoadedGltfModel>,
         camera: &Camera,
         path: &Path,
         parsed: ParsedAsset,
@@ -103,6 +125,19 @@ impl App {
                     path.to_path_buf(),
                     Transform::from_translation(position),
                 );
+                if !model.animations.is_empty() {
+                    if let Some(group) = world.model_group_mut(group) {
+                        group.animation_clips = model
+                            .animations
+                            .iter()
+                            .map(|animation| ModelAnimationClip {
+                                name: animation.name.clone(),
+                                duration: animation.duration,
+                            })
+                            .collect();
+                        group.animation = Some(ModelAnimationPlayback::default());
+                    }
+                }
                 for (instance_index, instance) in model.instances.iter().enumerate() {
                     world
                         .add_group_object(
@@ -120,6 +155,9 @@ impl App {
                         .ok_or_else(|| {
                             format!("Could not create model group for {}", path.display())
                         })?;
+                }
+                if !model.animations.is_empty() {
+                    animation_models.insert(path.to_path_buf(), model);
                 }
                 Ok(format!("Imported {count} model parts"))
             }
@@ -156,30 +194,37 @@ impl App {
     fn restore_scene(
         renderer: &mut Renderer,
         loaded: crate::scene::LoadedScene,
-    ) -> Result<(World, SceneFile), String> {
+    ) -> Result<(World, SceneFile, HashMap<PathBuf, LoadedGltfModel>), String> {
         let original_mesh_count = renderer.meshes.len();
         let original_material_count = renderer.materials.len();
         let crate::scene::LoadedScene { file, assets } = loaded;
         let result = (|| {
             let mut asset_instances = std::collections::HashMap::with_capacity(assets.len());
+            let mut animation_models = HashMap::new();
             for (path, parsed) in assets {
                 let instances = match renderer.load_parsed_asset(parsed, &path)? {
-                    LoadedAsset::Gltf(model) => model
-                        .instances
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, instance)| {
-                            RenderObject::new(
-                                Transform::default(),
-                                instance.mesh_id,
-                                instance.material_id,
-                            )
-                            .with_name(instance.name)
-                            .with_local_matrix(instance.node_transform)
-                            .with_skin_matrices(instance.skin_matrices)
-                            .with_asset_source(path.clone(), index)
-                        })
-                        .collect(),
+                    LoadedAsset::Gltf(model) => {
+                        let instances = model
+                            .instances
+                            .iter()
+                            .enumerate()
+                            .map(|(index, instance)| {
+                                RenderObject::new(
+                                    Transform::default(),
+                                    instance.mesh_id,
+                                    instance.material_id,
+                                )
+                                .with_name(instance.name.clone())
+                                .with_local_matrix(instance.node_transform)
+                                .with_skin_matrices(instance.skin_matrices.clone())
+                                .with_asset_source(path.clone(), index)
+                            })
+                            .collect();
+                        if !model.animations.is_empty() {
+                            animation_models.insert(path.clone(), model);
+                        }
+                        instances
+                    }
                     LoadedAsset::Obj(model) => model
                         .instances
                         .into_iter()
@@ -203,6 +248,52 @@ impl App {
                 crate::core::MATERIAL_GLASS.0 + 1,
                 asset_instances,
             )?;
+            let group_ids = world.model_group_ids().to_vec();
+            for (index, group_id) in group_ids.into_iter().enumerate() {
+                let group_path = world
+                    .model_group(group_id)
+                    .ok_or_else(|| format!("Scene model group {index} was not created"))?
+                    .source_path
+                    .clone();
+                let saved_animation = file.groups[index].animation;
+                let Some(model) = animation_models.get(&group_path) else {
+                    if saved_animation.is_some() {
+                        return Err(format!(
+                            "Scene model group '{}' has animation settings but its model has no animation data",
+                            file.groups[index].name
+                        ));
+                    }
+                    continue;
+                };
+                let clips: Vec<_> = model
+                    .animations
+                    .iter()
+                    .map(|animation| ModelAnimationClip {
+                        name: animation.name.clone(),
+                        duration: animation.duration,
+                    })
+                    .collect();
+                if let Some(saved_animation) = saved_animation
+                    && saved_animation.clip_index >= clips.len()
+                {
+                    return Err(format!(
+                        "Scene model group '{}' references a missing animation clip",
+                        file.groups[index].name
+                    ));
+                }
+                let mut playback = ModelAnimationPlayback::default();
+                if let Some(saved_animation) = saved_animation {
+                    playback.clip_index = saved_animation.clip_index;
+                    playback.speed = saved_animation.speed;
+                    playback.looping = saved_animation.looping;
+                    playback.playing = saved_animation.playing;
+                }
+                let group = world
+                    .model_group_mut(group_id)
+                    .ok_or_else(|| format!("Scene model group {index} was not created"))?;
+                group.animation_clips = clips;
+                group.animation = Some(playback);
+            }
             renderer.retain_scene_assets(
                 world.objects_mut(),
                 crate::core::MESH_SPHERE.0 + 1,
@@ -224,12 +315,81 @@ impl App {
                     renderer.set_material_params(object.material_id.0, params);
                 }
             }
-            Ok((world, file))
+            Ok((world, file, animation_models))
         })();
         if result.is_err() {
             renderer.discard_assets_after(original_mesh_count, original_material_count);
         }
         result
+    }
+
+    fn update_animations(
+        world: &mut World,
+        animation_models: &mut HashMap<PathBuf, LoadedGltfModel>,
+        animated_instances: &mut Vec<GltfPrimitiveInstance>,
+        dt: f32,
+    ) {
+        let group_ids = world.model_group_ids().to_vec();
+        for group_id in group_ids {
+            let Some((path, clip_index, time)) = ({
+                let Some(group) = world.model_group_mut(group_id) else {
+                    continue;
+                };
+                let Some(playback) = group.animation.as_mut() else {
+                    continue;
+                };
+                let Some(clip) = group.animation_clips.get(playback.clip_index) else {
+                    eprintln!("Model '{}' references a missing animation clip", group.name);
+                    playback.playing = false;
+                    continue;
+                };
+                advance_animation_playback(playback, clip.duration, dt);
+                Some((
+                    group.source_path.clone(),
+                    playback.clip_index,
+                    playback.time,
+                ))
+            }) else {
+                continue;
+            };
+            let Some(model) = animation_models.get_mut(&path) else {
+                eprintln!("Animation data for model {} is unavailable", path.display());
+                if let Some(group) = world.model_group_mut(group_id)
+                    && let Some(playback) = group.animation.as_mut()
+                {
+                    playback.playing = false;
+                }
+                continue;
+            };
+            if let Err(error) = model.sample_animation_into(clip_index, time, animated_instances) {
+                eprintln!("Could not update model animation: {error}");
+                if let Some(group) = world.model_group_mut(group_id)
+                    && let Some(playback) = group.animation.as_mut()
+                {
+                    playback.playing = false;
+                }
+                continue;
+            }
+            let Some(group) = world.model_group(group_id) else {
+                continue;
+            };
+            let object_ids = group.objects.clone();
+            for object_id in object_ids {
+                let instance_index = world
+                    .get_object(object_id)
+                    .and_then(|object| object.asset_source())
+                    .filter(|asset| asset.path == path)
+                    .map(|asset| asset.instance_index);
+                let Some(instance) = instance_index.and_then(|index| animated_instances.get(index))
+                else {
+                    continue;
+                };
+                if let Some(object) = world.get_object_mut(object_id) {
+                    object.set_local_matrix(instance.node_transform);
+                    object.set_skin_matrices(&instance.skin_matrices);
+                }
+            }
+        }
     }
 }
 
@@ -331,8 +491,24 @@ impl ApplicationHandler for App {
                                     Vec3::splat(0.75),
                                 ),
                             );
+                            if !model.animations.is_empty()
+                                && let Some(group) = self.world.model_group_mut(group)
+                            {
+                                group.animation_clips = model
+                                    .animations
+                                    .iter()
+                                    .map(|animation| ModelAnimationClip {
+                                        name: animation.name.clone(),
+                                        duration: animation.duration,
+                                    })
+                                    .collect();
+                                group.animation = Some(ModelAnimationPlayback {
+                                    playing: true,
+                                    ..ModelAnimationPlayback::default()
+                                });
+                            }
                             for (instance_index, instance) in model.instances.iter().enumerate() {
-                                let id = self.world.add_group_object(
+                                self.world.add_group_object(
                                     group,
                                     RenderObject::new(
                                         Transform::default(),
@@ -344,18 +520,13 @@ impl ApplicationHandler for App {
                                     .with_skin_matrices(instance.skin_matrices.clone())
                                     .with_asset_source(sample_model.clone(), instance_index),
                                 );
-                                if let Some(id) = id {
-                                    self.animated_object_ids.push(id);
-                                }
                             }
                             if let Some(animation) = model.animations.first() {
-                                eprintln!(
-                                    "Загружена skeletal-анимация '{}', {:.2} с",
-                                    animation.name, animation.duration
-                                );
-                                self.animated_model = Some(model);
+                                eprintln!("Loaded skeletal animation '{}'", animation.name);
+                                self.animation_models.insert(sample_model.clone(), model);
                             }
                         }
+
                         Err(error) => eprintln!("Не удалось загрузить glTF-модель: {error}"),
                     }
 
@@ -515,34 +686,12 @@ impl ApplicationHandler for App {
                 self.input.reset_mouse_delta();
 
                 self.world.update(dt);
-                self.animation_time += dt;
-                if let Some(model) = self.animated_model.as_mut() {
-                    if let Some(animation) = model.animations.first() {
-                        let time = if animation.duration > 0.0 {
-                            self.animation_time % animation.duration
-                        } else {
-                            0.0
-                        };
-                        match model.sample_animation_into(0, time, &mut self.animated_instances) {
-                            Ok(()) => {
-                                for (id, instance) in self
-                                    .animated_object_ids
-                                    .iter()
-                                    .zip(&self.animated_instances)
-                                {
-                                    if let Some(object) = self.world.get_object_mut(*id) {
-                                        object.set_local_matrix(instance.node_transform);
-                                        object.set_skin_matrices(&instance.skin_matrices);
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                eprintln!("Не удалось обновить skeletal-анимацию: {error}");
-                                self.animated_model = None;
-                            }
-                        }
-                    }
-                }
+                Self::update_animations(
+                    &mut self.world,
+                    &mut self.animation_models,
+                    &mut self.animated_instances,
+                    dt,
+                );
 
                 if let Some(debug_ui) = self.debug_ui.as_mut() {
                     if let Some(path) = debug_ui.take_scene_save_request() {
@@ -578,12 +727,10 @@ impl ApplicationHandler for App {
                     }
                     if let Some((path, loaded)) = debug_ui.take_scene_load_request() {
                         match loaded.and_then(|loaded| Self::restore_scene(renderer, loaded)) {
-                            Ok((world, file)) => {
+                            Ok((world, file, animation_models)) => {
                                 self.world = world;
-                                self.animated_model = None;
-                                self.animated_object_ids.clear();
+                                self.animation_models = animation_models;
                                 self.animated_instances.clear();
-                                self.animation_time = 0.0;
                                 if let Some(camera) = &file.camera {
                                     camera.apply_to(&mut self.camera);
                                 }
@@ -625,12 +772,13 @@ impl ApplicationHandler for App {
                                 let result = Self::import_asset(
                                     renderer,
                                     &mut self.world,
+                                    &mut self.animation_models,
                                     &self.camera,
                                     &path,
                                     parsed,
                                 );
                                 if result.is_ok() {
-                                    debug_ui.record_undo_snapshot(snapshot);
+                                    debug_ui.record_undo_snapshot(snapshot, renderer);
                                     debug_ui.mark_scene_dirty();
                                 }
                                 result
@@ -655,5 +803,41 @@ impl ApplicationHandler for App {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn looping_animation_wraps_to_the_start() {
+        let mut playback = ModelAnimationPlayback {
+            time: 0.9,
+            speed: 2.0,
+            looping: true,
+            playing: true,
+            ..ModelAnimationPlayback::default()
+        };
+
+        advance_animation_playback(&mut playback, 1.0, 0.2);
+
+        assert!((playback.time - 0.3).abs() < 0.0001);
+        assert!(playback.playing);
+    }
+
+    #[test]
+    fn non_looping_animation_stops_at_its_end() {
+        let mut playback = ModelAnimationPlayback {
+            time: 0.9,
+            looping: false,
+            playing: true,
+            ..ModelAnimationPlayback::default()
+        };
+
+        advance_animation_playback(&mut playback, 1.0, 0.2);
+
+        assert_eq!(playback.time, 1.0);
+        assert!(!playback.playing);
     }
 }

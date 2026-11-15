@@ -594,6 +594,7 @@ fn fs_glass(
     if !front_facing {
         normal = -normal;
     }
+    let geometric_normal = normal;
     normal = apply_normal_map(
         normal,
         v.world_tangent,
@@ -631,7 +632,7 @@ fn fs_glass(
     let fill_radiance = light.fill_color.rgb * light.fill_direction_intensity.w;
     var key_visibility = 1.0;
     if light.color.a > 0.5 {
-        key_visibility = shadow_visibility(v.world_pos, normal, key_dir);
+        key_visibility = shadow_visibility(v.world_pos, geometric_normal, key_dir);
     }
     let direct_reflection = evaluate_direct_light(
         normal,
@@ -787,6 +788,7 @@ fn fs_main(
     if !front_facing {
         normal = -normal;
     }
+    let geometric_normal = normal;
     normal = apply_normal_map(
         normal,
         v.world_tangent,
@@ -840,7 +842,7 @@ fn fs_main(
 
     var key_visibility = 1.0;
     if light.color.a > 0.5 {
-        key_visibility = shadow_visibility(v.world_pos, normal, key_dir);
+        key_visibility = shadow_visibility(v.world_pos, geometric_normal, key_dir);
     }
     var radiance = evaluate_direct_light(
         normal,
@@ -1320,7 +1322,10 @@ impl RenderPipelineBundle {
                 targets: &[],
                 compilation_options: Default::default(),
             }),
-            primitive: wgpu::PrimitiveState::default(),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: Some(wgpu::Face::Front),
+                ..Default::default()
+            },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
                 depth_write_enabled: true,

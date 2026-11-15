@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const SCENE_FORMAT_VERSION: u32 = 3;
+const SCENE_FORMAT_VERSION: u32 = 4;
 const MAX_SCENE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SCENE_OBJECTS: usize = 100_000;
 const MAX_SCENE_ASSETS: usize = 256;
@@ -38,6 +38,17 @@ pub struct SceneGroup {
     pub position: [f32; 3],
     pub rotation: [f32; 4],
     pub scale: [f32; 3],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animation: Option<SceneAnimationSettings>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SceneAnimationSettings {
+    pub clip_index: usize,
+    pub speed: f32,
+    pub looping: bool,
+    pub playing: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -207,6 +218,12 @@ impl SceneFile {
                 position: group.transform.position.to_array(),
                 rotation: group.transform.rotation.to_array(),
                 scale: group.transform.scale.to_array(),
+                animation: group.animation.map(|animation| SceneAnimationSettings {
+                    clip_index: animation.clip_index,
+                    speed: animation.speed,
+                    looping: animation.looping,
+                    playing: animation.playing,
+                }),
             });
         }
         for object in world.objects() {
@@ -426,6 +443,9 @@ impl SceneFile {
                 || !rotation.length_squared().is_finite()
                 || rotation.length_squared() <= f32::EPSILON
                 || !scale.is_finite()
+                || group.animation.is_some_and(|animation| {
+                    !animation.speed.is_finite() || !(0.1..=4.0).contains(&animation.speed)
+                })
             {
                 return Err(format!("Model group {index} has invalid data"));
             }
@@ -491,7 +511,7 @@ pub fn load_scene(path: &Path) -> Result<LoadedScene, String> {
     let mut file: SceneFile = serde_json::from_slice(&bytes)
         .map_err(|error| format!("Could not parse scene {}: {error}", path.display()))?;
     let legacy_scene = file.version == 1;
-    if matches!(file.version, 1 | 2) {
+    if matches!(file.version, 1 | 2 | 3) {
         file.version = SCENE_FORMAT_VERSION;
     }
     file.validate()?;
@@ -649,6 +669,7 @@ fn upgrade_legacy_model_groups(file: &mut SceneFile) {
                 position: root_position,
                 rotation: [0.0, 0.0, 0.0, 1.0],
                 scale: [1.0, 1.0, 1.0],
+                animation: None,
             });
             for object_index in bucket {
                 let object = &mut file.objects[object_index];
@@ -769,7 +790,55 @@ pub fn build_world(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scene::Transform;
+    use crate::scene::{ModelAnimationPlayback, Transform};
+
+    #[test]
+    fn saves_and_validates_model_animation_settings() {
+        let scene_directory = std::env::temp_dir().join(format!(
+            "bone-smashing-animation-scene-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&scene_directory).unwrap();
+        let model_path = scene_directory.join("animated.glb");
+        fs::write(&model_path, b"test model path").unwrap();
+        let scene_path = scene_directory.join("scene.bse-scene");
+        let mut world = World::new();
+        let group = world.add_model_group("Animated", model_path, Transform::default());
+        world.model_group_mut(group).unwrap().animation = Some(ModelAnimationPlayback {
+            clip_index: 2,
+            time: 1.25,
+            speed: 1.5,
+            looping: false,
+            playing: true,
+        });
+
+        let file = SceneFile::from_world(&world, &scene_path).unwrap();
+        let encoded = serde_json::to_vec(&file).unwrap();
+        let decoded: SceneFile = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            decoded.groups[0].animation,
+            Some(SceneAnimationSettings {
+                clip_index: 2,
+                speed: 1.5,
+                looping: false,
+                playing: true,
+            })
+        );
+
+        let mut invalid = decoded;
+        invalid.groups[0].animation.as_mut().unwrap().speed = 4.1;
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .contains("Model group 0 has invalid data")
+        );
+        fs::remove_dir_all(scene_directory).unwrap();
+    }
 
     #[test]
     fn saves_and_loads_scene_with_referenced_obj() {
@@ -1127,6 +1196,46 @@ mod tests {
         assert!(loaded.file.camera.is_none());
         assert!(loaded.file.renderer_settings.is_none());
         assert!(loaded.file.environment.is_none());
+        fs::remove_dir_all(scene_directory).unwrap();
+    }
+
+    #[test]
+    fn migrates_version_three_groups_without_animation_settings() {
+        let scene_directory = std::env::temp_dir().join(format!(
+            "bone-smashing-v3-scene-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&scene_directory).unwrap();
+        let model_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("models")
+            .join("sample.obj");
+        fs::copy(model_path, scene_directory.join("sample.obj")).unwrap();
+        let scene_path = scene_directory.join("version-3.bse-scene");
+        fs::write(
+            &scene_path,
+            r#"{
+                "version": 3,
+                "groups": [{
+                    "name": "Sample",
+                    "path": "sample.obj",
+                    "position": [0.0, 0.0, 0.0],
+                    "rotation": [0.0, 0.0, 0.0, 1.0],
+                    "scale": [1.0, 1.0, 1.0]
+                }],
+                "objects": []
+            }"#,
+        )
+        .unwrap();
+
+        let loaded = load_scene(&scene_path).unwrap();
+
+        assert_eq!(loaded.file.version, SCENE_FORMAT_VERSION);
+        assert_eq!(loaded.file.groups[0].animation, None);
         fs::remove_dir_all(scene_directory).unwrap();
     }
 

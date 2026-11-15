@@ -1,6 +1,7 @@
 use crate::camera::Camera;
 use crate::core::{MATERIAL_DEFAULT, MESH_CUBE};
-use crate::renderer::state::{ParsedAsset, RenderTimings, Renderer, parse_asset};
+use crate::renderer::material::MaterialParams;
+use crate::renderer::state::{ParsedAsset, RenderTimings, Renderer, RendererSettings, parse_asset};
 use crate::scene::{
     LoadedScene, ModelGroupId, ObjectId, RenderObject, SceneEnvironment, Transform, World,
     load_scene,
@@ -69,6 +70,36 @@ struct GizmoDrag {
 struct SceneSnapshot {
     world: World,
     selection: Option<SceneSelection>,
+    render_state: RenderSnapshot,
+}
+
+#[derive(Clone)]
+struct RenderSnapshot {
+    settings: RendererSettings,
+    materials: Vec<MaterialParams>,
+}
+
+impl RenderSnapshot {
+    fn capture(renderer: &Renderer) -> Self {
+        let materials = (0..renderer.material_count())
+            .map(|index| {
+                renderer
+                    .material_params(index)
+                    .expect("material index must be valid")
+            })
+            .collect();
+        Self {
+            settings: renderer.settings(),
+            materials,
+        }
+    }
+
+    fn apply(&self, renderer: &mut Renderer) {
+        renderer.set_settings(self.settings);
+        for (index, params) in self.materials.iter().copied().enumerate() {
+            renderer.set_material_params(index, params);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -81,12 +112,29 @@ struct UndoHistory {
 impl UndoHistory {
     const MAX_STEPS: usize = 32;
 
-    fn record(&mut self, world: &World, selection: Option<SceneSelection>) {
-        self.record_snapshot(world.clone(), selection);
+    fn record(
+        &mut self,
+        world: &World,
+        selection: Option<SceneSelection>,
+        render_state: &RenderSnapshot,
+    ) {
+        self.record_snapshot(world.clone(), selection, render_state.clone());
     }
 
-    fn record_snapshot(&mut self, world: World, selection: Option<SceneSelection>) {
-        Self::push_snapshot(&mut self.undo, SceneSnapshot { world, selection });
+    fn record_snapshot(
+        &mut self,
+        world: World,
+        selection: Option<SceneSelection>,
+        render_state: RenderSnapshot,
+    ) {
+        Self::push_snapshot(
+            &mut self.undo,
+            SceneSnapshot {
+                world,
+                selection,
+                render_state,
+            },
+        );
         self.redo.clear();
         self.active_transform_selection = None;
     }
@@ -97,6 +145,7 @@ impl UndoHistory {
         selection: Option<SceneSelection>,
         transform_selection: SceneSelection,
         pointer_down: bool,
+        render_state: &RenderSnapshot,
     ) {
         if !pointer_down || self.active_transform_selection != Some(transform_selection) {
             Self::push_snapshot(
@@ -104,6 +153,7 @@ impl UndoHistory {
                 SceneSnapshot {
                     world: world.clone(),
                     selection,
+                    render_state: render_state.clone(),
                 },
             );
             self.redo.clear();
@@ -111,7 +161,12 @@ impl UndoHistory {
         self.active_transform_selection = pointer_down.then_some(transform_selection);
     }
 
-    fn undo(&mut self, world: &mut World, selection: &mut Option<SceneSelection>) -> bool {
+    fn undo(
+        &mut self,
+        world: &mut World,
+        selection: &mut Option<SceneSelection>,
+        render_state: &mut RenderSnapshot,
+    ) -> bool {
         let Some(snapshot) = self.undo.pop() else {
             return false;
         };
@@ -121,6 +176,7 @@ impl UndoHistory {
             SceneSnapshot {
                 world: world.clone(),
                 selection: *selection,
+                render_state: render_state.clone(),
             },
         );
         *world = snapshot.world;
@@ -128,11 +184,17 @@ impl UndoHistory {
         *selection = snapshot
             .selection
             .filter(|selected| selection_is_valid(world, *selected));
+        *render_state = snapshot.render_state;
         self.active_transform_selection = None;
         true
     }
 
-    fn redo(&mut self, world: &mut World, selection: &mut Option<SceneSelection>) -> bool {
+    fn redo(
+        &mut self,
+        world: &mut World,
+        selection: &mut Option<SceneSelection>,
+        render_state: &mut RenderSnapshot,
+    ) -> bool {
         let Some(snapshot) = self.redo.pop() else {
             return false;
         };
@@ -142,6 +204,7 @@ impl UndoHistory {
             SceneSnapshot {
                 world: world.clone(),
                 selection: *selection,
+                render_state: render_state.clone(),
             },
         );
         *world = snapshot.world;
@@ -149,6 +212,7 @@ impl UndoHistory {
         *selection = snapshot
             .selection
             .filter(|selected| selection_is_valid(world, *selected));
+        *render_state = snapshot.render_state;
         self.active_transform_selection = None;
         true
     }
@@ -366,6 +430,15 @@ fn selected_transform_mut(
             world.get_object_mut(id).map(|object| &mut object.transform)
         }
         None => None,
+    }
+}
+
+fn selected_name_mut(world: &mut World, selected: SceneSelection) -> Option<&mut String> {
+    match selected {
+        SceneSelection::Model(id) => world.model_group_mut(id).map(|group| &mut group.name),
+        SceneSelection::Part(id) | SceneSelection::Object(id) => {
+            world.get_object_mut(id).map(|object| &mut object.name)
+        }
     }
 }
 
@@ -856,9 +929,12 @@ impl DebugUi {
         }
     }
 
-    pub fn record_undo_snapshot(&mut self, world: World) {
-        self.history
-            .record_snapshot(world, self.selected_scene_item);
+    pub fn record_undo_snapshot(&mut self, world: World, renderer: &Renderer) {
+        self.history.record_snapshot(
+            world,
+            self.selected_scene_item,
+            RenderSnapshot::capture(renderer),
+        );
     }
 
     pub fn prepare_frame(
@@ -929,6 +1005,8 @@ impl DebugUi {
         let mut save_current = false;
         let mut scene_modified = false;
         let mut transform_change = None;
+        let mut name_change = None;
+        let mut animation_change = None;
         let selection_is_valid = self
             .selected_scene_item
             .is_some_and(|selected| selection_is_valid(world, selected));
@@ -1509,12 +1587,17 @@ impl DebugUi {
                                                             world.model_group_mut(group_id)
                                                         {
                                                             ui.label("Model");
+                                                            let before = group.name.clone();
                                                             if ui
                                                                 .text_edit_singleline(
                                                                     &mut group.name,
                                                                 )
                                                                 .changed()
                                                             {
+                                                                name_change = Some((
+                                                                    SceneSelection::Model(group_id),
+                                                                    before,
+                                                                ));
                                                                 scene_modified = true;
                                                             }
                                                             ui.separator();
@@ -1529,22 +1612,134 @@ impl DebugUi {
                                                                 ));
                                                                 scene_modified = true;
                                                             }
+                                                            if let Some(playback) = group.animation.as_mut() {
+                                                                ui.separator();
+                                                                ui.label("Animation");
+                                                                let before = *playback;
+                                                                let selected_clip = group
+                                                                    .animation_clips
+                                                                    .get(playback.clip_index)
+                                                                    .map(|clip| clip.name.as_str())
+                                                                    .unwrap_or("Missing animation");
+                                                                egui::ComboBox::from_id_salt((
+                                                                    "model-animation-clip",
+                                                                    group_id.0,
+                                                                ))
+                                                                .selected_text(selected_clip)
+                                                                .show_ui(ui, |ui| {
+                                                                    for (index, clip) in group
+                                                                        .animation_clips
+                                                                        .iter()
+                                                                        .enumerate()
+                                                                    {
+                                                                        ui.selectable_value(
+                                                                            &mut playback.clip_index,
+                                                                            index,
+                                                                            &clip.name,
+                                                                        );
+                                                                    }
+                                                                });
+                                                                if playback.clip_index
+                                                                    != before.clip_index
+                                                                {
+                                                                    playback.time = 0.0;
+                                                                }
+                                                                ui.horizontal(|ui| {
+                                                                    if ui
+                                                                        .button(if playback.playing {
+                                                                            "Pause"
+                                                                        } else {
+                                                                            "Play"
+                                                                        })
+                                                                        .clicked()
+                                                                    {
+                                                                        if !playback.playing
+                                                                            && !playback.looping
+                                                                            && group
+                                                                                .animation_clips
+                                                                                .get(
+                                                                                    playback
+                                                                                        .clip_index,
+                                                                                )
+                                                                                .is_some_and(
+                                                                                    |clip| {
+                                                                                        playback
+                                                                                            .time
+                                                                                            >= clip
+                                                                                                .duration
+                                                                                    },
+                                                                                )
+                                                                        {
+                                                                            playback.time = 0.0;
+                                                                        }
+                                                                        playback.playing =
+                                                                            !playback.playing;
+                                                                    }
+                                                                    if ui.button("Restart").clicked()
+                                                                    {
+                                                                        playback.time = 0.0;
+                                                                    }
+                                                                });
+                                                                ui.checkbox(
+                                                                    &mut playback.looping,
+                                                                    "Loop",
+                                                                );
+                                                                ui.add(
+                                                                    egui::Slider::new(
+                                                                        &mut playback.speed,
+                                                                        0.1..=4.0,
+                                                                    )
+                                                                    .text("Speed"),
+                                                                );
+                                                                if let Some(clip) = group
+                                                                    .animation_clips
+                                                                    .get(playback.clip_index)
+                                                                    && clip.duration > 0.0
+                                                                {
+                                                                    ui.add(
+                                                                        egui::Slider::new(
+                                                                            &mut playback.time,
+                                                                            0.0..=clip.duration,
+                                                                        )
+                                                                        .text("Time"),
+                                                                    );
+                                                                }
+                                                                if playback.clip_index
+                                                                    != before.clip_index
+                                                                    || playback.speed != before.speed
+                                                                    || playback.looping
+                                                                        != before.looping
+                                                                    || playback.playing
+                                                                        != before.playing
+                                                                {
+                                                                    animation_change =
+                                                                        Some((group_id, before));
+                                                                    scene_modified = true;
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                     Some(
-                                                        SceneSelection::Part(object_id)
-                                                        | SceneSelection::Object(object_id),
+                                                        selection @ (SceneSelection::Part(
+                                                            object_id,
+                                                        )
+                                                        | SceneSelection::Object(
+                                                            object_id,
+                                                        )),
                                                     ) => {
                                                         if let Some(object) =
                                                             world.get_object_mut(object_id)
                                                         {
                                                             ui.label("Object");
+                                                            let before = object.name.clone();
                                                             if ui
                                                                 .text_edit_singleline(
                                                                     &mut object.name,
                                                                 )
                                                                 .changed()
                                                             {
+                                                                name_change =
+                                                                    Some((selection, before));
                                                                 scene_modified = true;
                                                             }
                                                             ui.separator();
@@ -1553,10 +1748,8 @@ impl DebugUi {
                                                                 ui,
                                                                 &mut object.transform,
                                                             ) {
-                                                                transform_change = Some((
-                                                                    SceneSelection::Part(object_id),
-                                                                    before,
-                                                                ));
+                                                                transform_change =
+                                                                    Some((selection, before));
                                                                 scene_modified = true;
                                                             }
                                                         }
@@ -1839,7 +2032,11 @@ impl DebugUi {
                         &mut self.gizmo_drag,
                     );
                     if !had_gizmo_drag && self.gizmo_drag.is_some() {
-                        self.history.record(world, selected_scene_item);
+                        self.history.record(
+                            world,
+                            selected_scene_item,
+                            &RenderSnapshot::capture(renderer),
+                        );
                     }
                 });
 
@@ -1903,7 +2100,50 @@ impl DebugUi {
                     });
             }
         });
-        scene_modified |= settings != settings_before || selected_params != selected_params_before;
+        let render_state_modified =
+            settings != settings_before || selected_params != selected_params_before;
+        let mut changed_name = None;
+        let mut changed_animation = None;
+        if let Some((selection, before)) = name_change
+            && let Some(name) = selected_name_mut(world, selection)
+        {
+            changed_name = Some((selection, name.clone()));
+            *name = before;
+        }
+        if let Some((group_id, before)) = animation_change
+            && let Some(after) = world
+                .model_group(group_id)
+                .and_then(|group| group.animation)
+        {
+            if let Some(group) = world.model_group_mut(group_id) {
+                group.animation = Some(before);
+            }
+            changed_animation = Some((group_id, after));
+        }
+        if render_state_modified || changed_name.is_some() || changed_animation.is_some() {
+            self.history.record(
+                world,
+                selected_scene_item,
+                &RenderSnapshot::capture(renderer),
+            );
+        }
+        if let Some((selection, after)) = changed_name
+            && let Some(name) = selected_name_mut(world, selection)
+        {
+            *name = after;
+        }
+        if let Some((group_id, after)) = changed_animation
+            && let Some(group) = world.model_group_mut(group_id)
+        {
+            group.animation = Some(after);
+        }
+        scene_modified |= render_state_modified;
+        if render_state_modified {
+            renderer.set_settings(settings);
+            if material_count > 0 {
+                renderer.set_material_params(self.selected_material, selected_params);
+            }
+        }
         if save_current {
             self.scene_save_request = Some(PathBuf::from(&self.scene_path));
             self.scene_status = None;
@@ -1919,6 +2159,7 @@ impl DebugUi {
                     selected_scene_item,
                     transform_selection,
                     pointer_down,
+                    &RenderSnapshot::capture(renderer),
                 );
                 if let Some(transform) = selected_transform_mut(world, Some(transform_selection)) {
                     *transform = after;
@@ -1929,14 +2170,40 @@ impl DebugUi {
             self.history.active_transform_selection = None;
         }
         if undo_requested {
-            scene_modified |= self.history.undo(world, &mut selected_scene_item);
+            let mut render_state = RenderSnapshot::capture(renderer);
+            let undone = self
+                .history
+                .undo(world, &mut selected_scene_item, &mut render_state);
+            scene_modified |= undone;
+            if undone {
+                render_state.apply(renderer);
+                settings = render_state.settings;
+                if let Some(params) = render_state.materials.get(self.selected_material) {
+                    selected_params = *params;
+                }
+            }
             self.gizmo_drag = None;
         } else if redo_requested {
-            scene_modified |= self.history.redo(world, &mut selected_scene_item);
+            let mut render_state = RenderSnapshot::capture(renderer);
+            let redone = self
+                .history
+                .redo(world, &mut selected_scene_item, &mut render_state);
+            scene_modified |= redone;
+            if redone {
+                render_state.apply(renderer);
+                settings = render_state.settings;
+                if let Some(params) = render_state.materials.get(self.selected_material) {
+                    selected_params = *params;
+                }
+            }
             self.gizmo_drag = None;
         }
         if add_cube {
-            self.history.record(world, selected_scene_item);
+            self.history.record(
+                world,
+                selected_scene_item,
+                &RenderSnapshot::capture(renderer),
+            );
             let forward = Vec3::new(
                 camera.yaw.cos() * camera.pitch.cos(),
                 camera.pitch.sin(),
@@ -1956,7 +2223,11 @@ impl DebugUi {
         }
         if duplicate_selection {
             if selected_scene_item.is_some() {
-                self.history.record(world, selected_scene_item);
+                self.history.record(
+                    world,
+                    selected_scene_item,
+                    &RenderSnapshot::capture(renderer),
+                );
                 let duplicate = match selected_scene_item {
                     Some(SceneSelection::Model(id)) => {
                         world.duplicate_model_group(id).map(SceneSelection::Model)
@@ -1975,7 +2246,11 @@ impl DebugUi {
         }
         if delete_selection {
             if selected_scene_item.is_some() {
-                self.history.record(world, selected_scene_item);
+                self.history.record(
+                    world,
+                    selected_scene_item,
+                    &RenderSnapshot::capture(renderer),
+                );
                 match selected_scene_item {
                     Some(SceneSelection::Model(id)) => {
                         world.remove_model_group(id);
@@ -2193,7 +2468,14 @@ impl DebugUi {
 mod tests {
     use super::*;
     use crate::core::{MaterialId, MeshId};
-    use crate::scene::RenderObject;
+    use crate::scene::{ModelAnimationClip, ModelAnimationPlayback, RenderObject};
+
+    fn test_render_state() -> RenderSnapshot {
+        RenderSnapshot {
+            settings: RendererSettings::default(),
+            materials: vec![MaterialParams::default()],
+        }
+    }
 
     #[test]
     fn viewport_picking_prefers_the_object_under_the_pointer_to_the_floor() {
@@ -2244,7 +2526,8 @@ mod tests {
             MaterialId(0),
         ));
         let mut history = UndoHistory::default();
-        history.record(&world, None);
+        let mut render_state = test_render_state();
+        history.record(&world, None, &render_state);
 
         let group =
             world.add_model_group("Model", PathBuf::from("model.glb"), Transform::default());
@@ -2256,18 +2539,18 @@ mod tests {
             .unwrap();
         let mut selection = Some(SceneSelection::Part(added));
 
-        assert!(history.undo(&mut world, &mut selection));
+        assert!(history.undo(&mut world, &mut selection, &mut render_state));
         assert!(world.get_object(added).is_none());
         assert!(world.model_group(group).is_none());
         assert_eq!(world.objects().len(), 1);
         assert!(selection.is_none());
 
-        assert!(history.redo(&mut world, &mut selection));
+        assert!(history.redo(&mut world, &mut selection, &mut render_state));
         assert!(world.get_object(added).is_some());
         assert!(world.model_group(group).is_some());
         assert!(selection == Some(SceneSelection::Part(added)));
 
-        assert!(history.undo(&mut world, &mut selection));
+        assert!(history.undo(&mut world, &mut selection, &mut render_state));
         let branched_group = world.add_model_group(
             "Branched",
             PathBuf::from("branched.glb"),
@@ -2291,18 +2574,20 @@ mod tests {
             MaterialId(0),
         ));
         let mut history = UndoHistory::default();
+        let mut render_state = test_render_state();
         history.record_transform(
             &world,
             Some(SceneSelection::Object(id)),
             SceneSelection::Object(id),
             false,
+            &render_state,
         );
         world.get_object_mut(id).unwrap().transform.position = Vec3::X;
         let mut selection = Some(SceneSelection::Object(id));
 
-        assert!(history.undo(&mut world, &mut selection));
+        assert!(history.undo(&mut world, &mut selection, &mut render_state));
         assert_eq!(world.get_object(id).unwrap().transform.position, Vec3::ZERO);
-        assert!(history.redo(&mut world, &mut selection));
+        assert!(history.redo(&mut world, &mut selection, &mut render_state));
         assert_eq!(world.get_object(id).unwrap().transform.position, Vec3::X);
     }
 
@@ -2315,7 +2600,8 @@ mod tests {
             MaterialId(0),
         ));
         let mut history = UndoHistory::default();
-        history.record(&world, None);
+        let mut render_state = test_render_state();
+        history.record(&world, None, &render_state);
         world.add_object(RenderObject::new(
             Transform::default(),
             MeshId(1),
@@ -2323,9 +2609,92 @@ mod tests {
         ));
         let mut selection = None;
 
-        assert!(history.undo(&mut world, &mut selection));
+        assert!(history.undo(&mut world, &mut selection, &mut render_state));
         assert!(history.can_redo());
-        history.record(&world, selection);
+        history.record(&world, selection, &render_state);
         assert!(!history.can_redo());
+    }
+
+    #[test]
+    fn undo_redo_restores_render_settings_and_material_parameters() {
+        let mut world = World::new();
+        let mut history = UndoHistory::default();
+        let mut render_state = test_render_state();
+        history.record(&world, None, &render_state);
+
+        render_state.settings.exposure_ev = 2.0;
+        render_state.materials[0].metallic = 0.9;
+        let mut selection = None;
+
+        assert!(history.undo(&mut world, &mut selection, &mut render_state));
+        assert_eq!(render_state.settings, RendererSettings::default());
+        assert_eq!(render_state.materials[0].metallic, 0.0);
+
+        assert!(history.redo(&mut world, &mut selection, &mut render_state));
+        assert_eq!(render_state.settings.exposure_ev, 2.0);
+        assert_eq!(render_state.materials[0].metallic, 0.9);
+    }
+
+    #[test]
+    fn undo_redo_restores_renamed_objects() {
+        let mut world = World::new();
+        let id = world.add_object(
+            RenderObject::new(Transform::default(), MeshId(0), MaterialId(0)).with_name("Cube"),
+        );
+        let mut history = UndoHistory::default();
+        let render_state = test_render_state();
+        history.record(&world, Some(SceneSelection::Object(id)), &render_state);
+        world.get_object_mut(id).unwrap().name = "Named cube".to_owned();
+        let mut selection = Some(SceneSelection::Object(id));
+        let mut render_state = render_state;
+
+        assert!(history.undo(&mut world, &mut selection, &mut render_state));
+        assert_eq!(world.get_object(id).unwrap().name, "Cube");
+        assert!(history.redo(&mut world, &mut selection, &mut render_state));
+        assert_eq!(world.get_object(id).unwrap().name, "Named cube");
+    }
+
+    #[test]
+    fn undo_redo_restores_animation_playback_settings() {
+        let mut world = World::new();
+        let group =
+            world.add_model_group("Animated", PathBuf::from("model.glb"), Transform::default());
+        let group_data = world.model_group_mut(group).unwrap();
+        group_data.animation_clips = vec![
+            ModelAnimationClip {
+                name: "Idle".to_owned(),
+                duration: 1.0,
+            },
+            ModelAnimationClip {
+                name: "Walk".to_owned(),
+                duration: 2.0,
+            },
+        ];
+        group_data.animation = Some(ModelAnimationPlayback::default());
+
+        let mut history = UndoHistory::default();
+        let mut render_state = test_render_state();
+        let selection = Some(SceneSelection::Model(group));
+        history.record(&world, selection, &render_state);
+        world.model_group_mut(group).unwrap().animation = Some(ModelAnimationPlayback {
+            clip_index: 1,
+            speed: 1.5,
+            looping: false,
+            playing: true,
+            ..ModelAnimationPlayback::default()
+        });
+        let mut selection = selection;
+
+        assert!(history.undo(&mut world, &mut selection, &mut render_state));
+        assert_eq!(
+            world.model_group(group).unwrap().animation,
+            Some(ModelAnimationPlayback::default())
+        );
+        assert!(history.redo(&mut world, &mut selection, &mut render_state));
+        let playback = world.model_group(group).unwrap().animation.unwrap();
+        assert_eq!(playback.clip_index, 1);
+        assert_eq!(playback.speed, 1.5);
+        assert!(!playback.looping);
+        assert!(playback.playing);
     }
 }

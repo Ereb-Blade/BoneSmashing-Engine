@@ -664,14 +664,25 @@ fn fs_glass(
         * vec4<f32>(v.world_pos + refracted_direction * 0.65, 1.0);
     let screen_size = vec2<f32>(textureDimensions(t_scene_color));
     let screen_uv = v.clip.xy / screen_size;
-    let refraction_offset = (
-        projected_refracted.xy / projected_refracted.w
-            - projected_origin.xy / projected_origin.w
-    ) * vec2<f32>(0.5, -0.5);
+    var refraction_offset = vec2<f32>(0.0);
+    if projected_origin.w > 1e-5 && projected_refracted.w > 1e-5 {
+        refraction_offset = (
+            projected_refracted.xy / projected_refracted.w
+                - projected_origin.xy / projected_origin.w
+        ) * vec2<f32>(0.5, -0.5);
+    }
+    let edge_distance = min(
+        min(screen_uv.x, screen_uv.y),
+        min(1.0 - screen_uv.x, 1.0 - screen_uv.y),
+    );
+    let edge_fade = smoothstep(0.0, 0.04, edge_distance);
+    let max_refraction_offset = vec2<f32>(2.0) / screen_size;
+    let limited_refraction_offset =
+        clamp(refraction_offset, -max_refraction_offset, max_refraction_offset) * edge_fade;
     let refracted_uv = clamp(
-        screen_uv + clamp(refraction_offset, vec2<f32>(-0.045), vec2<f32>(0.045)),
-        vec2<f32>(0.001),
-        vec2<f32>(0.999),
+        screen_uv + limited_refraction_offset,
+        vec2<f32>(0.5) / screen_size,
+        vec2<f32>(1.0) - vec2<f32>(0.5) / screen_size,
     );
     let background = textureSample(t_scene_color, s_scene_color, refracted_uv).rgb;
     let thickness = material.thickness_factor * textureSample(
@@ -687,7 +698,7 @@ fn fs_glass(
         );
     }
     let transmitted = background * surface_color.rgb * volume_attenuation;
-    let opaque_surface = surface_color.rgb * material.base_color.a;
+    let opaque_surface = surface_color.rgb;
     let transmission = clamp(
         material.transmission_factor * textureSample(t_transmission, s_diffuse, transmission_uv).r,
         0.0,
@@ -700,7 +711,8 @@ fn fs_glass(
         + reflected_environment * glass_fresnel
         + direct_reflection
         + emissive;
-    return vec4<f32>(color, 1.0);
+    let coverage = select(1.0, surface_color.a, material.alpha_mode == 2u);
+    return vec4<f32>(mix(background, color, coverage), 1.0);
 }
 
 @fragment

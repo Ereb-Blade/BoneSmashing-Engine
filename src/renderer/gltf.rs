@@ -1,15 +1,17 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use glam::{Mat4, Quat, Vec3};
 
 use crate::core::{MaterialId, MeshId};
 
 use super::mesh::{
-    MeshData, SkinVertex, UvSetsVertex, Vertex, calculate_normals, calculate_tangents,
-    calculate_tangents_with_uv,
+    MAX_IMPORTED_TEXTURE_DIMENSION, MeshData, SkinVertex, UvSetsVertex, Vertex, calculate_normals,
+    calculate_tangents, calculate_tangents_with_uv,
 };
 
-const MAX_IMPORTED_TEXTURE_DIMENSION: u32 = 1024;
 const MAX_IMPORTED_IMAGE_DATA_BYTES: usize = 128 * 1024 * 1024;
 const MAX_IMPORTED_MIPMAP_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -184,6 +186,32 @@ fn texture_info_transform(
         return Err("texture transform produces a non-finite UV coordinate".to_owned());
     }
     Ok((transform, tex_coord))
+}
+
+fn adjust_named_material_roughness(name: Option<&str>, roughness: f32) -> f32 {
+    if name == Some("detail_glass_clear") {
+        roughness.max(0.35)
+    } else {
+        roughness
+    }
+}
+
+fn is_supported_material_extension(name: &str) -> bool {
+    matches!(
+        name,
+        "KHR_materials_unlit"
+            | "KHR_materials_pbrSpecularGlossiness"
+            | "KHR_materials_ior"
+            | "KHR_materials_transmission"
+            | "KHR_materials_volume"
+            | "KHR_materials_specular"
+            | "KHR_materials_emissive_strength"
+            | "KHR_materials_clearcoat"
+            | "KHR_materials_sheen"
+            | "KHR_materials_iridescence"
+            | "KHR_materials_anisotropy"
+            | "KHR_materials_dispersion"
+    )
 }
 
 #[derive(Debug)]
@@ -544,27 +572,46 @@ impl GltfModelData {
         self.instances.len()
     }
 
+    pub(crate) fn limit_texture_dimensions(&mut self, max_dimension: u32) -> Result<(), String> {
+        if max_dimension == 0 {
+            return Err("device texture dimension limit is zero".to_owned());
+        }
+
+        let mut resized = false;
+        for image in &mut self.images {
+            if image.width.max(image.height) <= max_dimension {
+                continue;
+            }
+            let scale = max_dimension as f32 / image.width.max(image.height) as f32;
+            let width = ((image.width as f32 * scale).round() as u32).max(1);
+            let height = ((image.height as f32 * scale).round() as u32).max(1);
+            resize_gltf_image(image, width, height)?;
+            image.base_color_mip_levels = None;
+            image.metallic_roughness_mip_levels = None;
+            image.normal_mip_levels = None;
+            image.data_mip_levels = None;
+            image.emissive_mip_levels = None;
+            resized = true;
+        }
+
+        if resized {
+            prepare_image_mip_levels(&mut self.images, &self.materials)?;
+        }
+        Ok(())
+    }
+
     pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
         let (document, buffers, images) =
             gltf::import(path).map_err(|error| format!("{}: {error}", path.display()))?;
 
         let mut converted_images = Vec::with_capacity(images.len());
-        let mut converted_image_bytes = 0usize;
         for image in images {
             let converted =
                 convert_image(&image).map_err(|error| format!("{}: {error}", path.display()))?;
-            converted_image_bytes = converted_image_bytes
-                .checked_add(converted.rgba.len())
-                .ok_or_else(|| format!("{}: converted image data size overflow", path.display()))?;
-            if converted_image_bytes > MAX_IMPORTED_IMAGE_DATA_BYTES {
-                return Err(format!(
-                    "{}: resized image data exceeds the {} MiB import budget",
-                    path.display(),
-                    MAX_IMPORTED_IMAGE_DATA_BYTES / (1024 * 1024)
-                ));
-            }
             converted_images.push(converted);
+            fit_images_to_byte_budget(&mut converted_images, MAX_IMPORTED_IMAGE_DATA_BYTES as u64)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
         }
         let mut images = converted_images;
 
@@ -574,7 +621,8 @@ impl GltfModelData {
                 if let Some(extension) = material.extensions().and_then(|extensions| {
                     extensions
                         .keys()
-                        .find(|name| name.starts_with("KHR_materials_"))
+                        .filter(|name| name.starts_with("KHR_materials_"))
+                        .find(|name| !is_supported_material_extension(name))
                 }) {
                     return Err(format!(
                         "material '{}' uses unsupported extension '{extension}'",
@@ -684,9 +732,12 @@ impl GltfModelData {
                 let base_color_factor = specular_glossiness
                     .as_ref()
                     .map_or_else(|| pbr.base_color_factor(), |extension| extension.diffuse_factor());
-                let roughness_factor = specular_glossiness.as_ref().map_or_else(
-                    || pbr.roughness_factor(),
-                    |extension| 1.0 - extension.glossiness_factor(),
+                let roughness_factor = adjust_named_material_roughness(
+                    material.name(),
+                    specular_glossiness.as_ref().map_or_else(
+                        || pbr.roughness_factor(),
+                        |extension| 1.0 - extension.glossiness_factor(),
+                    ),
                 );
                 let metallic_factor = if specular_glossiness.is_some() {
                     0.0
@@ -1404,10 +1455,167 @@ impl GltfModelData {
     }
 }
 
+fn fit_images_to_byte_budget(images: &mut [GltfImageData], max_bytes: u64) -> Result<(), String> {
+    loop {
+        let total_bytes = images.iter().try_fold(0_u64, |total, image| {
+            total
+                .checked_add(image.rgba.len() as u64)
+                .ok_or_else(|| "converted image data size overflow".to_owned())
+        })?;
+        if total_bytes <= max_bytes {
+            return Ok(());
+        }
+        if max_bytes < images.len() as u64 * 4 || total_bytes == 0 {
+            return Err("image data budget cannot fit the imported textures".to_owned());
+        }
+
+        let scale = (max_bytes as f64 / total_bytes as f64).sqrt();
+        let mut resized = false;
+        for image in images.iter_mut() {
+            let width = ((image.width as f64 * scale).floor() as u32).max(1);
+            let height = ((image.height as f64 * scale).floor() as u32).max(1);
+            if width != image.width || height != image.height {
+                resize_gltf_image(image, width, height)?;
+                resized = true;
+            }
+        }
+        if !resized {
+            return Err("image data budget cannot fit the imported textures".to_owned());
+        }
+    }
+}
+
+fn resize_gltf_image(image: &mut GltfImageData, width: u32, height: u32) -> Result<(), String> {
+    if width == image.width && height == image.height {
+        return Ok(());
+    }
+    let rgba_image =
+        image::RgbaImage::from_raw(image.width, image.height, std::mem::take(&mut image.rgba))
+            .ok_or_else(|| "converted image has invalid RGBA data".to_owned())?;
+    let rgba = image::imageops::resize(
+        &rgba_image,
+        width,
+        height,
+        image::imageops::FilterType::Triangle,
+    )
+    .into_raw();
+    image.binary_alpha_mask = has_binary_alpha_mask(&rgba);
+    image.width = width;
+    image.height = height;
+    image.rgba = rgba;
+    Ok(())
+}
+
+fn mipmap_request_counts(
+    image_count: usize,
+    materials: &[GltfMaterialData],
+) -> Result<Vec<u64>, String> {
+    let mut requests = HashSet::new();
+    for material in materials {
+        for (index, kind) in [
+            (material.base_color_image, 0_u8),
+            (material.metallic_roughness_image, 1),
+            (material.normal_image, 2),
+            (material.occlusion_image, 3),
+            (material.specular_image, 3),
+            (material.transmission_image, 3),
+            (material.thickness_image, 3),
+            (material.emissive_image, 4),
+            (material.specular_color_image, 4),
+        ] {
+            if let Some(index) = index {
+                if index >= image_count {
+                    return Err(format!("material references missing image {index}"));
+                }
+                requests.insert((index, kind));
+            }
+        }
+    }
+
+    let mut counts = vec![0_u64; image_count];
+    for (index, _) in requests {
+        counts[index] += 1;
+    }
+    Ok(counts)
+}
+
+fn fit_images_to_mipmap_budget(
+    images: &mut [GltfImageData],
+    usage_counts: &[u64],
+    max_bytes: u64,
+) -> Result<(), String> {
+    if images.len() != usage_counts.len() {
+        return Err("mipmap usage count does not match image count".to_owned());
+    }
+
+    loop {
+        let total_bytes =
+            images
+                .iter()
+                .zip(usage_counts)
+                .try_fold(0_u64, |total, (image, &usage_count)| {
+                    let mip_bytes = mipmap_chain_byte_size(image.width, image.height)?;
+                    total
+                        .checked_add(
+                            mip_bytes
+                                .checked_mul(usage_count)
+                                .ok_or_else(|| "mipmap size overflow".to_owned())?,
+                        )
+                        .ok_or_else(|| "mipmap size overflow".to_owned())
+                })?;
+        if total_bytes <= max_bytes {
+            return Ok(());
+        }
+        if total_bytes == 0 {
+            return Err("mipmap budget cannot be satisfied".to_owned());
+        }
+
+        let scale = (max_bytes as f64 / total_bytes as f64).sqrt() * 0.99;
+        let mut resized = false;
+        for (image, &usage_count) in images.iter_mut().zip(usage_counts) {
+            if usage_count == 0 {
+                continue;
+            }
+            let width = ((image.width as f64 * scale).floor() as u32).max(1);
+            let height = ((image.height as f64 * scale).floor() as u32).max(1);
+            if width != image.width || height != image.height {
+                resize_gltf_image(image, width, height)?;
+                resized = true;
+            }
+        }
+        if !resized {
+            return Err("mipmap budget cannot be satisfied".to_owned());
+        }
+    }
+}
+
+fn mipmap_chain_byte_size(width: u32, height: u32) -> Result<u64, String> {
+    let mut width = width as u64;
+    let mut height = height as u64;
+    let mut image_bytes = 0_u64;
+    loop {
+        image_bytes = image_bytes
+            .checked_add(
+                width
+                    .checked_mul(height)
+                    .and_then(|pixels| pixels.checked_mul(4))
+                    .ok_or_else(|| "mipmap size overflow".to_owned())?,
+            )
+            .ok_or_else(|| "mipmap size overflow".to_owned())?;
+        if width == 1 && height == 1 {
+            return Ok(image_bytes);
+        }
+        width = (width / 2).max(1);
+        height = (height / 2).max(1);
+    }
+}
+
 fn prepare_image_mip_levels(
     images: &mut [GltfImageData],
     materials: &[GltfMaterialData],
 ) -> Result<(), String> {
+    let usage_counts = mipmap_request_counts(images.len(), materials)?;
+    fit_images_to_mipmap_budget(images, &usage_counts, MAX_IMPORTED_MIPMAP_BYTES)?;
     let mut mipmap_bytes = 0_u64;
     for material in materials {
         if let Some(index) = material.base_color_image {
@@ -2064,6 +2272,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn clear_headlight_glass_keeps_its_texture_visible() {
+        assert_eq!(
+            adjust_named_material_roughness(Some("detail_glass_clear"), 0.0),
+            0.35
+        );
+        assert_eq!(
+            adjust_named_material_roughness(Some("head_light"), 0.858),
+            0.858
+        );
+        assert_eq!(adjust_named_material_roughness(Some("body"), 0.858), 0.858);
+    }
+
+    #[test]
     fn loads_sample_scene_with_multiple_primitives_and_materials() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets")
@@ -2202,6 +2423,50 @@ mod tests {
         assert_eq!(material.specular_color_factor, [0.6, 0.7, 0.8]);
         assert_eq!(material.specular_color_image, Some(0));
         assert_eq!(material.specular_color_tex_coord, 2);
+    }
+
+    #[test]
+    fn accepts_clearcoat_material_extension() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let sample_path = manifest_dir
+            .join("assets")
+            .join("models")
+            .join("sample.gltf");
+        let sample = std::fs::read_to_string(sample_path)
+            .unwrap()
+            .replace("\r\n", "\n");
+        let with_clearcoat = sample
+            .replace(
+                "\"extensionsUsed\": [\"KHR_materials_unlit\"]",
+                "\"extensionsUsed\": [\"KHR_materials_unlit\", \"KHR_materials_clearcoat\"]",
+            )
+            .replace(
+                "\"name\": \"cool\",\n      \"alphaMode\": \"BLEND\",",
+                "\"name\": \"cool\",\n      \"alphaMode\": \"BLEND\",\n      \"extensions\": {\n        \"KHR_materials_clearcoat\": {\"clearcoatFactor\": 0.7, \"clearcoatRoughnessFactor\": 0.3}\n      },",
+            );
+        assert_ne!(with_clearcoat, sample);
+
+        let fixture_dir = std::env::temp_dir().join(format!(
+            "my_engine-clearcoat-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&fixture_dir).unwrap();
+        std::fs::copy(
+            manifest_dir.join("texture.png"),
+            fixture_dir.join("texture.png"),
+        )
+        .unwrap();
+        let fixture_path = fixture_dir.join("clearcoat.gltf");
+        let fixture = with_clearcoat.replace("../../texture.png", "texture.png");
+        std::fs::write(&fixture_path, fixture).unwrap();
+
+        let loaded = GltfModelData::load(&fixture_path);
+        std::fs::remove_dir_all(&fixture_dir).unwrap();
+        assert!(loaded.is_ok());
     }
 
     #[test]
@@ -2449,9 +2714,9 @@ mod tests {
     #[test]
     fn downscales_large_imported_images_to_the_texture_budget() {
         let image = gltf::image::Data {
-            pixels: vec![128; 2048],
+            pixels: vec![128; 8192],
             format: gltf::image::Format::R8,
-            width: 2048,
+            width: 8192,
             height: 1,
         };
         let converted = convert_image(&image).unwrap();
@@ -2462,6 +2727,46 @@ mod tests {
             converted.rgba.len(),
             (MAX_IMPORTED_TEXTURE_DIMENSION * 4) as usize
         );
+    }
+
+    #[test]
+    fn downscales_gltf_images_to_fit_the_shared_image_budget() {
+        let mut images = [GltfImageData {
+            width: 4,
+            height: 4,
+            rgba: vec![255; 4 * 4 * 4],
+            binary_alpha_mask: false,
+            base_color_mip_levels: None,
+            metallic_roughness_mip_levels: None,
+            normal_mip_levels: None,
+            data_mip_levels: None,
+            emissive_mip_levels: None,
+        }];
+
+        fit_images_to_byte_budget(&mut images, 16).unwrap();
+
+        assert_eq!((images[0].width, images[0].height), (2, 2));
+        assert_eq!(images[0].rgba.len(), 16);
+    }
+
+    #[test]
+    fn downscales_gltf_images_when_the_mipmap_budget_is_exceeded() {
+        let mut images = [GltfImageData {
+            width: 4,
+            height: 4,
+            rgba: vec![255; 4 * 4 * 4],
+            binary_alpha_mask: false,
+            base_color_mip_levels: None,
+            metallic_roughness_mip_levels: None,
+            normal_mip_levels: None,
+            data_mip_levels: None,
+            emissive_mip_levels: None,
+        }];
+
+        fit_images_to_mipmap_budget(&mut images, &[1], 64).unwrap();
+
+        assert!(images[0].width < 4);
+        assert!(mipmap_chain_byte_size(images[0].width, images[0].height).unwrap() <= 64);
     }
 
     #[test]

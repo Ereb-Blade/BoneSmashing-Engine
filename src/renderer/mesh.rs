@@ -1,6 +1,13 @@
-use std::{error::Error, fmt, path::Path};
+use std::{
+    collections::HashMap,
+    error::Error,
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use wgpu::util::DeviceExt;
+
+pub(crate) const MAX_IMPORTED_TEXTURE_DIMENSION: u32 = 4096;
 
 #[derive(Debug)]
 pub struct MeshData {
@@ -9,6 +16,244 @@ pub struct MeshData {
     pub indices: Vec<u32>,
     pub skin_vertices: Vec<SkinVertex>,
     pub tangents: Vec<[f32; 4]>,
+}
+
+#[derive(Debug)]
+pub struct ObjTextureData {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct ObjMaterialData {
+    pub name: String,
+    pub diffuse: [f32; 3],
+    pub specular: [f32; 3],
+    pub shininess: f32,
+    pub dissolve: f32,
+    pub diffuse_texture: Option<usize>,
+    pub ambient_texture: Option<usize>,
+    pub normal_texture: Option<usize>,
+}
+
+#[derive(Debug)]
+pub struct ObjPrimitiveData {
+    pub name: String,
+    pub mesh: MeshData,
+    pub material_index: Option<usize>,
+}
+
+#[derive(Debug)]
+pub struct ObjModelData {
+    pub materials: Vec<ObjMaterialData>,
+    pub textures: Vec<ObjTextureData>,
+    pub primitives: Vec<ObjPrimitiveData>,
+}
+
+impl ObjModelData {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, ObjImportError> {
+        let path = path.as_ref();
+        let (models, materials) =
+            tobj::load_obj(path, &tobj::GPU_LOAD_OPTIONS).map_err(ObjImportError::Load)?;
+        let materials = materials.map_err(ObjImportError::Load)?;
+        let texture_directory = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut textures = Vec::new();
+        let mut texture_cache = HashMap::new();
+        let mut loaded_materials = Vec::with_capacity(materials.len());
+
+        for material in materials {
+            let load_texture = |filename: Option<String>,
+                                cache: &mut HashMap<PathBuf, usize>,
+                                textures: &mut Vec<ObjTextureData>|
+             -> Result<Option<usize>, ObjImportError> {
+                let Some(filename) = filename else {
+                    return Ok(None);
+                };
+                let Some(filename) = obj_texture_filename(&filename) else {
+                    return Ok(None);
+                };
+                let texture_path = PathBuf::from(filename);
+                let texture_path = if texture_path.is_absolute() {
+                    texture_path
+                } else {
+                    texture_directory.join(texture_path)
+                };
+                let texture_path = std::fs::canonicalize(&texture_path).map_err(|error| {
+                    ObjImportError::Invalid(format!(
+                        "material '{}' texture {} could not be found: {error}",
+                        material.name,
+                        texture_path.display()
+                    ))
+                })?;
+                if let Some(&index) = cache.get(&texture_path) {
+                    return Ok(Some(index));
+                }
+
+                let image = image::open(&texture_path).map_err(|error| {
+                    ObjImportError::Invalid(format!(
+                        "material '{}' texture {} could not be decoded: {error}",
+                        material.name,
+                        texture_path.display()
+                    ))
+                })?;
+                let image = downscale_obj_texture(image);
+                let image = image.to_rgba8();
+                let image = image::imageops::flip_vertical(&image);
+                let index = textures.len();
+                textures.push(ObjTextureData {
+                    width: image.width(),
+                    height: image.height(),
+                    rgba: image.into_raw(),
+                });
+                cache.insert(texture_path, index);
+                Ok(Some(index))
+            };
+
+            let diffuse_texture = load_texture(
+                material.diffuse_texture.clone(),
+                &mut texture_cache,
+                &mut textures,
+            )?;
+            let ambient_texture = if let Some(filename) = material.ambient_texture.clone() {
+                load_texture(Some(filename), &mut texture_cache, &mut textures)?
+            } else {
+                let inferred_filename = material
+                    .diffuse_texture
+                    .as_deref()
+                    .and_then(obj_texture_filename)
+                    .and_then(|filename| {
+                        inferred_obj_occlusion_filename(filename, texture_directory)
+                    });
+                if let Some(filename) = inferred_filename {
+                    load_texture(Some(filename), &mut texture_cache, &mut textures)?
+                } else {
+                    None
+                }
+            };
+            let normal_texture =
+                load_texture(material.normal_texture, &mut texture_cache, &mut textures)?;
+
+            loaded_materials.push(ObjMaterialData {
+                name: material.name.clone(),
+                diffuse: material.diffuse.unwrap_or([1.0; 3]),
+                specular: material.specular.unwrap_or([1.0; 3]),
+                shininess: material.shininess.unwrap_or(32.0),
+                dissolve: material.dissolve.unwrap_or(1.0),
+                diffuse_texture,
+                ambient_texture,
+                normal_texture,
+            });
+        }
+
+        let mut primitives = Vec::with_capacity(models.len());
+        for model in &models {
+            if model
+                .mesh
+                .material_id
+                .is_some_and(|index| index >= loaded_materials.len())
+            {
+                return Err(ObjImportError::Invalid(format!(
+                    "model '{}' references an unknown MTL material",
+                    model.name
+                )));
+            }
+            primitives.push(ObjPrimitiveData {
+                name: model.name.clone(),
+                mesh: MeshData::from_obj_models(std::slice::from_ref(model))?,
+                material_index: model.mesh.material_id,
+            });
+        }
+
+        if primitives.is_empty() {
+            return Err(ObjImportError::Invalid(
+                "file does not contain any triangle meshes".to_owned(),
+            ));
+        }
+
+        Ok(Self {
+            materials: loaded_materials,
+            textures,
+            primitives,
+        })
+    }
+
+    pub fn primitive_count(&self) -> usize {
+        self.primitives.len()
+    }
+}
+
+fn obj_texture_filename(value: &str) -> Option<String> {
+    let tokens = value.split_whitespace().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < tokens.len() && tokens[index].starts_with('-') {
+        let option = tokens[index];
+        index += 1;
+        match option {
+            "-s" | "-o" | "-t" => {
+                let mut consumed = 0;
+                while consumed < 3
+                    && tokens
+                        .get(index)
+                        .is_some_and(|token| token.parse::<f32>().is_ok())
+                {
+                    index += 1;
+                    consumed += 1;
+                }
+            }
+            "-mm" => {
+                for _ in 0..2 {
+                    if tokens
+                        .get(index)
+                        .is_some_and(|token| token.parse::<f32>().is_ok())
+                    {
+                        index += 1;
+                    }
+                }
+            }
+            "-bm" | "-boost" | "-texres" | "-imfchan" | "-type" | "-clamp" | "-blendu"
+            | "-blendv" | "-cc" | "-colorspace" => {
+                if index < tokens.len() {
+                    index += 1;
+                }
+            }
+            "-halo" => {}
+            _ => return Some(value.trim().trim_matches('"').to_owned()),
+        }
+    }
+    let filename = tokens[index..].join(" ");
+    let filename = filename.trim().trim_matches('"').to_owned();
+    (!filename.is_empty()).then_some(filename)
+}
+
+fn inferred_obj_occlusion_filename(
+    diffuse_filename: String,
+    texture_directory: &Path,
+) -> Option<String> {
+    let path = Path::new(&diffuse_filename);
+    let stem = path.file_stem()?.to_str()?;
+    let extension = path.extension()?.to_str()?;
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    ["_occlusion", "_ao"].into_iter().find_map(|suffix| {
+        let filename = parent.join(format!("{stem}{suffix}.{extension}"));
+        texture_directory
+            .join(&filename)
+            .is_file()
+            .then(|| filename.to_string_lossy().into_owned())
+    })
+}
+
+fn downscale_obj_texture(image: image::DynamicImage) -> image::DynamicImage {
+    if image.width() > MAX_IMPORTED_TEXTURE_DIMENSION
+        || image.height() > MAX_IMPORTED_TEXTURE_DIMENSION
+    {
+        image.thumbnail(
+            MAX_IMPORTED_TEXTURE_DIMENSION,
+            MAX_IMPORTED_TEXTURE_DIMENSION,
+        )
+    } else {
+        image
+    }
 }
 
 #[repr(C)]
@@ -807,5 +1052,116 @@ mod tests {
 
         assert_eq!(data.indices.len(), 18);
         assert_eq!(data.vertices.len(), 5);
+    }
+
+    #[test]
+    fn loads_obj_materials_textures_and_material_groups() {
+        let directory = std::env::temp_dir().join(format!(
+            "bone-smashing-obj-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let obj_path = directory.join("model.obj");
+        std::fs::write(
+            &obj_path,
+            "mtllib model.mtl\n\
+             o wall\n\
+             v 0 0 0\n\
+             v 1 0 0\n\
+             v 0 1 0\n\
+             vt 0 0\n\
+             vt 1 0\n\
+             vt 0 1\n\
+             vn 0 0 1\n\
+             usemtl brick\n\
+             f 1/1/1 2/2/1 3/3/1\n\
+             o roof\n\
+             usemtl roof_material\n\
+             f 1/1/1 3/3/1 2/2/1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("model.mtl"),
+            "newmtl brick\n\
+             Kd 0.8 0.7 0.6\n\
+             Ks 0.4 0.4 0.4\n\
+             Ns 64\n\
+             map_Kd -s 1 1 1 albedo.png\n\
+             map_Bump normal.png\n\
+             newmtl roof_material\n\
+             Kd 0.2 0.3 0.4\n\
+             map_Ka roof_ao.png\n",
+        )
+        .unwrap();
+        let image = image::RgbaImage::from_raw(1, 2, vec![255, 0, 0, 255, 0, 0, 255, 255]).unwrap();
+        image.save(directory.join("albedo.png")).unwrap();
+        image.save(directory.join("albedo_occlusion.png")).unwrap();
+        image.save(directory.join("roof_ao.png")).unwrap();
+        image.save(directory.join("normal.png")).unwrap();
+
+        let model = ObjModelData::load(&obj_path).unwrap();
+
+        assert_eq!(model.primitive_count(), 2);
+        assert_eq!(model.materials.len(), 2);
+        let brick = model
+            .materials
+            .iter()
+            .find(|material| material.name == "brick")
+            .unwrap();
+        assert_eq!(brick.diffuse_texture, Some(0));
+        assert_eq!(brick.ambient_texture, Some(1));
+        assert_eq!(brick.normal_texture, Some(2));
+        assert_eq!(
+            model
+                .materials
+                .iter()
+                .find(|material| material.name == "roof_material")
+                .unwrap()
+                .ambient_texture,
+            Some(3)
+        );
+        assert_eq!(model.textures.len(), 4);
+        assert_eq!(model.textures[0].rgba, [0, 0, 255, 255, 255, 0, 0, 255]);
+        assert!(
+            model
+                .primitives
+                .iter()
+                .all(|primitive| primitive.material_index.is_some())
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn parses_obj_texture_options_and_filenames_with_spaces() {
+        assert_eq!(
+            obj_texture_filename("-s 1 1 1 \"albedo map.png\""),
+            Some("albedo map.png".to_owned())
+        );
+        assert_eq!(
+            obj_texture_filename("textures/albedo map.png"),
+            Some("textures/albedo map.png".to_owned())
+        );
+        assert_eq!(obj_texture_filename("-halo"), None);
+    }
+
+    #[test]
+    fn preserves_obj_texture_quality_up_to_4096_pixels_without_upscaling() {
+        let small = image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 1));
+        let small = downscale_obj_texture(small);
+        assert_eq!((small.width(), small.height()), (2, 1));
+
+        let large = image::DynamicImage::ImageRgba8(image::RgbaImage::new(
+            MAX_IMPORTED_TEXTURE_DIMENSION + 1,
+            1,
+        ));
+        let large = downscale_obj_texture(large);
+        assert_eq!(
+            (large.width(), large.height()),
+            (MAX_IMPORTED_TEXTURE_DIMENSION, 1)
+        );
     }
 }

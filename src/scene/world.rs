@@ -1,7 +1,8 @@
-use glam::Quat;
+use glam::{Quat, Vec3};
 
 use crate::scene::Transform;
 use crate::scene::entity::RenderObject;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -20,8 +21,14 @@ pub struct ModelGroup {
 
 pub struct World {
     objects: Vec<RenderObject>,
+    object_ids: Vec<ObjectId>,
+    object_indices: HashMap<ObjectId, usize>,
+    next_object_id: usize,
     standalone_objects: Vec<ObjectId>,
     model_groups: Vec<ModelGroup>,
+    model_group_ids: Vec<ModelGroupId>,
+    model_group_indices: HashMap<ModelGroupId, usize>,
+    next_model_group_id: usize,
     rotating_cube_id: Option<ObjectId>,
 }
 
@@ -35,8 +42,14 @@ impl World {
     pub fn new() -> Self {
         Self {
             objects: Vec::new(),
+            object_ids: Vec::new(),
+            object_indices: HashMap::new(),
+            next_object_id: 0,
             standalone_objects: Vec::new(),
             model_groups: Vec::new(),
+            model_group_ids: Vec::new(),
+            model_group_indices: HashMap::new(),
+            next_model_group_id: 0,
             rotating_cube_id: None,
         }
     }
@@ -49,7 +62,13 @@ impl World {
     }
 
     fn push_object(&mut self, object: RenderObject) -> ObjectId {
-        let id = ObjectId(self.objects.len());
+        let id = ObjectId(self.next_object_id);
+        self.next_object_id = self
+            .next_object_id
+            .checked_add(1)
+            .expect("ObjectId space exhausted");
+        self.object_indices.insert(id, self.objects.len());
+        self.object_ids.push(id);
         self.objects.push(object);
         id
     }
@@ -60,7 +79,13 @@ impl World {
         source_path: PathBuf,
         transform: Transform,
     ) -> ModelGroupId {
-        let id = ModelGroupId(self.model_groups.len());
+        let id = ModelGroupId(self.next_model_group_id);
+        self.next_model_group_id = self
+            .next_model_group_id
+            .checked_add(1)
+            .expect("ModelGroupId space exhausted");
+        self.model_group_indices.insert(id, self.model_groups.len());
+        self.model_group_ids.push(id);
         self.model_groups.push(ModelGroup {
             name: name.into(),
             transform,
@@ -75,12 +100,13 @@ impl World {
         group_id: ModelGroupId,
         mut object: RenderObject,
     ) -> Option<ObjectId> {
-        if self.model_groups.get(group_id.0).is_none() {
+        let group_index = *self.model_group_indices.get(&group_id)?;
+        if self.model_groups.get(group_index).is_none() {
             return None;
         }
         object.set_model_group(Some(group_id));
         let object_id = self.push_object(object);
-        self.model_groups[group_id.0].objects.push(object_id);
+        self.model_groups[group_index].objects.push(object_id);
         Some(object_id)
     }
 
@@ -88,23 +114,33 @@ impl World {
         &self.model_groups
     }
 
+    pub fn model_group_ids(&self) -> &[ModelGroupId] {
+        &self.model_group_ids
+    }
+
+    pub fn object_id_at(&self, index: usize) -> Option<ObjectId> {
+        self.object_ids.get(index).copied()
+    }
+
     pub fn standalone_objects(&self) -> &[ObjectId] {
         &self.standalone_objects
     }
 
     pub fn model_group_mut(&mut self, id: ModelGroupId) -> Option<&mut ModelGroup> {
-        self.model_groups.get_mut(id.0)
+        let index = *self.model_group_indices.get(&id)?;
+        self.model_groups.get_mut(index)
     }
 
     pub fn model_group(&self, id: ModelGroupId) -> Option<&ModelGroup> {
-        self.model_groups.get(id.0)
+        let index = *self.model_group_indices.get(&id)?;
+        self.model_groups.get(index)
     }
 
     pub fn group_model_matrix(&self, object: &RenderObject) -> glam::Mat4 {
         object.model_group().map_or_else(
             || object.model_matrix(),
             |id| {
-                self.model_groups.get(id.0).map_or_else(
+                self.model_group(id).map_or_else(
                     || object.model_matrix(),
                     |group| group.transform.to_matrix() * object.model_matrix(),
                 )
@@ -117,8 +153,100 @@ impl World {
         self.rotating_cube_id = Some(id);
     }
 
+    pub fn get_object(&self, id: ObjectId) -> Option<&RenderObject> {
+        let index = *self.object_indices.get(&id)?;
+        self.objects.get(index)
+    }
+
     pub fn get_object_mut(&mut self, id: ObjectId) -> Option<&mut RenderObject> {
-        self.objects.get_mut(id.0)
+        let index = *self.object_indices.get(&id)?;
+        self.objects.get_mut(index)
+    }
+
+    pub fn remove_object(&mut self, id: ObjectId) -> Option<RenderObject> {
+        let object = self.remove_object_storage(id)?;
+        self.standalone_objects.retain(|&object_id| object_id != id);
+
+        if let Some(group_id) = object.model_group()
+            && self
+                .model_group(group_id)
+                .is_some_and(|group| group.objects.is_empty())
+        {
+            self.remove_model_group_storage(group_id);
+        }
+
+        Some(object)
+    }
+
+    fn remove_object_storage(&mut self, id: ObjectId) -> Option<RenderObject> {
+        let index = self.object_indices.remove(&id)?;
+        let removed = self.objects.swap_remove(index);
+        self.object_ids.swap_remove(index);
+        if let Some(&moved_id) = self.object_ids.get(index) {
+            self.object_indices.insert(moved_id, index);
+        }
+        self.standalone_objects.retain(|&object_id| object_id != id);
+        if self.rotating_cube_id == Some(id) {
+            self.rotating_cube_id = None;
+        }
+        if let Some(group_id) = removed.model_group()
+            && let Some(group) = self.model_group_mut(group_id)
+        {
+            group.objects.retain(|&object_id| object_id != id);
+        }
+        Some(removed)
+    }
+
+    pub fn remove_model_group(&mut self, id: ModelGroupId) -> Option<ModelGroup> {
+        let group = self.model_group(id)?.clone();
+        for object_id in &group.objects {
+            self.remove_object_storage(*object_id);
+        }
+        self.remove_model_group_storage(id)
+    }
+
+    fn remove_model_group_storage(&mut self, id: ModelGroupId) -> Option<ModelGroup> {
+        let index = self.model_group_indices.remove(&id)?;
+        let group = self.model_groups.swap_remove(index);
+        self.model_group_ids.swap_remove(index);
+        if let Some(&moved_id) = self.model_group_ids.get(index) {
+            self.model_group_indices.insert(moved_id, index);
+        }
+        Some(group)
+    }
+
+    pub fn duplicate_object(&mut self, id: ObjectId) -> Option<ObjectId> {
+        let mut object = self.get_object(id)?.clone();
+        object.transform.position += Vec3::X;
+        object.name = if object.name.is_empty() {
+            "Object Copy".to_owned()
+        } else {
+            format!("{} Copy", object.name)
+        };
+        match object.model_group() {
+            Some(group_id) => self.add_group_object(group_id, object),
+            None => Some(self.add_object(object)),
+        }
+    }
+
+    pub fn duplicate_model_group(&mut self, id: ModelGroupId) -> Option<ModelGroupId> {
+        let source = self.model_group(id)?.clone();
+        let objects: Vec<_> = source
+            .objects
+            .iter()
+            .filter_map(|&object_id| self.get_object(object_id).cloned())
+            .collect();
+        let mut transform = source.transform;
+        transform.position += Vec3::X;
+        let copy_id = self.add_model_group(
+            format!("{} Copy", source.name),
+            source.source_path,
+            transform,
+        );
+        for object in objects {
+            self.add_group_object(copy_id, object)?;
+        }
+        Some(copy_id)
     }
 
     pub fn update(&mut self, dt: f32) {
@@ -193,11 +321,119 @@ mod tests {
             MaterialId(0),
         );
         let id = world.add_group_object(group, object).unwrap();
-        let object = &world.objects()[id.0];
+        let object = world.get_object(id).unwrap();
         let world_position = world
             .group_model_matrix(object)
             .transform_point3(Vec3::ZERO);
 
         assert_eq!(world_position, Vec3::new(10.0, 2.0, 0.0));
+    }
+
+    #[test]
+    fn removed_object_ids_do_not_alias_objects_added_later() {
+        let mut world = World::new();
+        let first = world.add_object(RenderObject::new(
+            Transform::from_translation(Vec3::X),
+            MeshId(0),
+            MaterialId(0),
+        ));
+        let second = world.add_object(RenderObject::new(
+            Transform::from_translation(Vec3::Y),
+            MeshId(0),
+            MaterialId(0),
+        ));
+
+        world.remove_object(first).unwrap();
+        let third = world.add_object(RenderObject::new(
+            Transform::from_translation(Vec3::Z),
+            MeshId(0),
+            MaterialId(0),
+        ));
+
+        assert!(world.get_object(first).is_none());
+        assert_eq!(
+            world.get_object(second).unwrap().transform.position,
+            Vec3::Y
+        );
+        assert_eq!(world.get_object(third).unwrap().transform.position, Vec3::Z);
+    }
+
+    #[test]
+    fn duplicate_standalone_object_is_offset_and_keeps_source_intact() {
+        let mut world = World::new();
+        let source = world.add_object(RenderObject::new(
+            Transform::from_translation(Vec3::Y),
+            MeshId(0),
+            MaterialId(0),
+        ));
+
+        let copy = world.duplicate_object(source).unwrap();
+
+        assert_ne!(copy, source);
+        assert_eq!(
+            world.get_object(source).unwrap().transform.position,
+            Vec3::Y
+        );
+        assert_eq!(
+            world.get_object(copy).unwrap().transform.position,
+            Vec3::Y + Vec3::X
+        );
+    }
+
+    #[test]
+    fn removing_model_group_removes_its_parts_without_invalidating_other_ids() {
+        let mut world = World::new();
+        let first_group =
+            world.add_model_group("First", PathBuf::from("first.glb"), Transform::default());
+        let first_part = world
+            .add_group_object(
+                first_group,
+                RenderObject::new(Transform::default(), MeshId(0), MaterialId(0)),
+            )
+            .unwrap();
+        let second_group =
+            world.add_model_group("Second", PathBuf::from("second.glb"), Transform::default());
+        let second_part = world
+            .add_group_object(
+                second_group,
+                RenderObject::new(Transform::default(), MeshId(0), MaterialId(0)),
+            )
+            .unwrap();
+
+        world.remove_model_group(first_group).unwrap();
+
+        assert!(world.get_object(first_part).is_none());
+        assert!(world.model_group(first_group).is_none());
+        assert!(world.get_object(second_part).is_some());
+        assert!(world.model_group(second_group).is_some());
+        assert_eq!(world.model_group_ids(), &[second_group]);
+    }
+
+    #[test]
+    fn duplicate_group_creates_new_stable_ids_and_copies_children() {
+        let mut world = World::new();
+        let group = world.add_model_group(
+            "Vehicle",
+            PathBuf::from("vehicle.glb"),
+            Transform::default(),
+        );
+        let part = world
+            .add_group_object(
+                group,
+                RenderObject::new(Transform::default(), MeshId(1), MaterialId(2)).with_name("Body"),
+            )
+            .unwrap();
+
+        let copy = world.duplicate_model_group(group).unwrap();
+        let copy_part = world.model_group(copy).unwrap().objects[0];
+
+        assert_ne!(copy, group);
+        assert_ne!(copy_part, part);
+        assert_eq!(world.get_object(copy_part).unwrap().name, "Body");
+        assert_eq!(
+            world.get_object(copy_part).unwrap().model_group(),
+            Some(copy)
+        );
+        assert_eq!(world.model_group(copy).unwrap().transform.position, Vec3::X);
     }
 }

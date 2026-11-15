@@ -8,10 +8,10 @@ use winit::window::Window;
 
 use crate::camera::{Camera, CameraUniform};
 use crate::config::DEPTH_FORMAT;
-use crate::core::{MaterialId, MeshId};
+use crate::core::{MATERIAL_DEFAULT, MaterialId, MeshId};
 use crate::renderer::gltf::{GltfModelData, LoadedGltfModel};
-use crate::renderer::material::{Material, MaterialParams};
-use crate::renderer::mesh::{Mesh, MeshData};
+use crate::renderer::material::{Material, MaterialParams, generate_mip_levels_with_alpha};
+use crate::renderer::mesh::{Mesh, MeshData, ObjModelData};
 use crate::renderer::pipeline::{HDR_FORMAT, RenderPipelineBundle};
 use crate::renderer::{debug_ui::DebugUi, environment::Environment};
 use crate::scene::{RenderObject, World};
@@ -19,12 +19,24 @@ use crate::scene::{RenderObject, World};
 #[derive(Debug)]
 pub enum ParsedAsset {
     Gltf(GltfModelData),
-    Obj(MeshData),
+    Obj(ObjModelData),
 }
 
 pub enum LoadedAsset {
     Gltf(LoadedGltfModel),
-    Obj(MeshId),
+    Obj(LoadedObjModel),
+}
+
+#[derive(Debug)]
+pub struct LoadedObjInstance {
+    pub name: String,
+    pub mesh_id: MeshId,
+    pub material_id: MaterialId,
+}
+
+#[derive(Debug)]
+pub struct LoadedObjModel {
+    pub instances: Vec<LoadedObjInstance>,
 }
 
 pub fn parse_asset(path: &Path) -> Result<ParsedAsset, String> {
@@ -35,7 +47,7 @@ pub fn parse_asset(path: &Path) -> Result<ParsedAsset, String> {
         .ok_or_else(|| format!("Unsupported model file: {}", path.display()))?;
     match extension.as_str() {
         "glb" | "gltf" => GltfModelData::load(path).map(ParsedAsset::Gltf),
-        "obj" => MeshData::load_obj(path)
+        "obj" => ObjModelData::load(path)
             .map(ParsedAsset::Obj)
             .map_err(|error| format!("{}: {error}", path.display())),
         _ => Err(format!(
@@ -1210,16 +1222,208 @@ impl Renderer {
     ) -> Result<LoadedAsset, String> {
         match parsed {
             ParsedAsset::Gltf(model) => self.upload_gltf(model, path).map(LoadedAsset::Gltf),
-            ParsedAsset::Obj(mesh_data) => self.upload_obj(mesh_data, path).map(LoadedAsset::Obj),
+            ParsedAsset::Obj(model) => self.upload_obj_model(model, path).map(LoadedAsset::Obj),
         }
+    }
+
+    fn upload_obj_model(
+        &mut self,
+        model: ObjModelData,
+        path: &Path,
+    ) -> Result<LoadedObjModel, String> {
+        let limits = self.device.limits();
+        let max_buffer_size = limits.max_buffer_size;
+        for (index, texture) in model.textures.iter().enumerate() {
+            if texture.width > limits.max_texture_dimension_2d
+                || texture.height > limits.max_texture_dimension_2d
+            {
+                return Err(format!(
+                    "{}: OBJ texture {index} exceeds the device's maximum 2D texture dimension",
+                    path.display()
+                ));
+            }
+        }
+        for (index, primitive) in model.primitives.iter().enumerate() {
+            let vertex_bytes = std::mem::size_of_val(primitive.mesh.vertices.as_slice()) as u64;
+            let uv_bytes = std::mem::size_of_val(primitive.mesh.uv_sets.as_slice()) as u64;
+            let skin_bytes = std::mem::size_of_val(primitive.mesh.skin_vertices.as_slice()) as u64;
+            let tangent_bytes = std::mem::size_of_val(primitive.mesh.tangents.as_slice()) as u64;
+            let index_bytes = std::mem::size_of_val(primitive.mesh.indices.as_slice()) as u64;
+            if vertex_bytes > max_buffer_size
+                || uv_bytes > max_buffer_size
+                || skin_bytes > max_buffer_size
+                || tangent_bytes > max_buffer_size
+                || index_bytes > max_buffer_size
+                || primitive
+                    .material_index
+                    .is_some_and(|material| material >= model.materials.len())
+            {
+                return Err(format!(
+                    "{}: OBJ primitive {index} exceeds a device limit or references a missing material",
+                    path.display()
+                ));
+            }
+        }
+        for material in &model.materials {
+            if material
+                .diffuse_texture
+                .is_some_and(|image| image >= model.textures.len())
+                || material
+                    .ambient_texture
+                    .is_some_and(|image| image >= model.textures.len())
+                || material
+                    .normal_texture
+                    .is_some_and(|image| image >= model.textures.len())
+                || !material.diffuse.iter().all(|value| value.is_finite())
+                || !material.specular.iter().all(|value| value.is_finite())
+                || !material.shininess.is_finite()
+                || !material.dissolve.is_finite()
+            {
+                return Err(format!(
+                    "{}: OBJ material contains invalid values or references a missing texture",
+                    path.display()
+                ));
+            }
+        }
+
+        let white_mips = [vec![255; 4]];
+        let flat_normal_mips = [vec![128, 128, 255, 255]];
+        let first_material_id = self.materials.len();
+        for material in &model.materials {
+            let diffuse = material.diffuse_texture.map(|index| &model.textures[index]);
+            let diffuse_mips = diffuse
+                .map(|texture| {
+                    generate_mip_levels_with_alpha(
+                        &texture.rgba,
+                        texture.width,
+                        texture.height,
+                        true,
+                        false,
+                        true,
+                    )
+                })
+                .unwrap_or_else(|| white_mips.to_vec());
+            let (diffuse_width, diffuse_height) = diffuse
+                .map(|texture| (texture.width, texture.height))
+                .unwrap_or((1, 1));
+
+            let normal = material.normal_texture.map(|index| &model.textures[index]);
+            let normal_mips = normal
+                .map(|texture| {
+                    generate_mip_levels_with_alpha(
+                        &texture.rgba,
+                        texture.width,
+                        texture.height,
+                        false,
+                        true,
+                        false,
+                    )
+                })
+                .unwrap_or_else(|| flat_normal_mips.to_vec());
+            let (normal_width, normal_height) = normal
+                .map(|texture| (texture.width, texture.height))
+                .unwrap_or((1, 1));
+
+            let occlusion = material.ambient_texture.map(|index| &model.textures[index]);
+            let occlusion_mips = occlusion
+                .map(|texture| {
+                    generate_mip_levels_with_alpha(
+                        &texture.rgba,
+                        texture.width,
+                        texture.height,
+                        false,
+                        false,
+                        false,
+                    )
+                })
+                .unwrap_or_else(|| white_mips.to_vec());
+            let (occlusion_width, occlusion_height) = occlusion
+                .map(|texture| (texture.width, texture.height))
+                .unwrap_or((1, 1));
+
+            let label = format!(
+                "{} - {}",
+                path.file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("OBJ"),
+                material.name
+            );
+            let shininess = material.shininess.clamp(0.0, 1000.0);
+            self.materials.push(Material::from_precomputed_mipmaps(
+                &self.device,
+                &self.queue,
+                &self.texture_bind_group_layout,
+                (&diffuse_mips, diffuse_width, diffuse_height),
+                (&white_mips, 1, 1),
+                (&normal_mips, normal_width, normal_height),
+                (&occlusion_mips, occlusion_width, occlusion_height),
+                (&white_mips, 1, 1),
+                (&white_mips, 1, 1),
+                (&white_mips, 1, 1),
+                (&white_mips, 1, 1),
+                (&white_mips, 1, 1),
+                MaterialParams {
+                    base_color: [
+                        material.diffuse[0].clamp(0.0, 1.0),
+                        material.diffuse[1].clamp(0.0, 1.0),
+                        material.diffuse[2].clamp(0.0, 1.0),
+                        material.dissolve.clamp(0.0, 1.0),
+                    ],
+                    roughness: (2.0 / (shininess + 2.0)).sqrt().clamp(0.045, 1.0),
+                    metallic: 0.0,
+                    alpha_mode: u32::from(material.dissolve < 1.0) * 2,
+                    normal_scale: if normal.is_some() { 1.0 } else { 0.0 },
+                    specular_factor: (material.specular.iter().sum::<f32>() / 3.0).clamp(0.0, 1.0),
+                    ..Default::default()
+                },
+                Some(&label),
+            ));
+        }
+
+        let mut instances = Vec::with_capacity(model.primitives.len());
+        for primitive in model.primitives {
+            let mesh_id = MeshId(self.meshes.len());
+            let label = if primitive.name.is_empty() {
+                path.file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("OBJ")
+                    .to_owned()
+            } else {
+                format!(
+                    "{} - {}",
+                    path.file_stem()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("OBJ"),
+                    primitive.name
+                )
+            };
+            self.meshes.push(Mesh::from_mesh_data(
+                &self.device,
+                &primitive.mesh,
+                Some(&label),
+            ));
+            instances.push(LoadedObjInstance {
+                name: label,
+                mesh_id,
+                material_id: primitive
+                    .material_index
+                    .map(|index| MaterialId(first_material_id + index))
+                    .unwrap_or(MATERIAL_DEFAULT),
+            });
+        }
+
+        Ok(LoadedObjModel { instances })
     }
 
     fn upload_gltf(
         &mut self,
-        model: GltfModelData,
+        mut model: GltfModelData,
         path: &Path,
     ) -> Result<LoadedGltfModel, String> {
         let limits = self.device.limits();
+        model
+            .limit_texture_dimensions(limits.max_texture_dimension_2d)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
         let max_buffer_size = limits.max_buffer_size;
 
         for (index, image) in model.images.iter().enumerate() {
@@ -1500,6 +1704,7 @@ impl Renderer {
         let ui_started = Instant::now();
         let previous_timings = self.timings;
         debug_ui.prepare_frame(
+            camera,
             window,
             frame_time,
             fps,

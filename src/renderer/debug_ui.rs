@@ -1,6 +1,10 @@
+use crate::camera::Camera;
+use crate::core::{MATERIAL_DEFAULT, MESH_CUBE};
 use crate::renderer::state::{ParsedAsset, RenderTimings, Renderer, parse_asset};
-use crate::scene::{LoadedScene, ModelGroupId, ObjectId, Transform, World, load_scene};
-use glam::{EulerRot, Quat};
+use crate::scene::{
+    LoadedScene, ModelGroupId, ObjectId, RenderObject, Transform, World, load_scene,
+};
+use glam::{EulerRot, Mat4, Quat, Vec3};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use winit::window::Window;
@@ -12,10 +16,53 @@ struct PreparedFrame {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CameraControlMode {
+    ClickToCapture,
+    HoldMouseButton,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CameraLookButton {
+    Left,
+    Right,
+}
+
+impl CameraLookButton {
+    pub fn mouse_button(self) -> winit::event::MouseButton {
+        match self {
+            Self::Left => winit::event::MouseButton::Left,
+            Self::Right => winit::event::MouseButton::Right,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum SceneSelection {
     Model(ModelGroupId),
     Part(ObjectId),
     Object(ObjectId),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditorTab {
+    Scene,
+    Render,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GizmoMode {
+    Move,
+    Rotate,
+    Scale,
+}
+
+#[derive(Clone, Copy)]
+struct GizmoDrag {
+    mode: GizmoMode,
+    axis: usize,
+    screen_direction: egui::Vec2,
+    world_per_pixel: f32,
+    last_pointer: egui::Pos2,
 }
 
 pub struct DebugUi {
@@ -23,6 +70,10 @@ pub struct DebugUi {
     platform: egui_winit::State,
     renderer: egui_wgpu::Renderer,
     visible: bool,
+    active_tab: EditorTab,
+    show_camera_settings: bool,
+    camera_control_mode: CameraControlMode,
+    camera_look_button: CameraLookButton,
     environment_path: String,
     status: Option<Result<String, String>>,
     environment_dialog: Option<mpsc::Receiver<Option<PathBuf>>>,
@@ -40,69 +91,101 @@ pub struct DebugUi {
     scene_save_request: Option<PathBuf>,
     scene_load_request: Option<Result<LoadedScene, String>>,
     selected_scene_item: Option<SceneSelection>,
+    gizmo_mode: GizmoMode,
+    gizmo_drag: Option<GizmoDrag>,
+    viewport_rect: Option<egui::Rect>,
+    last_pointer_pos: Option<egui::Pos2>,
     prepared: Option<PreparedFrame>,
 }
 
 fn edit_transform(ui: &mut egui::Ui, transform: &mut Transform) {
-    ui.horizontal(|ui| {
-        ui.label("Position");
-        ui.add(
-            egui::DragValue::new(&mut transform.position.x)
-                .speed(0.1)
-                .range(-100_000.0..=100_000.0)
-                .prefix("X "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut transform.position.y)
-                .speed(0.1)
-                .range(-100_000.0..=100_000.0)
-                .prefix("Y "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut transform.position.z)
-                .speed(0.1)
-                .range(-100_000.0..=100_000.0)
-                .prefix("Z "),
-        );
-    });
-
     let (mut pitch, mut yaw, mut roll) = transform.rotation.to_euler(EulerRot::XYZ);
     pitch = pitch.to_degrees();
     yaw = yaw.to_degrees();
     roll = roll.to_degrees();
-    let rotation_changed = ui
-        .horizontal(|ui| {
+    let mut rotation_changed = false;
+    egui::Grid::new("transform-inspector")
+        .num_columns(4)
+        .spacing(egui::vec2(6.0, 5.0))
+        .show(ui, |ui| {
+            ui.weak("");
+            ui.weak("X");
+            ui.weak("Y");
+            ui.weak("Z");
+            ui.end_row();
+
+            ui.label("Position");
+            ui.add_sized(
+                [72.0, 26.0],
+                egui::DragValue::new(&mut transform.position.x)
+                    .speed(0.1)
+                    .range(-100_000.0..=100_000.0),
+            );
+            ui.add_sized(
+                [72.0, 26.0],
+                egui::DragValue::new(&mut transform.position.y)
+                    .speed(0.1)
+                    .range(-100_000.0..=100_000.0),
+            );
+            ui.add_sized(
+                [72.0, 26.0],
+                egui::DragValue::new(&mut transform.position.z)
+                    .speed(0.1)
+                    .range(-100_000.0..=100_000.0),
+            );
+            ui.end_row();
+
             ui.label("Rotation");
-            let pitch_changed = ui
-                .add(
+            rotation_changed |= ui
+                .add_sized(
+                    [72.0, 26.0],
                     egui::DragValue::new(&mut pitch)
                         .speed(1.0)
                         .range(-36_000.0..=36_000.0)
-                        .suffix("°")
-                        .prefix("X "),
+                        .suffix("°"),
                 )
                 .changed();
-            let yaw_changed = ui
-                .add(
+            rotation_changed |= ui
+                .add_sized(
+                    [72.0, 26.0],
                     egui::DragValue::new(&mut yaw)
                         .speed(1.0)
                         .range(-36_000.0..=36_000.0)
-                        .suffix("°")
-                        .prefix("Y "),
+                        .suffix("°"),
                 )
                 .changed();
-            let roll_changed = ui
-                .add(
+            rotation_changed |= ui
+                .add_sized(
+                    [72.0, 26.0],
                     egui::DragValue::new(&mut roll)
                         .speed(1.0)
                         .range(-36_000.0..=36_000.0)
-                        .suffix("°")
-                        .prefix("Z "),
+                        .suffix("°"),
                 )
                 .changed();
-            pitch_changed || yaw_changed || roll_changed
-        })
-        .inner;
+            ui.end_row();
+
+            ui.label("Scale");
+            ui.add_sized(
+                [72.0, 26.0],
+                egui::DragValue::new(&mut transform.scale.x)
+                    .speed(0.05)
+                    .range(-1_000.0..=1_000.0),
+            );
+            ui.add_sized(
+                [72.0, 26.0],
+                egui::DragValue::new(&mut transform.scale.y)
+                    .speed(0.05)
+                    .range(-1_000.0..=1_000.0),
+            );
+            ui.add_sized(
+                [72.0, 26.0],
+                egui::DragValue::new(&mut transform.scale.z)
+                    .speed(0.05)
+                    .range(-1_000.0..=1_000.0),
+            );
+            ui.end_row();
+        });
     if rotation_changed {
         transform.rotation = Quat::from_euler(
             EulerRot::XYZ,
@@ -111,33 +194,360 @@ fn edit_transform(ui: &mut egui::Ui, transform: &mut Transform) {
             roll.to_radians(),
         );
     }
+}
 
-    ui.horizontal(|ui| {
-        ui.label("Scale");
-        ui.add(
-            egui::DragValue::new(&mut transform.scale.x)
-                .speed(0.05)
-                .range(-1_000.0..=1_000.0)
-                .prefix("X "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut transform.scale.y)
-                .speed(0.05)
-                .range(-1_000.0..=1_000.0)
-                .prefix("Y "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut transform.scale.z)
-                .speed(0.05)
-                .range(-1_000.0..=1_000.0)
-                .prefix("Z "),
-        );
-    });
+fn project_to_screen(
+    position: Vec3,
+    view_projection: Mat4,
+    screen_rect: egui::Rect,
+) -> Option<egui::Pos2> {
+    let clip = view_projection * position.extend(1.0);
+    if clip.w <= 0.0 {
+        return None;
+    }
+    let ndc = clip.truncate().truncate() / clip.w;
+    Some(egui::pos2(
+        screen_rect.left() + (ndc.x + 1.0) * 0.5 * screen_rect.width(),
+        screen_rect.top() + (1.0 - ndc.y) * 0.5 * screen_rect.height(),
+    ))
+}
+
+fn axis_vector(axis: usize) -> Vec3 {
+    match axis {
+        0 => Vec3::X,
+        1 => Vec3::Y,
+        _ => Vec3::Z,
+    }
+}
+
+fn selected_transform_mut(
+    world: &mut World,
+    selected: Option<SceneSelection>,
+) -> Option<&mut Transform> {
+    match selected {
+        Some(SceneSelection::Model(id)) => {
+            world.model_group_mut(id).map(|group| &mut group.transform)
+        }
+        Some(SceneSelection::Part(id) | SceneSelection::Object(id)) => {
+            world.get_object_mut(id).map(|object| &mut object.transform)
+        }
+        None => None,
+    }
+}
+
+fn selected_world_position(world: &World, selected: Option<SceneSelection>) -> Option<Vec3> {
+    match selected {
+        Some(SceneSelection::Model(id)) => {
+            world.model_group(id).map(|group| group.transform.position)
+        }
+        Some(SceneSelection::Part(id) | SceneSelection::Object(id)) => {
+            world.get_object(id).map(|object| {
+                world
+                    .group_model_matrix(object)
+                    .transform_point3(Vec3::ZERO)
+            })
+        }
+        None => None,
+    }
+}
+
+fn pick_scene_object(
+    pointer: egui::Pos2,
+    screen_rect: egui::Rect,
+    camera: &Camera,
+    world: &World,
+) -> Option<SceneSelection> {
+    let view_projection = camera.build_view_projection_matrix();
+    world
+        .objects()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, object)| {
+            let model_matrix = world.group_model_matrix(object);
+            let position = model_matrix.transform_point3(Vec3::ZERO);
+            let screen = project_to_screen(position, view_projection, screen_rect)?;
+            let distance_squared = screen.distance_sq(pointer);
+            let world_scale = model_matrix
+                .to_scale_rotation_translation()
+                .0
+                .abs()
+                .max_element();
+            let radius = (screen_rect.height() * 1.207 * world_scale
+                / camera.eye.distance(position).max(0.1))
+            .clamp(18.0, 120.0);
+            (distance_squared <= radius * radius)
+                .then(|| world.object_id_at(index))
+                .flatten()
+                .map(|id| (distance_squared, SceneSelection::Part(id)))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, selection)| selection)
+}
+
+fn distance_to_segment(point: egui::Pos2, start: egui::Pos2, end: egui::Pos2) -> f32 {
+    let segment = end - start;
+    let length_squared = segment.length_sq();
+    if length_squared <= f32::EPSILON {
+        return point.distance(start);
+    }
+    let t = ((point - start).dot(segment) / length_squared).clamp(0.0, 1.0);
+    point.distance(start + segment * t)
+}
+
+fn rotation_ring_points(
+    position: Vec3,
+    axis: usize,
+    radius: f32,
+    view_projection: Mat4,
+    screen_rect: egui::Rect,
+) -> Option<Vec<egui::Pos2>> {
+    let (u, v) = match axis {
+        0 => (Vec3::Y, Vec3::Z),
+        1 => (Vec3::X, Vec3::Z),
+        _ => (Vec3::X, Vec3::Y),
+    };
+    (0..=96)
+        .map(|step| {
+            let angle = std::f32::consts::TAU * step as f32 / 96.0;
+            let point = position + (u * angle.cos() + v * angle.sin()) * radius;
+            project_to_screen(point, view_projection, screen_rect)
+        })
+        .collect()
+}
+
+fn paint_scene_gizmo(
+    ui: &egui::Ui,
+    viewport_rect: egui::Rect,
+    screen_rect: egui::Rect,
+    camera: &Camera,
+    world: &mut World,
+    selected: &mut Option<SceneSelection>,
+    mode: GizmoMode,
+    drag_state: &mut Option<GizmoDrag>,
+) {
+    let context = ui.ctx();
+    let pointer = context.input(|input| input.pointer.latest_pos());
+    let primary_pressed =
+        context.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary));
+    let primary_down =
+        context.input(|input| input.pointer.button_down(egui::PointerButton::Primary));
+    let primary_released =
+        context.input(|input| input.pointer.button_released(egui::PointerButton::Primary));
+    let view_projection = camera.build_view_projection_matrix();
+    let pointer_is_in_viewport = pointer.is_some_and(|position| viewport_rect.contains(position));
+
+    if primary_pressed && pointer_is_in_viewport {
+        if let Some(pointer_position) = pointer {
+            let selected_center = selected_world_position(world, *selected)
+                .and_then(|position| project_to_screen(position, view_projection, screen_rect));
+            let mut hit_axis = None;
+            if let Some(center) = selected_center {
+                if mode == GizmoMode::Rotate {
+                    if let Some(position) = selected_world_position(world, *selected) {
+                        let ring_radius = camera.eye.distance(position).max(0.1) * 0.828_427 * 72.0
+                            / screen_rect.height().max(1.0);
+                        for axis in 0..3 {
+                            let Some(points) = rotation_ring_points(
+                                position,
+                                axis,
+                                ring_radius,
+                                view_projection,
+                                screen_rect,
+                            ) else {
+                                continue;
+                            };
+                            for segment in points.windows(2) {
+                                let tangent = segment[1] - segment[0];
+                                let distance =
+                                    distance_to_segment(pointer_position, segment[0], segment[1]);
+                                if distance <= 8.0 {
+                                    hit_axis = Some((
+                                        axis,
+                                        tangent.normalized(),
+                                        1.0 / pointer_position.distance(center).max(10.0),
+                                    ));
+                                    break;
+                                }
+                            }
+                            if hit_axis.is_some() {
+                                break;
+                            }
+                        }
+                    }
+                } else if let Some(position) = selected_world_position(world, *selected) {
+                    let world_length = camera.eye.distance(position).max(0.1) * 0.828_427 * 72.0
+                        / screen_rect.height().max(1.0);
+                    for axis in 0..3 {
+                        let direction = axis_vector(axis);
+                        let Some(end) = project_to_screen(
+                            position + direction * world_length,
+                            view_projection,
+                            screen_rect,
+                        ) else {
+                            continue;
+                        };
+                        let projected_axis = end - center;
+                        let projected_length = projected_axis.length();
+                        if projected_length < 1.0 {
+                            continue;
+                        }
+                        if pointer_position.distance(center) >= 14.0
+                            && distance_to_segment(pointer_position, center, end) <= 10.0
+                        {
+                            hit_axis = Some((
+                                axis,
+                                projected_axis / projected_length,
+                                world_length / projected_length,
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Some((axis, screen_direction, world_per_pixel)) = hit_axis {
+                *drag_state = Some(GizmoDrag {
+                    mode,
+                    axis,
+                    screen_direction,
+                    world_per_pixel,
+                    last_pointer: pointer_position,
+                });
+            } else if let Some(selection) =
+                pick_scene_object(pointer_position, screen_rect, camera, world)
+            {
+                *selected = Some(selection);
+                *drag_state = None;
+            }
+        }
+    }
+
+    if let (Some(pointer_position), Some(mut drag)) = (pointer, *drag_state) {
+        if primary_down {
+            let pointer_delta = pointer_position - drag.last_pointer;
+            let amount = pointer_delta.dot(drag.screen_direction) * drag.world_per_pixel;
+            if let Some(transform) = selected_transform_mut(world, *selected) {
+                match drag.mode {
+                    GizmoMode::Move => transform.position += axis_vector(drag.axis) * amount,
+                    GizmoMode::Rotate => {
+                        let rotation = Quat::from_axis_angle(axis_vector(drag.axis), amount);
+                        transform.rotation = rotation * transform.rotation;
+                    }
+                    GizmoMode::Scale => {
+                        transform.scale[drag.axis] =
+                            (transform.scale[drag.axis] + amount).clamp(-1_000.0, 1_000.0);
+                    }
+                }
+            }
+            drag.last_pointer = pointer_position;
+            *drag_state = Some(drag);
+        }
+    }
+    if primary_released || !primary_down {
+        *drag_state = None;
+    }
+
+    let Some(position) = selected_world_position(world, *selected) else {
+        return;
+    };
+    let Some(center) = project_to_screen(position, view_projection, screen_rect) else {
+        return;
+    };
+    if !viewport_rect.contains(center) {
+        return;
+    }
+
+    let painter = ui.painter().with_clip_rect(viewport_rect);
+    let colors = [
+        egui::Color32::from_rgb(235, 75, 65),
+        egui::Color32::from_rgb(110, 220, 100),
+        egui::Color32::from_rgb(75, 145, 245),
+    ];
+    if mode == GizmoMode::Rotate {
+        let ring_radius = camera.eye.distance(position).max(0.1) * 0.828_427 * 72.0
+            / screen_rect.height().max(1.0);
+        for (axis, color) in colors.into_iter().enumerate() {
+            if let Some(points) =
+                rotation_ring_points(position, axis, ring_radius, view_projection, screen_rect)
+            {
+                painter.add(egui::Shape::line(points, egui::Stroke::new(2.5_f32, color)));
+            }
+        }
+        return;
+    }
+
+    let world_length =
+        camera.eye.distance(position).max(0.1) * 0.828_427 * 72.0 / screen_rect.height().max(1.0);
+    for (axis, color) in colors.into_iter().enumerate() {
+        let Some(end) = project_to_screen(
+            position + axis_vector(axis) * world_length,
+            view_projection,
+            screen_rect,
+        ) else {
+            continue;
+        };
+        let offset = end - center;
+        if offset.length_sq() < 1.0 {
+            continue;
+        }
+        let direction = offset.normalized();
+        painter.line_segment([center, end], egui::Stroke::new(3.0_f32, color));
+        if mode == GizmoMode::Move {
+            let tip = end;
+            let base = tip - direction * 12.0;
+            let side = egui::vec2(-direction.y, direction.x) * 5.0;
+            painter.add(egui::Shape::convex_polygon(
+                vec![tip, base + side, base - side],
+                color,
+                egui::Stroke::NONE,
+            ));
+        } else {
+            painter.rect_filled(
+                egui::Rect::from_center_size(end, egui::vec2(10.0, 10.0)),
+                1.0,
+                color,
+            );
+        }
+    }
+    painter.circle_filled(center, 4.0, egui::Color32::WHITE);
 }
 
 impl DebugUi {
     pub fn new(window: &Arc<Window>, device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let context = egui::Context::default();
+        let mut visuals = egui::Visuals::dark();
+        visuals.override_text_color = Some(egui::Color32::from_rgb(222, 222, 222));
+        visuals.weak_text_color = Some(egui::Color32::from_rgb(150, 150, 150));
+        visuals.panel_fill = egui::Color32::from_rgb(30, 30, 30);
+        visuals.window_fill = egui::Color32::from_rgb(38, 38, 38);
+        visuals.extreme_bg_color = egui::Color32::from_rgb(24, 24, 24);
+        visuals.faint_bg_color = egui::Color32::from_rgb(44, 44, 44);
+        visuals.selection.bg_fill = egui::Color32::from_rgb(68, 68, 68);
+        visuals.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(115));
+        visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(36, 36, 36);
+        visuals.widgets.noninteractive.bg_stroke =
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(53));
+        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(48, 48, 48);
+        visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(42, 42, 42);
+        visuals.widgets.inactive.bg_stroke =
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(72));
+        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(61, 61, 61);
+        visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(56, 56, 56);
+        visuals.widgets.hovered.bg_stroke =
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90));
+        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(68, 68, 68);
+        visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgb(62, 62, 62);
+        visuals.widgets.open.bg_fill = egui::Color32::from_rgb(48, 48, 48);
+        visuals.widgets.open.weak_bg_fill = egui::Color32::from_rgb(48, 48, 48);
+        visuals.collapsing_header_frame = true;
+        visuals.button_frame = true;
+        context.set_visuals(visuals);
+        let mut style = (*context.style()).clone();
+        style.spacing.item_spacing = egui::vec2(8.0, 7.0);
+        style.spacing.button_padding = egui::vec2(10.0, 7.0);
+        style.spacing.window_margin = egui::Margin::same(12);
+        style.spacing.menu_margin = egui::Margin::same(8);
+        context.set_style(style);
         let platform = egui_winit::State::new(
             context.clone(),
             egui::ViewportId::ROOT,
@@ -151,6 +561,10 @@ impl DebugUi {
             platform,
             renderer: egui_wgpu::Renderer::new(device, format, None, 1, false),
             visible: true,
+            active_tab: EditorTab::Scene,
+            show_camera_settings: false,
+            camera_control_mode: CameraControlMode::HoldMouseButton,
+            camera_look_button: CameraLookButton::Right,
             environment_path: String::new(),
             status: None,
             environment_dialog: None,
@@ -168,16 +582,82 @@ impl DebugUi {
             scene_save_request: None,
             scene_load_request: None,
             selected_scene_item: None,
+            gizmo_mode: GizmoMode::Move,
+            gizmo_drag: None,
+            viewport_rect: None,
+            last_pointer_pos: None,
             prepared: None,
         }
     }
 
     pub fn on_window_event(&mut self, window: &Window, event: &winit::event::WindowEvent) -> bool {
-        self.platform.on_window_event(window, event).consumed
+        let consumed = self.platform.on_window_event(window, event).consumed;
+        if let winit::event::WindowEvent::CursorMoved { position, .. } = event {
+            let pixels_per_point = window.scale_factor() as f32;
+            self.last_pointer_pos = Some(egui::pos2(
+                position.x as f32 / pixels_per_point,
+                position.y as f32 / pixels_per_point,
+            ));
+        }
+        let pointer_in_viewport = self.last_pointer_pos.is_some_and(|position| {
+            self.viewport_rect
+                .is_some_and(|rect| rect.contains(position))
+        });
+        if self.visible
+            && pointer_in_viewport
+            && self.camera_control_mode == CameraControlMode::HoldMouseButton
+            && matches!(
+                event,
+                winit::event::WindowEvent::MouseInput {
+                    state: winit::event::ElementState::Pressed,
+                    button: winit::event::MouseButton::Left,
+                    ..
+                }
+            )
+        {
+            return true;
+        }
+        if self.visible
+            && pointer_in_viewport
+            && self.camera_control_mode == CameraControlMode::ClickToCapture
+            && matches!(
+                event,
+                winit::event::WindowEvent::MouseInput {
+                    state: winit::event::ElementState::Pressed,
+                    button: winit::event::MouseButton::Left,
+                    ..
+                }
+            )
+        {
+            return false;
+        }
+        if self.visible
+            && pointer_in_viewport
+            && self.camera_control_mode == CameraControlMode::HoldMouseButton
+            && matches!(
+                event,
+                winit::event::WindowEvent::MouseInput {
+                    state: winit::event::ElementState::Pressed,
+                    button,
+                    ..
+                } if *button == self.camera_look_button.mouse_button()
+            )
+        {
+            return false;
+        }
+        consumed
     }
 
     pub fn toggle(&mut self) {
         self.visible = !self.visible;
+    }
+
+    pub fn camera_control_mode(&self) -> CameraControlMode {
+        self.camera_control_mode
+    }
+
+    pub fn camera_look_button(&self) -> CameraLookButton {
+        self.camera_look_button
     }
 
     pub fn take_asset_request(&mut self) -> Option<(PathBuf, Result<ParsedAsset, String>)> {
@@ -206,6 +686,7 @@ impl DebugUi {
 
     pub fn prepare_frame(
         &mut self,
+        camera: &Camera,
         window: &Window,
         frame_time: f32,
         fps: f32,
@@ -223,6 +704,7 @@ impl DebugUi {
                 Err(error) => self.status = Some(Err(error)),
             }
         }
+
         let mut settings = renderer.settings();
         let material_count = renderer.material_count();
         self.selected_material = self.selected_material.min(material_count.saturating_sub(1));
@@ -234,19 +716,18 @@ impl DebugUi {
         let mut pick_asset = false;
         let mut pick_scene_to_save = false;
         let mut pick_scene_to_load = false;
+        let mut add_cube = false;
+        let mut duplicate_selection = false;
+        let mut delete_selection = false;
         let selection_is_valid = match self.selected_scene_item {
             Some(SceneSelection::Model(id)) => world.model_group(id).is_some(),
             Some(SceneSelection::Part(id) | SceneSelection::Object(id)) => {
-                world.objects().get(id.0).is_some()
+                world.get_object(id).is_some()
             }
             None => false,
         };
         let mut selected_scene_item = if selection_is_valid {
             self.selected_scene_item
-        } else if let Some((index, _)) = world.model_groups().iter().enumerate().next() {
-            Some(SceneSelection::Model(ModelGroupId(index)))
-        } else if let Some(id) = world.standalone_objects().first() {
-            Some(SceneSelection::Object(*id))
         } else {
             None
         };
@@ -366,37 +847,32 @@ impl DebugUi {
             if !self.visible {
                 return;
             }
-            egui::Window::new("BoneSmashing Engine | Renderer")
-                .default_width(340.0)
-                .resizable(true)
+            let scene_io_enabled = self.scene_loading.is_none()
+                && self.scene_save_dialog.is_none()
+                && self.scene_load_dialog.is_none()
+                && self.scene_save_request.is_none()
+                && self.scene_load_request.is_none()
+                && self.asset_dialog.is_none()
+                && self.asset_import.is_none()
+                && self.asset_request.is_none();
+            let import_enabled = self.asset_dialog.is_none()
+                && self.asset_import.is_none()
+                && self.scene_loading.is_none()
+                && self.scene_save_dialog.is_none()
+                && self.scene_load_dialog.is_none()
+                && self.scene_save_request.is_none()
+                && self.scene_load_request.is_none();
+            egui::TopBottomPanel::top("editor-toolbar")
+                .exact_height(42.0)
                 .show(context, |ui| {
-                    ui.label(format!("{fps:.1} FPS  |  {:.2} ms", frame_time * 1000.0));
-                    ui.label(format!("CPU + waits: {cpu_frame_time:.2} ms"));
-                    ui.small(format!(
-                        "UI {:.2} | scene {:.2} | acquire {:.2} | encode/submit {:.2} ms",
-                        timings.ui_cpu_ms,
-                        timings.scene_cpu_ms,
-                        timings.acquire_cpu_ms,
-                        timings.encode_submit_cpu_ms,
-                    ));
-                    ui.label(format!("Objects: {}", world.objects().len()));
-                    ui.separator();
-
-                    ui.collapsing("Scene", |ui| {
-                        ui.horizontal(|ui| {
-                            let scene_io_enabled = self.scene_loading.is_none()
-                                && self.scene_save_dialog.is_none()
-                                && self.scene_load_dialog.is_none()
-                                && self.scene_save_request.is_none()
-                                && self.scene_load_request.is_none()
-                                && self.asset_dialog.is_none()
-                                && self.asset_import.is_none()
-                                && self.asset_request.is_none();
+                    egui::MenuBar::new().ui(ui, |ui| {
+                        ui.menu_button("File", |ui| {
                             if ui
                                 .add_enabled(scene_io_enabled, egui::Button::new("Open scene..."))
                                 .clicked()
                             {
                                 pick_scene_to_load = true;
+                                ui.close();
                             }
                             if ui
                                 .add_enabled(
@@ -406,133 +882,269 @@ impl DebugUi {
                                 .clicked()
                             {
                                 pick_scene_to_save = true;
+                                ui.close();
                             }
                         });
-                        if !self.scene_path.is_empty() {
-                            ui.small(&self.scene_path);
-                        }
-                        if self.scene_loading.is_some()
-                            || self.scene_load_dialog.is_some()
-                            || self.scene_save_dialog.is_some()
-                        {
-                            ui.label("Working with scene...");
-                        }
-                        if let Some(status) = &self.scene_status {
-                            match status {
-                                Ok(message) => {
-                                    ui.colored_label(egui::Color32::LIGHT_GREEN, message);
-                                }
-                                Err(message) => {
-                                    ui.colored_label(egui::Color32::LIGHT_RED, message);
-                                }
-                            }
-                        }
                         if ui
-                            .add_enabled(
-                                self.asset_dialog.is_none()
-                                    && self.asset_import.is_none()
-                                    && self.scene_loading.is_none()
-                                    && self.scene_save_dialog.is_none()
-                                    && self.scene_load_dialog.is_none()
-                                    && self.scene_save_request.is_none()
-                                    && self.scene_load_request.is_none(),
-                                egui::Button::new("Import model..."),
-                            )
+                            .add_enabled(import_enabled, egui::Button::new("Import model"))
                             .clicked()
                         {
                             pick_asset = true;
                         }
-                        if !self.asset_path.is_empty() {
-                            ui.small(&self.asset_path);
+                        if ui
+                            .add_enabled(scene_io_enabled, egui::Button::new("Add cube"))
+                            .clicked()
+                        {
+                            add_cube = true;
                         }
-                        if self.asset_dialog.is_some() {
-                            ui.label("Waiting for file selection...");
-                        } else if self.asset_import.is_some() {
-                            ui.label("Reading model data...");
+                        let has_selection = selected_scene_item.is_some();
+                        if ui
+                            .add_enabled(
+                                scene_io_enabled && has_selection,
+                                egui::Button::new("Duplicate"),
+                            )
+                            .clicked()
+                        {
+                            duplicate_selection = true;
                         }
-                        if let Some(status) = &self.asset_status {
-                            match status {
-                                Ok(message) => {
-                                    ui.colored_label(egui::Color32::LIGHT_GREEN, message);
-                                }
-                                Err(message) => {
-                                    ui.colored_label(egui::Color32::LIGHT_RED, message);
-                                }
+                        if ui
+                            .add_enabled(
+                                scene_io_enabled && has_selection,
+                                egui::Button::new("Delete"),
+                            )
+                            .clicked()
+                        {
+                            delete_selection = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                !renderer.environment_is_loading()
+                                    && self.environment_dialog.is_none(),
+                                egui::Button::new("Load HDR"),
+                            )
+                            .clicked()
+                        {
+                            pick_environment = true;
+                        }
+                        ui.separator();
+                        for (mode, label) in [
+                            (GizmoMode::Move, "Move"),
+                            (GizmoMode::Rotate, "Rotate"),
+                            (GizmoMode::Scale, "Scale"),
+                        ] {
+                            if ui
+                                .selectable_label(self.gizmo_mode == mode, label)
+                                .clicked()
+                            {
+                                self.gizmo_mode = mode;
                             }
                         }
-                        ui.small("Supported formats: .glb, .gltf, .obj");
+                        ui.menu_button("View", |ui| {
+                            if ui.button("Camera controls...").clicked() {
+                                self.show_camera_settings = true;
+                                ui.close();
+                            }
+                        });
+                        ui.separator();
+                        ui.label(format!("{:.0} FPS", fps));
+                    });
+                });
+            egui::SidePanel::right("editor-sidebar")
+                .default_width(400.0)
+                .width_range(320.0..=520.0)
+                .resizable(true)
+                .show(context, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(self.active_tab == EditorTab::Scene, "Scene")
+                            .clicked()
+                        {
+                            self.active_tab = EditorTab::Scene;
+                        }
+                        if ui
+                            .selectable_label(self.active_tab == EditorTab::Render, "Render")
+                            .clicked()
+                        {
+                            self.active_tab = EditorTab::Render;
+                        }
+                    });
+                    ui.separator();
 
-                        if world.objects().is_empty() && world.model_groups().is_empty() {
-                            ui.label("The scene is empty");
-                        } else {
-                            let row_height = ui.text_style_height(&egui::TextStyle::Button);
-                            ui.label("Models");
-                            egui::ScrollArea::vertical()
-                                .id_salt("model-list")
-                                .max_height(140.0)
-                                .show_rows(
-                                    ui,
-                                    row_height,
-                                    world.model_groups().len(),
-                                    |ui, rows| {
-                                        for index in rows {
-                                            let group = &world.model_groups()[index];
-                                            let id = ModelGroupId(index);
-                                            let is_selected = match selected_scene_item {
-                                                Some(SceneSelection::Model(selected)) => {
-                                                    selected == id
-                                                }
-                                                Some(SceneSelection::Part(object_id)) => {
-                                                    world
-                                                        .objects()
-                                                        .get(object_id.0)
-                                                        .and_then(|object| object.model_group())
-                                                        == Some(id)
-                                                }
-                                                _ => false,
-                                            };
-                                            if ui
-                                                .selectable_label(
-                                                    is_selected,
-                                                    format!(
-                                                        "{} ({} parts)",
-                                                        group.name,
-                                                        group.objects.len()
-                                                    ),
+                    egui::ScrollArea::vertical()
+                        .id_salt("editor-sidebar-content")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if self.active_tab == EditorTab::Scene {
+                                egui::CollapsingHeader::new("Hierarchy")
+                                    .default_open(true)
+                                    .show(ui, |ui| {
+                                        if !self.scene_path.is_empty() {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(format!(
+                                                        "Scene: {}",
+                                                        Path::new(&self.scene_path)
+                                                            .file_name()
+                                                            .and_then(|name| name.to_str())
+                                                            .unwrap_or(&self.scene_path)
+                                                    ))
+                                                    .small(),
                                                 )
-                                                .clicked()
-                                            {
-                                                selected_scene_item =
-                                                    Some(SceneSelection::Model(id));
+                                                .truncate(),
+                                            )
+                                            .on_hover_text(&self.scene_path);
+                                        }
+                                        if self.scene_loading.is_some()
+                                            || self.scene_load_dialog.is_some()
+                                            || self.scene_save_dialog.is_some()
+                                        {
+                                            ui.label("Working with scene...");
+                                        }
+                                        if let Some(status) = &self.scene_status {
+                                            match status {
+                                                Ok(message) => {
+                                                    ui.colored_label(
+                                                        egui::Color32::LIGHT_GREEN,
+                                                        message,
+                                                    );
+                                                }
+                                                Err(message) => {
+                                                    ui.colored_label(
+                                                        egui::Color32::LIGHT_RED,
+                                                        message,
+                                                    );
+                                                }
                                             }
                                         }
-                                    },
-                                );
+                                        if !self.asset_path.is_empty() {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(format!(
+                                                        "Model: {}",
+                                                        Path::new(&self.asset_path)
+                                                            .file_name()
+                                                            .and_then(|name| name.to_str())
+                                                            .unwrap_or(&self.asset_path)
+                                                    ))
+                                                    .small(),
+                                                )
+                                                .truncate(),
+                                            )
+                                            .on_hover_text(&self.asset_path);
+                                        }
+                                        if self.asset_dialog.is_some() {
+                                            ui.label("Waiting for file selection...");
+                                        } else if self.asset_import.is_some() {
+                                            ui.label("Reading model data...");
+                                        }
+                                        if let Some(status) = &self.asset_status {
+                                            match status {
+                                                Ok(message) => {
+                                                    ui.colored_label(
+                                                        egui::Color32::LIGHT_GREEN,
+                                                        message,
+                                                    );
+                                                }
+                                                Err(message) => {
+                                                    ui.colored_label(
+                                                        egui::Color32::LIGHT_RED,
+                                                        message,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        ui.small("Supported formats: .glb, .gltf, .obj");
 
-                            let active_group = match selected_scene_item {
-                                Some(SceneSelection::Model(group_id)) => Some(group_id),
-                                Some(SceneSelection::Part(object_id)) => world
-                                    .objects()
-                                    .get(object_id.0)
-                                    .and_then(|object| object.model_group()),
-                                _ => None,
-                            };
-                            if let Some(group_id) = active_group {
-                                if let Some(group) = world.model_group(group_id) {
-                                    ui.label(format!("{} parts", group.name));
-                                    egui::ScrollArea::vertical()
-                                        .id_salt("model-part-list")
-                                        .max_height(120.0)
-                                        .show_rows(
-                                            ui,
-                                            row_height,
-                                            group.objects.len(),
-                                            |ui, rows| {
-                                                for part_index in rows {
-                                                    let object_id = group.objects[part_index];
-                                                    let object = &world.objects()[object_id.0];
-                                                    let label = if object.name.is_empty() {
-                                                        object
+                                        if world.objects().is_empty()
+                                            && world.model_groups().is_empty()
+                                        {
+                                            ui.label("The scene is empty");
+                                        } else {
+                                            let row_height =
+                                                ui.text_style_height(&egui::TextStyle::Button);
+                                            ui.label(
+                                                egui::RichText::new("MODELS").small().strong(),
+                                            );
+                                            egui::ScrollArea::vertical()
+                                                .id_salt("model-list")
+                                                .max_height(140.0)
+                                                .show_rows(
+                                                    ui,
+                                                    row_height,
+                                                    world.model_groups().len(),
+                                                    |ui, rows| {
+                                                        for index in rows {
+                                                            let group =
+                                                                &world.model_groups()[index];
+                                                            let id = world.model_group_ids()[index];
+                                                            let is_selected =
+                                                                match selected_scene_item {
+                                                                    Some(
+                                                                        SceneSelection::Model(
+                                                                            selected,
+                                                                        ),
+                                                                    ) => selected == id,
+                                                                    Some(SceneSelection::Part(
+                                                                        object_id,
+                                                                    )) => {
+                                                                        world
+                                                                            .get_object(object_id)
+                                                                            .and_then(|object| {
+                                                                                object.model_group()
+                                                                            })
+                                                                            == Some(id)
+                                                                    }
+                                                                    _ => false,
+                                                                };
+                                                            if ui
+                                                                .selectable_label(
+                                                                    is_selected,
+                                                                    format!(
+                                                                        "{} ({} parts)",
+                                                                        group.name,
+                                                                        group.objects.len()
+                                                                    ),
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                selected_scene_item =
+                                                                    Some(SceneSelection::Model(id));
+                                                            }
+                                                        }
+                                                    },
+                                                );
+
+                                            let active_group = match selected_scene_item {
+                                                Some(SceneSelection::Model(group_id)) => {
+                                                    Some(group_id)
+                                                }
+                                                Some(SceneSelection::Part(object_id)) => world
+                                                    .get_object(object_id)
+                                                    .and_then(|object| object.model_group()),
+                                                _ => None,
+                                            };
+                                            if let Some(group_id) = active_group {
+                                                if let Some(group) = world.model_group(group_id) {
+                                                    ui.label(format!("{} parts", group.name));
+                                                    egui::ScrollArea::vertical()
+                                                        .id_salt("model-part-list")
+                                                        .max_height(120.0)
+                                                        .show_rows(
+                                                            ui,
+                                                            row_height,
+                                                            group.objects.len(),
+                                                            |ui, rows| {
+                                                                for part_index in rows {
+                                                                    let object_id =
+                                                                        group.objects[part_index];
+                                                                    let Some(object) =
+                                                                        world.get_object(object_id)
+                                                                    else {
+                                                                        continue;
+                                                                    };
+                                                                    let label =
+                                                                        if object.name.is_empty() {
+                                                                            object
                                                             .asset_source()
                                                             .map(|source| {
                                                                 format!(
@@ -543,10 +1155,10 @@ impl DebugUi {
                                                             .unwrap_or_else(|| {
                                                                 format!("Part {}", part_index + 1)
                                                             })
-                                                    } else {
-                                                        object.name.clone()
-                                                    };
-                                                    if ui
+                                                                        } else {
+                                                                            object.name.clone()
+                                                                        };
+                                                                    if ui
                                                         .selectable_label(
                                                             selected_scene_item
                                                                 == Some(SceneSelection::Part(
@@ -559,278 +1171,485 @@ impl DebugUi {
                                                         selected_scene_item =
                                                             Some(SceneSelection::Part(object_id));
                                                     }
+                                                                }
+                                                            },
+                                                        );
                                                 }
-                                            },
-                                        );
-                                }
-                            }
+                                            }
 
-                            ui.label("Scene objects");
-                            egui::ScrollArea::vertical()
-                                .id_salt("standalone-object-list")
-                                .max_height(140.0)
-                                .show_rows(
-                                    ui,
-                                    row_height,
-                                    world.standalone_objects().len(),
-                                    |ui, rows| {
-                                        for row in rows {
-                                            let id = world.standalone_objects()[row];
-                                            let object = &world.objects()[id.0];
-                                            if ui
-                                                .selectable_label(
-                                                    selected_scene_item
-                                                        == Some(SceneSelection::Object(id)),
-                                                    format!(
-                                                        "{} (mesh {}, material {})",
-                                                        if object.name.is_empty() {
-                                                            format!("Object {}", id.0 + 1)
-                                                        } else {
-                                                            object.name.clone()
-                                                        },
-                                                        object.mesh_id.0,
-                                                        object.material_id.0
-                                                    ),
-                                                )
-                                                .clicked()
+                                            ui.add_space(4.0);
+                                            ui.label(
+                                                egui::RichText::new("SCENE OBJECTS")
+                                                    .small()
+                                                    .strong(),
+                                            );
+                                            egui::ScrollArea::vertical()
+                                                .id_salt("standalone-object-list")
+                                                .max_height(140.0)
+                                                .show_rows(
+                                                    ui,
+                                                    row_height,
+                                                    world.standalone_objects().len(),
+                                                    |ui, rows| {
+                                                        for row in rows {
+                                                            let id =
+                                                                world.standalone_objects()[row];
+                                                            let Some(object) = world.get_object(id)
+                                                            else {
+                                                                continue;
+                                                            };
+                                                            if ui
+                                                                .selectable_label(
+                                                                    selected_scene_item
+                                                                        == Some(
+                                                                            SceneSelection::Object(
+                                                                                id,
+                                                                            ),
+                                                                        ),
+                                                                    format!(
+                                                                        "{} (mesh {}, material {})",
+                                                                        if object.name.is_empty() {
+                                                                            format!(
+                                                                                "Object {}",
+                                                                                id.0 + 1
+                                                                            )
+                                                                        } else {
+                                                                            object.name.clone()
+                                                                        },
+                                                                        object.mesh_id.0,
+                                                                        object.material_id.0
+                                                                    ),
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                selected_scene_item = Some(
+                                                                    SceneSelection::Object(id),
+                                                                );
+                                                            }
+                                                        }
+                                                    },
+                                                );
+
+                                            ui.add_space(6.0);
+                                            egui::CollapsingHeader::new("Inspector")
+                                                .default_open(true)
+                                                .show(ui, |ui| match selected_scene_item {
+                                                    Some(SceneSelection::Model(group_id)) => {
+                                                        if let Some(group) =
+                                                            world.model_group_mut(group_id)
+                                                        {
+                                                            ui.label("Model");
+                                                            ui.text_edit_singleline(
+                                                                &mut group.name,
+                                                            );
+                                                            ui.separator();
+                                                            edit_transform(
+                                                                ui,
+                                                                &mut group.transform,
+                                                            );
+                                                        }
+                                                    }
+                                                    Some(
+                                                        SceneSelection::Part(object_id)
+                                                        | SceneSelection::Object(object_id),
+                                                    ) => {
+                                                        if let Some(object) =
+                                                            world.get_object_mut(object_id)
+                                                        {
+                                                            ui.label("Object");
+                                                            ui.text_edit_singleline(
+                                                                &mut object.name,
+                                                            );
+                                                            ui.separator();
+                                                            edit_transform(
+                                                                ui,
+                                                                &mut object.transform,
+                                                            );
+                                                        }
+                                                    }
+                                                    None => {
+                                                        ui.weak("Select an object to inspect it.");
+                                                    }
+                                                });
+                                            self.selected_scene_item = selected_scene_item;
+                                        }
+                                    });
+                            } else {
+                                egui::CollapsingHeader::new("Performance")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        ui.small(format!(
+                                            "Frame {:.2} ms  |  {:.1} FPS",
+                                            frame_time * 1000.0,
+                                            fps
+                                        ));
+                                        ui.small(format!(
+                                            "CPU {:.2} ms  |  UI {:.2} ms  |  Scene {:.2} ms",
+                                            cpu_frame_time, timings.ui_cpu_ms, timings.scene_cpu_ms
+                                        ));
+                                        ui.small(format!(
+                                            "Acquire {:.2} ms  |  Submit {:.2} ms",
+                                            timings.acquire_cpu_ms, timings.encode_submit_cpu_ms
+                                        ));
+                                    });
+                                ui.collapsing("Render settings", |ui| {
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut settings.key_light_yaw_degrees,
+                                            -180.0..=180.0,
+                                        )
+                                        .text("Key light yaw"),
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut settings.key_light_elevation_degrees,
+                                            -89.0..=-5.0,
+                                        )
+                                        .text("Key light elevation"),
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut settings.key_light_intensity,
+                                            0.0..=8.0,
+                                        )
+                                        .text("Key light"),
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut settings.fill_light_intensity,
+                                            0.0..=4.0,
+                                        )
+                                        .text("Fill light"),
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut settings.environment_intensity,
+                                            0.0..=2.0,
+                                        )
+                                        .text("Environment"),
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(&mut settings.exposure_ev, -10.0..=3.0)
+                                            .text("Exposure (EV)"),
+                                    );
+                                    ui.checkbox(
+                                        &mut settings.shadows_enabled,
+                                        "Directional shadows",
+                                    );
+                                    ui.checkbox(
+                                        &mut settings.unlocked_fps,
+                                        "Unlock FPS (disable VSync)",
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(&mut settings.render_scale, 0.5..=1.0)
+                                            .step_by(0.05)
+                                            .text("Render resolution scale"),
+                                    );
+                                    egui::ComboBox::from_label("Anti-aliasing (MSAA)")
+                                        .selected_text(if settings.msaa_samples == 1 {
+                                            "Off".to_owned()
+                                        } else {
+                                            format!("{}x", settings.msaa_samples)
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            for &sample_count in renderer.supported_msaa_samples() {
+                                                let label = if sample_count == 1 {
+                                                    "Off".to_owned()
+                                                } else {
+                                                    format!("{sample_count}x")
+                                                };
+                                                ui.selectable_value(
+                                                    &mut settings.msaa_samples,
+                                                    sample_count,
+                                                    label,
+                                                );
+                                            }
+                                        });
+                                    if ui.button("Reset lighting").clicked() {
+                                        let defaults =
+                                            crate::renderer::state::RendererSettings::default();
+                                        settings.key_light_yaw_degrees =
+                                            defaults.key_light_yaw_degrees;
+                                        settings.key_light_elevation_degrees =
+                                            defaults.key_light_elevation_degrees;
+                                        settings.key_light_intensity = defaults.key_light_intensity;
+                                        settings.fill_light_intensity =
+                                            defaults.fill_light_intensity;
+                                        settings.environment_intensity =
+                                            defaults.environment_intensity;
+                                        settings.exposure_ev = defaults.exposure_ev;
+                                        settings.shadows_enabled = defaults.shadows_enabled;
+                                        settings.debug_view = defaults.debug_view;
+                                        settings.render_scale = defaults.render_scale;
+                                        if renderer
+                                            .supported_msaa_samples()
+                                            .contains(&defaults.msaa_samples)
+                                        {
+                                            settings.msaa_samples = defaults.msaa_samples;
+                                        }
+                                    }
+                                    egui::ComboBox::from_label("Debug view")
+                                        .selected_text(
+                                            [
+                                                "Lit",
+                                                "World normals",
+                                                "Base color",
+                                                "Roughness / metallic",
+                                                "Diffuse IBL",
+                                                "Specular IBL",
+                                            ]
+                                            .get(settings.debug_view as usize)
+                                            .copied()
+                                            .unwrap_or("Lit"),
+                                        )
+                                        .show_ui(ui, |ui| {
+                                            for (index, label) in [
+                                                "Lit",
+                                                "World normals",
+                                                "Base color",
+                                                "Roughness / metallic",
+                                                "Diffuse IBL",
+                                                "Specular IBL",
+                                            ]
+                                            .iter()
+                                            .enumerate()
                                             {
-                                                selected_scene_item =
-                                                    Some(SceneSelection::Object(id));
+                                                ui.selectable_value(
+                                                    &mut settings.debug_view,
+                                                    index as u32,
+                                                    *label,
+                                                );
+                                            }
+                                        });
+                                });
+
+                                ui.collapsing("Environment & lighting", |ui| {
+                                    ui.label(format!(
+                                        "Active: {} ({} mips)",
+                                        renderer.environment_name(),
+                                        renderer.environment_mip_count()
+                                    ));
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add_enabled(
+                                                self.environment_dialog.is_none()
+                                                    && !renderer.environment_is_loading(),
+                                                egui::Button::new("Browse..."),
+                                            )
+                                            .clicked()
+                                        {
+                                            pick_environment = true;
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                !renderer.environment_is_loading(),
+                                                egui::Button::new("Load .hdr"),
+                                            )
+                                            .clicked()
+                                        {
+                                            load_environment = true;
+                                        }
+                                    });
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.environment_path)
+                                            .desired_width(ui.available_width())
+                                            .hint_text("Path to .hdr / .exr environment"),
+                                    );
+                                    if renderer.environment_is_loading() {
+                                        ui.spinner();
+                                        ui.label("Preparing HDR environment...");
+                                    } else if self.environment_dialog.is_some() {
+                                        ui.label("Waiting for file selection...");
+                                    }
+                                    ui.label("Equirectangular .hdr / .exr environment (2:1)");
+                                    if let Some(status) = &self.status {
+                                        match status {
+                                            Ok(message) => {
+                                                ui.colored_label(
+                                                    egui::Color32::LIGHT_GREEN,
+                                                    message,
+                                                );
+                                            }
+                                            Err(message) => {
+                                                ui.colored_label(egui::Color32::LIGHT_RED, message);
                                             }
                                         }
-                                    },
-                                );
-
-                            ui.separator();
-                            match selected_scene_item {
-                                Some(SceneSelection::Model(group_id)) => {
-                                    if let Some(group) = world.model_group_mut(group_id) {
-                                        ui.horizontal(|ui| {
-                                            ui.label("Model name");
-                                            if ui.text_edit_singleline(&mut group.name).lost_focus()
-                                                && group.name.trim().is_empty()
-                                            {
-                                                group.name = "Model".to_owned();
-                                            }
-                                        });
-                                        edit_transform(ui, &mut group.transform);
-                                    }
-                                }
-                                Some(
-                                    SceneSelection::Part(object_id)
-                                    | SceneSelection::Object(object_id),
-                                ) => {
-                                    if let Some(object) = world.get_object_mut(object_id) {
-                                        ui.horizontal(|ui| {
-                                            ui.label("Part name");
-                                            ui.text_edit_singleline(&mut object.name);
-                                        });
-                                        edit_transform(ui, &mut object.transform);
-                                    }
-                                }
-                                None => {}
-                            }
-                            self.selected_scene_item = selected_scene_item;
-                        }
-                    });
-
-                    ui.collapsing("Lighting & tone mapping", |ui| {
-                        ui.add(
-                            egui::Slider::new(&mut settings.key_light_yaw_degrees, -180.0..=180.0)
-                                .text("Key light yaw"),
-                        );
-                        ui.add(
-                            egui::Slider::new(
-                                &mut settings.key_light_elevation_degrees,
-                                -89.0..=-5.0,
-                            )
-                            .text("Key light elevation"),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut settings.key_light_intensity, 0.0..=8.0)
-                                .text("Key light"),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut settings.fill_light_intensity, 0.0..=4.0)
-                                .text("Fill light"),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut settings.environment_intensity, 0.0..=2.0)
-                                .text("Environment"),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut settings.exposure_ev, -10.0..=3.0)
-                                .text("Exposure (EV)"),
-                        );
-                        ui.checkbox(&mut settings.shadows_enabled, "Directional shadows");
-                        ui.checkbox(&mut settings.unlocked_fps, "Unlock FPS (disable VSync)");
-                        ui.add(
-                            egui::Slider::new(&mut settings.render_scale, 0.5..=1.0)
-                                .step_by(0.05)
-                                .text("Render resolution scale"),
-                        );
-                        egui::ComboBox::from_label("Anti-aliasing (MSAA)")
-                            .selected_text(if settings.msaa_samples == 1 {
-                                "Off".to_owned()
-                            } else {
-                                format!("{}x", settings.msaa_samples)
-                            })
-                            .show_ui(ui, |ui| {
-                                for &sample_count in renderer.supported_msaa_samples() {
-                                    let label = if sample_count == 1 {
-                                        "Off".to_owned()
-                                    } else {
-                                        format!("{sample_count}x")
-                                    };
-                                    ui.selectable_value(
-                                        &mut settings.msaa_samples,
-                                        sample_count,
-                                        label,
-                                    );
-                                }
-                            });
-                        if ui.button("Reset lighting").clicked() {
-                            let defaults = crate::renderer::state::RendererSettings::default();
-                            settings.key_light_yaw_degrees = defaults.key_light_yaw_degrees;
-                            settings.key_light_elevation_degrees =
-                                defaults.key_light_elevation_degrees;
-                            settings.key_light_intensity = defaults.key_light_intensity;
-                            settings.fill_light_intensity = defaults.fill_light_intensity;
-                            settings.environment_intensity = defaults.environment_intensity;
-                            settings.exposure_ev = defaults.exposure_ev;
-                            settings.shadows_enabled = defaults.shadows_enabled;
-                            settings.debug_view = defaults.debug_view;
-                            settings.render_scale = defaults.render_scale;
-                            if renderer
-                                .supported_msaa_samples()
-                                .contains(&defaults.msaa_samples)
-                            {
-                                settings.msaa_samples = defaults.msaa_samples;
-                            }
-                        }
-                        egui::ComboBox::from_label("Debug view")
-                            .selected_text(
-                                [
-                                    "Lit",
-                                    "World normals",
-                                    "Base color",
-                                    "Roughness / metallic",
-                                    "Diffuse IBL",
-                                    "Specular IBL",
-                                ]
-                                .get(settings.debug_view as usize)
-                                .copied()
-                                .unwrap_or("Lit"),
-                            )
-                            .show_ui(ui, |ui| {
-                                for (index, label) in [
-                                    "Lit",
-                                    "World normals",
-                                    "Base color",
-                                    "Roughness / metallic",
-                                    "Diffuse IBL",
-                                    "Specular IBL",
-                                ]
-                                .iter()
-                                .enumerate()
-                                {
-                                    ui.selectable_value(
-                                        &mut settings.debug_view,
-                                        index as u32,
-                                        *label,
-                                    );
-                                }
-                            });
-                    });
-
-                    ui.collapsing("HDR environment", |ui| {
-                        ui.label(format!(
-                            "Active: {} ({} mips)",
-                            renderer.environment_name(),
-                            renderer.environment_mip_count()
-                        ));
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(
-                                    self.environment_dialog.is_none()
-                                        && !renderer.environment_is_loading(),
-                                    egui::Button::new("Browse..."),
-                                )
-                                .clicked()
-                            {
-                                pick_environment = true;
-                            }
-                            ui.text_edit_singleline(&mut self.environment_path);
-                            if ui
-                                .add_enabled(
-                                    !renderer.environment_is_loading(),
-                                    egui::Button::new("Load .hdr"),
-                                )
-                                .clicked()
-                            {
-                                load_environment = true;
-                            }
-                        });
-                        if renderer.environment_is_loading() {
-                            ui.spinner();
-                            ui.label("Preparing HDR environment...");
-                        } else if self.environment_dialog.is_some() {
-                            ui.label("Waiting for file selection...");
-                        }
-                        ui.label("Equirectangular .hdr / .exr environment (2:1)");
-                        if let Some(status) = &self.status {
-                            match status {
-                                Ok(message) => {
-                                    ui.colored_label(egui::Color32::LIGHT_GREEN, message);
-                                }
-                                Err(message) => {
-                                    ui.colored_label(egui::Color32::LIGHT_RED, message);
-                                }
-                            }
-                        }
-                    });
-
-                    ui.collapsing("Material inspector", |ui| {
-                        if material_count == 0 {
-                            ui.label("No materials loaded");
-                        } else {
-                            egui::ComboBox::from_label("Material")
-                                .selected_text(
-                                    renderer
-                                        .material_label(self.selected_material)
-                                        .unwrap_or(""),
-                                )
-                                .show_ui(ui, |ui| {
-                                    for index in 0..material_count {
-                                        let label = renderer.material_label(index).unwrap_or("");
-                                        ui.selectable_value(
-                                            &mut self.selected_material,
-                                            index,
-                                            format!("{index}: {label}"),
-                                        );
                                     }
                                 });
-                            ui.add(
-                                egui::Slider::new(&mut selected_params.roughness, 0.045..=1.0)
-                                    .text("Roughness"),
-                            );
-                            ui.add(
-                                egui::Slider::new(&mut selected_params.metallic, 0.0..=1.0)
-                                    .text("Metallic"),
-                            );
-                            if selected_params.transmission_factor > 0.0 {
-                                ui.label(
+
+                                ui.collapsing("Material inspector", |ui| {
+                                    if material_count == 0 {
+                                        ui.label("No materials loaded");
+                                    } else {
+                                        egui::ComboBox::from_label("Material")
+                                            .selected_text(
+                                                renderer
+                                                    .material_label(self.selected_material)
+                                                    .unwrap_or(""),
+                                            )
+                                            .show_ui(ui, |ui| {
+                                                for index in 0..material_count {
+                                                    let label = renderer
+                                                        .material_label(index)
+                                                        .unwrap_or("");
+                                                    ui.selectable_value(
+                                                        &mut self.selected_material,
+                                                        index,
+                                                        format!("{index}: {label}"),
+                                                    );
+                                                }
+                                            });
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut selected_params.roughness,
+                                                0.045..=1.0,
+                                            )
+                                            .text("Roughness"),
+                                        );
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut selected_params.metallic,
+                                                0.0..=1.0,
+                                            )
+                                            .text("Metallic"),
+                                        );
+                                        if selected_params.transmission_factor > 0.0 {
+                                            ui.label(
                                     "Glass material: screen-space refraction; metallic is ignored",
                                 );
-                            } else if selected_params.unlit > 0.5 {
-                                ui.label("Unlit material: PBR controls have no effect");
+                                        } else if selected_params.unlit > 0.5 {
+                                            ui.label("Unlit material: PBR controls have no effect");
+                                        }
+                                    }
+                                });
                             }
-                        }
-                    });
+                        });
                     ui.separator();
-                    ui.small("F1: show/hide panel  |  Esc: release camera");
+                    ui.small("LMB: select/drag | RMB: look | Esc: release camera");
                 });
+
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(context, |ui| {
+                    let viewport_rect = ui.max_rect();
+                    self.viewport_rect = Some(viewport_rect);
+                    paint_scene_gizmo(
+                        ui,
+                        viewport_rect,
+                        context.screen_rect(),
+                        camera,
+                        world,
+                        &mut selected_scene_item,
+                        self.gizmo_mode,
+                        &mut self.gizmo_drag,
+                    );
+                });
+
+            if self.visible && self.show_camera_settings {
+                egui::Window::new("Camera controls")
+                    .default_width(300.0)
+                    .resizable(false)
+                    .open(&mut self.show_camera_settings)
+                    .show(context, |ui| {
+                        ui.label("Viewport navigation");
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui
+                                .selectable_label(
+                                    self.camera_control_mode == CameraControlMode::ClickToCapture,
+                                    "Click to capture",
+                                )
+                                .clicked()
+                            {
+                                self.camera_control_mode = CameraControlMode::ClickToCapture;
+                            }
+                            if ui
+                                .selectable_label(
+                                    self.camera_control_mode == CameraControlMode::HoldMouseButton,
+                                    "Hold mouse",
+                                )
+                                .clicked()
+                            {
+                                self.camera_control_mode = CameraControlMode::HoldMouseButton;
+                            }
+                        });
+                        if self.camera_control_mode == CameraControlMode::ClickToCapture {
+                            ui.label("Click the viewport to capture the cursor.");
+                            ui.label("Press Esc to release it.");
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.label("Look while holding");
+                                egui::ComboBox::from_id_salt("camera-look-button")
+                                    .selected_text(match self.camera_look_button {
+                                        CameraLookButton::Left => "LMB",
+                                        CameraLookButton::Right => "RMB",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.camera_look_button,
+                                            CameraLookButton::Right,
+                                            "Right mouse button",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.camera_look_button,
+                                            CameraLookButton::Left,
+                                            "Left mouse button",
+                                        );
+                                    });
+                            });
+                            ui.label("The cursor returns when the button is released.");
+                        }
+                        ui.separator();
+                        ui.label("Move: W A S D");
+                        ui.label("Up / down: Space / Shift");
+                    });
+            }
         });
+        if add_cube {
+            let forward = Vec3::new(
+                camera.yaw.cos() * camera.pitch.cos(),
+                camera.pitch.sin(),
+                camera.yaw.sin() * camera.pitch.cos(),
+            )
+            .normalize();
+            let id = world.add_object(
+                RenderObject::new(
+                    Transform::from_translation(camera.eye + forward * 4.0),
+                    MESH_CUBE,
+                    MATERIAL_DEFAULT,
+                )
+                .with_name("Cube"),
+            );
+            selected_scene_item = Some(SceneSelection::Object(id));
+        }
+        if duplicate_selection {
+            selected_scene_item = match selected_scene_item {
+                Some(SceneSelection::Model(id)) => {
+                    world.duplicate_model_group(id).map(SceneSelection::Model)
+                }
+                Some(SceneSelection::Part(id)) => {
+                    world.duplicate_object(id).map(SceneSelection::Part)
+                }
+                Some(SceneSelection::Object(id)) => {
+                    world.duplicate_object(id).map(SceneSelection::Object)
+                }
+                None => None,
+            };
+        }
+        if delete_selection {
+            match selected_scene_item {
+                Some(SceneSelection::Model(id)) => {
+                    world.remove_model_group(id);
+                }
+                Some(SceneSelection::Part(id) | SceneSelection::Object(id)) => {
+                    world.remove_object(id);
+                }
+                None => {}
+            }
+            selected_scene_item = None;
+            self.gizmo_drag = None;
+        }
+        self.selected_scene_item = selected_scene_item;
         self.platform
             .handle_platform_output(window, output.platform_output);
 
@@ -1023,5 +1842,52 @@ impl DebugUi {
             self.renderer.free_texture(id);
         }
         user_commands
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{MaterialId, MeshId};
+    use crate::scene::RenderObject;
+
+    #[test]
+    fn viewport_picking_prefers_the_object_under_the_pointer_to_the_floor() {
+        let camera = Camera {
+            eye: Vec3::new(0.0, 2.0, 6.0),
+            yaw: -90.0_f32.to_radians(),
+            pitch: -15.0_f32.to_radians(),
+            up: Vec3::Y,
+            aspect: 16.0 / 9.0,
+        };
+        let mut world = World::new();
+        world.add_object(RenderObject::new(
+            Transform::from_translation(Vec3::new(0.0, -1.0, 0.0)),
+            MeshId(0),
+            MaterialId(0),
+        ));
+        world.add_object(RenderObject::new(
+            Transform::new(
+                Vec3::new(0.0, -0.32, 0.0),
+                Quat::IDENTITY,
+                Vec3::splat(0.68),
+            ),
+            MeshId(1),
+            MaterialId(0),
+        ));
+
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+        let sphere_center = project_to_screen(
+            Vec3::new(0.0, -0.32, 0.0),
+            camera.build_view_projection_matrix(),
+            screen_rect,
+        )
+        .unwrap();
+
+        let sphere_id = world.object_id_at(1).unwrap();
+        assert!(matches!(
+            pick_scene_object(sphere_center, screen_rect, &camera, &world),
+            Some(SceneSelection::Part(id)) if id == sphere_id
+        ));
     }
 }

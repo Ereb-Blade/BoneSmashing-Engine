@@ -71,6 +71,13 @@ impl SceneFile {
         })?;
         let mut objects = Vec::with_capacity(world.objects().len());
         let mut groups = Vec::with_capacity(world.model_groups().len());
+        let group_indices: HashMap<_, _> = world
+            .model_group_ids()
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, id)| (id, index))
+            .collect();
         let mut stored_asset_paths =
             HashMap::with_capacity(world.objects().len().min(MAX_SCENE_ASSETS));
         for group in world.model_groups() {
@@ -132,9 +139,15 @@ impl SceneFile {
                     material_id: object.material_id.0,
                 }
             };
+            let model_group = match object.model_group() {
+                Some(id) => Some(*group_indices.get(&id).ok_or_else(|| {
+                    format!("Object '{}' references a missing model group", object.name)
+                })?),
+                None => None,
+            };
             objects.push(SceneObject {
                 source,
-                model_group: object.model_group().map(|id| id.0),
+                model_group,
                 name: object.name.clone(),
                 position: object.transform.position.to_array(),
                 rotation: object.transform.rotation.to_array(),
@@ -331,7 +344,7 @@ pub fn load_scene(path: &Path) -> Result<LoadedScene, String> {
         })?;
         let count = match parsed {
             ParsedAsset::Gltf(model) => model.instance_count(),
-            ParsedAsset::Obj(_) => 1,
+            ParsedAsset::Obj(model) => model.primitive_count(),
         };
         if *instance_index >= count {
             return Err(format!(
@@ -609,6 +622,45 @@ mod tests {
                 path,
             } if Path::new(path).is_absolute()
         ));
+    }
+
+    #[test]
+    fn saved_group_indices_remain_valid_after_a_group_is_deleted() {
+        let scene_directory = std::env::temp_dir().join(format!(
+            "bone-smashing-group-ids-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&scene_directory).unwrap();
+        let model_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("models")
+            .join("sample.obj");
+        let copied_model_path = scene_directory.join("sample.obj");
+        fs::copy(model_path, &copied_model_path).unwrap();
+
+        let mut world = World::new();
+        let removed =
+            world.add_model_group("Removed", copied_model_path.clone(), Transform::default());
+        world.remove_model_group(removed).unwrap();
+        let surviving =
+            world.add_model_group("Surviving", copied_model_path.clone(), Transform::default());
+        world
+            .add_group_object(
+                surviving,
+                RenderObject::new(Transform::default(), MeshId(0), MaterialId(0))
+                    .with_asset_source(copied_model_path, 0),
+            )
+            .unwrap();
+
+        let file = SceneFile::from_world(&world, &scene_directory.join("test.bse-scene")).unwrap();
+
+        assert_eq!(file.groups.len(), 1);
+        assert_eq!(file.objects[0].model_group, Some(0));
+        fs::remove_dir_all(scene_directory).unwrap();
     }
 
     #[test]

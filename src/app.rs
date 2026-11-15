@@ -17,7 +17,7 @@ use crate::core::{
     MATERIAL_SILVER, MESH_CUBE, MESH_PLANE, MESH_SPHERE,
 };
 use crate::input::Input;
-use crate::renderer::debug_ui::DebugUi;
+use crate::renderer::debug_ui::{CameraControlMode, CameraLookButton, DebugUi};
 use crate::renderer::gltf::{GltfPrimitiveInstance, LoadedGltfModel};
 use crate::renderer::state::{LoadedAsset, ParsedAsset, Renderer};
 use crate::scene::{ObjectId, RenderObject, SceneFile, Transform, World, build_world};
@@ -123,7 +123,7 @@ impl App {
                 }
                 Ok(format!("Imported {count} model parts"))
             }
-            LoadedAsset::Obj(mesh_id) => {
+            LoadedAsset::Obj(model) => {
                 let group = world.add_model_group(
                     path.file_stem()
                         .and_then(|name| name.to_str())
@@ -131,21 +131,24 @@ impl App {
                     path.to_path_buf(),
                     Transform::from_translation(position),
                 );
-                world
-                    .add_group_object(
-                        group,
-                        RenderObject::new(Transform::default(), mesh_id, MATERIAL_DEFAULT)
-                            .with_name(
-                                path.file_stem()
-                                    .and_then(|name| name.to_str())
-                                    .unwrap_or("Model"),
+                let count = model.instances.len();
+                for (instance_index, instance) in model.instances.into_iter().enumerate() {
+                    world
+                        .add_group_object(
+                            group,
+                            RenderObject::new(
+                                Transform::default(),
+                                instance.mesh_id,
+                                instance.material_id,
                             )
-                            .with_asset_source(path.to_path_buf(), 0),
-                    )
-                    .ok_or_else(|| {
-                        format!("Could not create model group for {}", path.display())
-                    })?;
-                Ok("Imported OBJ model".to_owned())
+                            .with_name(instance.name)
+                            .with_asset_source(path.to_path_buf(), instance_index),
+                        )
+                        .ok_or_else(|| {
+                            format!("Could not create model group for {}", path.display())
+                        })?;
+                }
+                Ok(format!("Imported OBJ model ({count} parts)"))
             }
         }
     }
@@ -176,19 +179,20 @@ impl App {
                             .with_asset_source(path.clone(), index)
                         })
                         .collect(),
-                    LoadedAsset::Obj(mesh_id) => vec![
-                        RenderObject::new(
-                            Transform::default(),
-                            mesh_id,
-                            crate::core::MATERIAL_DEFAULT,
-                        )
-                        .with_name(
-                            path.file_stem()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or("Model"),
-                        )
-                        .with_asset_source(path.clone(), 0),
-                    ],
+                    LoadedAsset::Obj(model) => model
+                        .instances
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, instance)| {
+                            RenderObject::new(
+                                Transform::default(),
+                                instance.mesh_id,
+                                instance.material_id,
+                            )
+                            .with_name(instance.name)
+                            .with_asset_source(path.clone(), index)
+                        })
+                        .collect(),
                 };
                 asset_instances.insert(path, instances);
             }
@@ -386,6 +390,16 @@ impl ApplicationHandler for App {
             .debug_ui
             .as_mut()
             .is_some_and(|debug_ui| debug_ui.on_window_event(window, &event));
+        let camera_control_mode = self
+            .debug_ui
+            .as_ref()
+            .map(DebugUi::camera_control_mode)
+            .unwrap_or(CameraControlMode::ClickToCapture);
+        let camera_look_button = self
+            .debug_ui
+            .as_ref()
+            .map(DebugUi::camera_look_button)
+            .unwrap_or(CameraLookButton::Right);
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -421,11 +435,26 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                ..
-            } => {
-                if !ui_consumed {
+            WindowEvent::MouseInput { state, button, .. } => {
+                let should_capture = match camera_control_mode {
+                    CameraControlMode::ClickToCapture => {
+                        state == ElementState::Pressed && button == winit::event::MouseButton::Left
+                    }
+                    CameraControlMode::HoldMouseButton => {
+                        button == camera_look_button.mouse_button()
+                            && state == ElementState::Pressed
+                    }
+                };
+                let should_release = camera_control_mode == CameraControlMode::HoldMouseButton
+                    && button == camera_look_button.mouse_button()
+                    && state == ElementState::Released
+                    && self.input.cursor_locked;
+                if should_release {
+                    let _ = window.set_cursor_grab(CursorGrabMode::None);
+                    window.set_cursor_visible(true);
+                    self.input.cursor_locked = false;
+                    self.input.reset_mouse_delta();
+                } else if should_capture && !ui_consumed && !self.input.cursor_locked {
                     match window
                         .set_cursor_grab(CursorGrabMode::Confined)
                         .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked))

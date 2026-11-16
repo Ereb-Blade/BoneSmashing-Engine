@@ -7,6 +7,7 @@ use crate::scene::{
     load_scene,
 };
 use glam::{EulerRot, Mat4, Quat, Vec3};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use winit::window::Window;
@@ -449,11 +450,66 @@ fn selection_is_valid(world: &World, selected: SceneSelection) -> bool {
     }
 }
 
+fn show_model_group_tree(
+    ui: &mut egui::Ui,
+    world: &World,
+    children: &HashMap<Option<ModelGroupId>, Vec<ModelGroupId>>,
+    parent: Option<ModelGroupId>,
+    selected: &mut Option<SceneSelection>,
+) {
+    let Some(group_ids) = children.get(&parent) else {
+        return;
+    };
+    for &group_id in group_ids {
+        let Some(group) = world.model_group(group_id) else {
+            continue;
+        };
+        let is_selected = match *selected {
+            Some(SceneSelection::Model(selected_id)) => selected_id == group_id,
+            Some(SceneSelection::Part(object_id) | SceneSelection::Object(object_id)) => {
+                world.get_object(object_id).is_some_and(|object| {
+                    object.model_group() == Some(group_id) || object.parent_node() == Some(group_id)
+                })
+            }
+            None => false,
+        };
+        let label = if group.source_path.is_some() {
+            format!("{} ({} parts)", group.name, group.objects.len())
+        } else if world.gltf_node_index(group_id).is_some() {
+            format!("{} (glTF node)", group.name)
+        } else {
+            format!("{} (empty node)", group.name)
+        };
+        if children
+            .get(&Some(group_id))
+            .is_some_and(|group_children| !group_children.is_empty())
+        {
+            let id = ui.make_persistent_id(("model-group-tree", group_id.0));
+            let (_, header, _) = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                id,
+                false,
+            )
+            .show_header(ui, |ui| ui.selectable_label(is_selected, label))
+            .body(|ui| {
+                show_model_group_tree(ui, world, children, Some(group_id), selected);
+            });
+            if header.inner.clicked() {
+                *selected = Some(SceneSelection::Model(group_id));
+            }
+        } else if ui.selectable_label(is_selected, label).clicked() {
+            *selected = Some(SceneSelection::Model(group_id));
+        }
+    }
+}
+
 fn selected_world_position(world: &World, selected: Option<SceneSelection>) -> Option<Vec3> {
     match selected {
-        Some(SceneSelection::Model(id)) => {
-            world.model_group(id).map(|group| group.transform.position)
-        }
+        Some(SceneSelection::Model(id)) => world.model_group(id).map(|_| {
+            world
+                .model_group_world_matrix(id)
+                .transform_point3(Vec3::ZERO)
+        }),
         Some(SceneSelection::Part(id) | SceneSelection::Object(id)) => {
             world.get_object(id).map(|object| {
                 world
@@ -463,6 +519,17 @@ fn selected_world_position(world: &World, selected: Option<SceneSelection>) -> O
         }
         None => None,
     }
+}
+
+fn selected_parent_world_matrix(world: &World, selected: Option<SceneSelection>) -> Mat4 {
+    let parent = match selected {
+        Some(SceneSelection::Model(id)) => world.model_group_parent(id),
+        Some(SceneSelection::Part(id) | SceneSelection::Object(id)) => world
+            .get_object(id)
+            .and_then(|object| object.parent_node().or_else(|| object.model_group())),
+        None => None,
+    };
+    parent.map_or(Mat4::IDENTITY, |id| world.model_group_world_matrix(id))
 }
 
 fn pick_scene_object(
@@ -641,15 +708,33 @@ fn paint_scene_gizmo(
         if primary_down {
             let pointer_delta = pointer_position - drag.last_pointer;
             let amount = pointer_delta.dot(drag.screen_direction) * drag.world_per_pixel;
+            let parent_matrix = (drag.mode == GizmoMode::Move)
+                .then(|| selected_parent_world_matrix(world, *selected));
             if let Some(transform) = selected_transform_mut(world, *selected) {
-                changed |= amount != 0.0;
                 match drag.mode {
-                    GizmoMode::Move => transform.position += axis_vector(drag.axis) * amount,
+                    GizmoMode::Move => {
+                        let parent_matrix = parent_matrix.unwrap_or(Mat4::IDENTITY);
+                        let determinant = parent_matrix.determinant();
+                        if amount != 0.0
+                            && determinant.is_finite()
+                            && determinant.abs() > f32::EPSILON
+                        {
+                            let local_delta = parent_matrix
+                                .inverse()
+                                .transform_vector3(axis_vector(drag.axis) * amount);
+                            if local_delta.is_finite() {
+                                transform.position += local_delta;
+                                changed = true;
+                            }
+                        }
+                    }
                     GizmoMode::Rotate => {
+                        changed |= amount != 0.0;
                         let rotation = Quat::from_axis_angle(axis_vector(drag.axis), amount);
                         transform.rotation = rotation * transform.rotation;
                     }
                     GizmoMode::Scale => {
+                        changed |= amount != 0.0;
                         transform.scale[drag.axis] =
                             (transform.scale[drag.axis] + amount).clamp(-1_000.0, 1_000.0);
                     }
@@ -997,6 +1082,7 @@ impl DebugUi {
         let mut pick_scene_to_save = false;
         let mut pick_scene_to_load = false;
         let mut add_cube = false;
+        let mut add_empty_node = false;
         let mut duplicate_selection = false;
         let mut delete_selection = false;
         let mut undo_requested = false;
@@ -1007,6 +1093,7 @@ impl DebugUi {
         let mut transform_change = None;
         let mut name_change = None;
         let mut animation_change = None;
+        let mut parent_change = None;
         let selection_is_valid = self
             .selected_scene_item
             .is_some_and(|selected| selection_is_valid(world, selected));
@@ -1230,6 +1317,15 @@ impl DebugUi {
                         {
                             add_cube = true;
                         }
+                        if ui
+                            .add_enabled(
+                                scene_io_enabled,
+                                egui::Button::new("Add empty node"),
+                            )
+                            .clicked()
+                        {
+                            add_empty_node = true;
+                        }
                         let has_selection = selected_scene_item.is_some();
                         if ui
                             .add_enabled(
@@ -1411,56 +1507,29 @@ impl DebugUi {
                                             let row_height =
                                                 ui.text_style_height(&egui::TextStyle::Button);
                                             ui.label(
-                                                egui::RichText::new("MODELS").small().strong(),
+                                                egui::RichText::new("MODEL HIERARCHY")
+                                                    .small()
+                                                    .strong(),
                                             );
                                             egui::ScrollArea::vertical()
                                                 .id_salt("model-list")
-                                                .max_height(140.0)
-                                                .show_rows(
-                                                    ui,
-                                                    row_height,
-                                                    world.model_groups().len(),
-                                                    |ui, rows| {
-                                                        for index in rows {
-                                                            let group =
-                                                                &world.model_groups()[index];
-                                                            let id = world.model_group_ids()[index];
-                                                            let is_selected =
-                                                                match selected_scene_item {
-                                                                    Some(
-                                                                        SceneSelection::Model(
-                                                                            selected,
-                                                                        ),
-                                                                    ) => selected == id,
-                                                                    Some(SceneSelection::Part(
-                                                                        object_id,
-                                                                    )) => {
-                                                                        world
-                                                                            .get_object(object_id)
-                                                                            .and_then(|object| {
-                                                                                object.model_group()
-                                                                            })
-                                                                            == Some(id)
-                                                                    }
-                                                                    _ => false,
-                                                                };
-                                                            if ui
-                                                                .selectable_label(
-                                                                    is_selected,
-                                                                    format!(
-                                                                        "{} ({} parts)",
-                                                                        group.name,
-                                                                        group.objects.len()
-                                                                    ),
-                                                                )
-                                                                .clicked()
-                                                            {
-                                                                selected_scene_item =
-                                                                    Some(SceneSelection::Model(id));
-                                                            }
-                                                        }
-                                                    },
-                                                );
+                                                .max_height(180.0)
+                                                .show(ui, |ui| {
+                                                    let mut children = HashMap::new();
+                                                    for &id in world.model_group_ids() {
+                                                        children
+                                                            .entry(world.model_group_parent(id))
+                                                            .or_insert_with(Vec::new)
+                                                            .push(id);
+                                                    }
+                                                    show_model_group_tree(
+                                                        ui,
+                                                        world,
+                                                        &children,
+                                                        None,
+                                                        &mut selected_scene_item,
+                                                    );
+                                                });
 
                                             let active_group = match selected_scene_item {
                                                 Some(SceneSelection::Model(group_id)) => {
@@ -1583,10 +1652,88 @@ impl DebugUi {
                                                 .default_open(true)
                                                 .show(ui, |ui| match selected_scene_item {
                                                     Some(SceneSelection::Model(group_id)) => {
+                                                        let parent_before =
+                                                            world.model_group_parent(group_id);
+                                                        let transform_before = world
+                                                            .model_group(group_id)
+                                                            .expect("selected model group must exist")
+                                                            .transform;
+                                                        let mut selected_parent = parent_before;
+                                                        let parent_name = selected_parent
+                                                            .and_then(|id| {
+                                                                world
+                                                                    .model_group(id)
+                                                                    .map(|group| group.name.clone())
+                                                            })
+                                                            .unwrap_or_else(|| "Root".to_owned());
+                                                        ui.label("Parent node");
+                                                        egui::ComboBox::from_id_salt((
+                                                            "model-parent",
+                                                            group_id.0,
+                                                        ))
+                                                        .selected_text(parent_name)
+                                                        .show_ui(ui, |ui| {
+                                                            ui.selectable_value(
+                                                                &mut selected_parent,
+                                                                None,
+                                                                "Root",
+                                                            );
+                                                            for &candidate in
+                                                                world.model_group_ids()
+                                                            {
+                                                                if world
+                                                                    .can_set_model_group_parent(
+                                                                        group_id,
+                                                                        Some(candidate),
+                                                                    )
+                                                                {
+                                                                    let label = world
+                                                                        .model_group(candidate)
+                                                                        .map(|group| {
+                                                                            group.name.as_str()
+                                                                        })
+                                                                        .unwrap_or("Model");
+                                                                    ui.selectable_value(
+                                                                        &mut selected_parent,
+                                                                        Some(candidate),
+                                                                        label,
+                                                                    );
+                                                                }
+                                                            }
+                                                        });
+                                                        if selected_parent != parent_before {
+                                                            match world
+                                                                .reparent_model_group_preserving_world(
+                                                                    group_id,
+                                                                    selected_parent,
+                                                                )
+                                                            {
+                                                                Ok(()) => {
+                                                                    parent_change = Some((
+                                                                        group_id,
+                                                                        parent_before,
+                                                                        transform_before,
+                                                                    ));
+                                                                    scene_modified = true;
+                                                                }
+                                                                Err(error) => {
+                                                                    self.scene_status =
+                                                                        Some(Err(error));
+                                                                }
+                                                            }
+                                                        }
+                                                        let is_gltf_node =
+                                                            world.gltf_node_index(group_id).is_some();
                                                         if let Some(group) =
                                                             world.model_group_mut(group_id)
                                                         {
-                                                            ui.label("Model");
+                                                            ui.label(if group.source_path.is_some() {
+                                                                "Model"
+                                                            } else if is_gltf_node {
+                                                                "glTF node"
+                                                            } else {
+                                                                "Empty node"
+                                                            });
                                                             let before = group.name.clone();
                                                             if ui
                                                                 .text_edit_singleline(
@@ -2104,6 +2251,7 @@ impl DebugUi {
             settings != settings_before || selected_params != selected_params_before;
         let mut changed_name = None;
         let mut changed_animation = None;
+        let mut changed_parent = None;
         if let Some((selection, before)) = name_change
             && let Some(name) = selected_name_mut(world, selection)
         {
@@ -2120,7 +2268,28 @@ impl DebugUi {
             }
             changed_animation = Some((group_id, after));
         }
-        if render_state_modified || changed_name.is_some() || changed_animation.is_some() {
+        if let Some((group_id, before_parent, before_transform)) = parent_change {
+            let after = world.model_group_parent(group_id);
+            let after_transform = world
+                .model_group(group_id)
+                .expect("reparented model group must remain available")
+                .transform;
+            if after != before_parent {
+                world
+                    .set_model_group_parent(group_id, before_parent)
+                    .expect("previous model parent must remain valid");
+                world
+                    .model_group_mut(group_id)
+                    .expect("reparented model group must remain available")
+                    .transform = before_transform;
+                changed_parent = Some((group_id, after, after_transform));
+            }
+        }
+        if render_state_modified
+            || changed_name.is_some()
+            || changed_animation.is_some()
+            || changed_parent.is_some()
+        {
             self.history.record(
                 world,
                 selected_scene_item,
@@ -2137,6 +2306,15 @@ impl DebugUi {
         {
             group.animation = Some(after);
         }
+        if let Some((group_id, after_parent, after_transform)) = changed_parent {
+            world
+                .set_model_group_parent(group_id, after_parent)
+                .expect("new model parent must remain valid");
+            world
+                .model_group_mut(group_id)
+                .expect("reparented model group must remain available")
+                .transform = after_transform;
+        }
         scene_modified |= render_state_modified;
         if render_state_modified {
             renderer.set_settings(settings);
@@ -2148,7 +2326,9 @@ impl DebugUi {
             self.scene_save_request = Some(PathBuf::from(&self.scene_path));
             self.scene_status = None;
         }
-        if let Some((transform_selection, before)) = transform_change {
+        if parent_change.is_none()
+            && let Some((transform_selection, before)) = transform_change
+        {
             if let Some(after) = selected_transform_mut(world, Some(transform_selection)).copied() {
                 if let Some(transform) = selected_transform_mut(world, Some(transform_selection)) {
                     *transform = before;
@@ -2219,6 +2399,25 @@ impl DebugUi {
                 .with_name("Cube"),
             );
             selected_scene_item = Some(SceneSelection::Object(id));
+            scene_modified = true;
+        }
+        if add_empty_node {
+            self.history.record(
+                world,
+                selected_scene_item,
+                &RenderSnapshot::capture(renderer),
+            );
+            let forward = Vec3::new(
+                camera.yaw.cos() * camera.pitch.cos(),
+                camera.pitch.sin(),
+                camera.yaw.sin() * camera.pitch.cos(),
+            )
+            .normalize();
+            let id = world.add_empty_node(
+                "Empty node",
+                Transform::from_translation(camera.eye + forward * 4.0),
+            );
+            selected_scene_item = Some(SceneSelection::Model(id));
             scene_modified = true;
         }
         if duplicate_selection {
@@ -2478,6 +2677,27 @@ mod tests {
     }
 
     #[test]
+    fn world_space_gizmo_move_respects_mirrored_parent_transforms() {
+        let mut world = World::new();
+        let parent = world.add_empty_node(
+            "Mirrored parent",
+            Transform::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(-1.0, 1.0, 1.0)),
+        );
+        let child = world.add_empty_node("Child", Transform::default());
+        world.set_model_group_parent(child, Some(parent)).unwrap();
+
+        let parent_matrix =
+            selected_parent_world_matrix(&world, Some(SceneSelection::Model(child)));
+        let local_delta = parent_matrix.inverse().transform_vector3(Vec3::X);
+        world.model_group_mut(child).unwrap().transform.position += local_delta;
+
+        let world_position = world
+            .model_group_world_matrix(child)
+            .transform_point3(Vec3::ZERO);
+        assert!(world_position.abs_diff_eq(Vec3::X, 1e-5));
+    }
+
+    #[test]
     fn viewport_picking_prefers_the_object_under_the_pointer_to_the_floor() {
         let camera = Camera {
             eye: Vec3::new(0.0, 2.0, 6.0),
@@ -2613,6 +2833,38 @@ mod tests {
         assert!(history.can_redo());
         history.record(&world, selection, &render_state);
         assert!(!history.can_redo());
+    }
+
+    #[test]
+    fn undo_redo_restores_model_group_parent_changes() {
+        let mut world = World::new();
+        let parent = world.add_empty_node(
+            "Parent",
+            Transform::from_translation(Vec3::new(1.0, 0.0, 0.0)),
+        );
+        let child = world.add_empty_node("Child", Transform::from_translation(Vec3::Y));
+        let selection = Some(SceneSelection::Model(child));
+        let mut history = UndoHistory::default();
+        let mut render_state = test_render_state();
+        history.record(&world, selection, &render_state);
+        world
+            .reparent_model_group_preserving_world(child, Some(parent))
+            .unwrap();
+        let parented_transform = world.model_group(child).unwrap().transform;
+        let mut selection = selection;
+
+        assert!(history.undo(&mut world, &mut selection, &mut render_state));
+        assert_eq!(world.model_group_parent(child), None);
+        assert_eq!(
+            world.model_group(child).unwrap().transform.position,
+            Vec3::Y
+        );
+        assert!(history.redo(&mut world, &mut selection, &mut render_state));
+        assert_eq!(world.model_group_parent(child), Some(parent));
+        assert_eq!(
+            world.model_group(child).unwrap().transform.position,
+            parented_transform.position
+        );
     }
 
     #[test]

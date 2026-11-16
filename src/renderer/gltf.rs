@@ -6,6 +6,7 @@ use std::{
 use glam::{Mat4, Quat, Vec3};
 
 use crate::core::{MaterialId, MeshId};
+use crate::scene::Transform;
 
 use super::mesh::{
     MAX_IMPORTED_TEXTURE_DIMENSION, MeshData, SkinVertex, UvSetsVertex, Vertex, calculate_normals,
@@ -225,13 +226,22 @@ pub struct GltfPrimitiveInstance {
     pub name: String,
     pub mesh_id: MeshId,
     pub material_id: MaterialId,
+    pub node_index: usize,
     pub node_transform: Mat4,
     pub skin_matrices: Vec<Mat4>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GltfNodeInfo {
+    pub name: String,
+    pub parent_index: Option<usize>,
+    pub transform: Transform,
 }
 
 #[derive(Debug)]
 pub struct LoadedGltfModel {
     pub instances: Vec<GltfPrimitiveInstance>,
+    pub node_hierarchy: Vec<GltfNodeInfo>,
     pub animations: Vec<GltfAnimationInfo>,
     animation_data: Option<GltfAnimationData>,
 }
@@ -256,17 +266,28 @@ impl LoadedGltfModel {
         data.sample(animation_index, time)
     }
 
+    #[cfg(test)]
     pub fn sample_animation_into(
         &mut self,
         animation_index: usize,
         time: f32,
         output: &mut Vec<GltfPrimitiveInstance>,
     ) -> Result<(), String> {
+        self.sample_animation_with_nodes_into(animation_index, time, output, &mut Vec::new())
+    }
+
+    pub fn sample_animation_with_nodes_into(
+        &mut self,
+        animation_index: usize,
+        time: f32,
+        output: &mut Vec<GltfPrimitiveInstance>,
+        node_transforms: &mut Vec<(usize, Transform)>,
+    ) -> Result<(), String> {
         let data = self
             .animation_data
             .as_mut()
             .ok_or_else(|| "model does not contain skeletal animation data".to_owned())?;
-        data.sample_into(animation_index, time, output)
+        data.sample_into(animation_index, time, output, node_transforms)
     }
 }
 
@@ -388,6 +409,7 @@ impl GltfAnimationData {
                     name: instance.name.clone(),
                     mesh_id: self.mesh_ids[instance.primitive_index],
                     material_id: self.material_ids[instance.primitive_index],
+                    node_index: instance.node_index,
                     node_transform,
                     skin_matrices,
                 })
@@ -400,6 +422,7 @@ impl GltfAnimationData {
         animation_index: usize,
         time: f32,
         output: &mut Vec<GltfPrimitiveInstance>,
+        node_transforms: &mut Vec<(usize, Transform)>,
     ) -> Result<(), String> {
         if !time.is_finite() {
             return Err("animation time must be finite".to_owned());
@@ -411,6 +434,19 @@ impl GltfAnimationData {
         self.sample_nodes.copy_from_slice(&self.base_nodes);
         let duration = self.animation_infos[animation_index].duration;
         apply_animation_channels(clip, duration, time, &mut self.sample_nodes)?;
+        node_transforms.clear();
+        node_transforms.extend(
+            self.sample_nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| node.animated)
+                .map(|(index, node)| {
+                    (
+                        index,
+                        Transform::new(node.translation, node.rotation, node.scale),
+                    )
+                }),
+        );
 
         calculate_global_transforms_into(
             &self.sample_nodes,
@@ -429,6 +465,7 @@ impl GltfAnimationData {
                     name: instance.name.clone(),
                     mesh_id: self.mesh_ids[instance.primitive_index],
                     material_id: self.material_ids[instance.primitive_index],
+                    node_index: instance.node_index,
                     node_transform,
                     skin_matrices: Vec::new(),
                 });
@@ -561,6 +598,7 @@ pub struct GltfModelData {
     pub primitives: Vec<GltfPrimitiveData>,
     instances: Vec<AnimationInstanceData>,
     nodes: Vec<NodePose>,
+    node_names: Vec<String>,
     parents: Vec<Option<usize>>,
     skins: Vec<SkinData>,
     clips: Vec<AnimationClipData>,
@@ -1331,6 +1369,16 @@ impl GltfModelData {
 
         let (nodes, parents) =
             read_nodes(&document).map_err(|error| format!("{}: {error}", path.display()))?;
+        let mut node_names: Vec<_> = document
+            .nodes()
+            .map(|node| {
+                node.name()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("Node {}", node.index() + 1))
+            })
+            .collect();
         let skins = read_skins(&document, &buffers)
             .map_err(|error| format!("{}: {error}", path.display()))?;
         let (clips, animation_infos) = read_animations(&document, &buffers)
@@ -1343,6 +1391,7 @@ impl GltfModelData {
             let mut nodes = nodes;
             let mut parents = parents;
             let synthetic_node = nodes.len();
+            node_names.push("Scene".to_owned());
             nodes.push(NodePose {
                 translation: Vec3::ZERO,
                 rotation: Quat::IDENTITY,
@@ -1399,6 +1448,7 @@ impl GltfModelData {
             primitives,
             instances,
             nodes,
+            node_names,
             parents,
             skins,
             clips,
@@ -1411,6 +1461,17 @@ impl GltfModelData {
         first_mesh_id: usize,
         first_material_id: usize,
     ) -> Result<LoadedGltfModel, String> {
+        let node_hierarchy = self
+            .nodes
+            .iter()
+            .zip(&self.parents)
+            .zip(&self.node_names)
+            .map(|((node, &parent_index), name)| GltfNodeInfo {
+                name: name.clone(),
+                parent_index,
+                transform: Transform::new(node.translation, node.rotation, node.scale),
+            })
+            .collect();
         let globals = calculate_global_transforms(&self.nodes, &self.parents)?;
         let mesh_ids = (0..self.primitives.len())
             .map(|index| MeshId(first_mesh_id + index))
@@ -1449,6 +1510,7 @@ impl GltfModelData {
         };
         Ok(LoadedGltfModel {
             instances,
+            node_hierarchy,
             animations: self.animation_infos,
             animation_data,
         })
@@ -2103,6 +2165,7 @@ fn build_instances(
                 name: instance.name.clone(),
                 mesh_id,
                 material_id,
+                node_index: instance.node_index,
                 node_transform,
                 skin_matrices,
             })
@@ -2620,6 +2683,17 @@ mod tests {
         let mut loaded = model.into_loaded(10, 5).unwrap();
         assert_eq!(loaded.instances[0].mesh_id, MeshId(10));
         assert_eq!(loaded.animations.len(), 1);
+        assert!(!loaded.node_hierarchy.is_empty());
+        assert!(loaded.node_hierarchy.iter().all(|node| {
+            node.parent_index
+                .map_or(true, |parent| parent < loaded.node_hierarchy.len())
+        }));
+        assert!(
+            loaded
+                .instances
+                .iter()
+                .all(|instance| instance.node_index < loaded.node_hierarchy.len())
+        );
         assert_eq!(
             loaded
                 .instances
@@ -2642,10 +2716,22 @@ mod tests {
         );
 
         let mut reused = Vec::new();
+        let mut node_transforms = Vec::new();
         loaded
-            .sample_animation_into(0, loaded.animations[0].duration * 0.5, &mut reused)
+            .sample_animation_with_nodes_into(
+                0,
+                loaded.animations[0].duration * 0.5,
+                &mut reused,
+                &mut node_transforms,
+            )
             .unwrap();
         assert_eq!(reused.len(), animated.len());
+        assert!(!node_transforms.is_empty());
+        assert!(
+            node_transforms
+                .iter()
+                .all(|(index, _)| *index < loaded.node_hierarchy.len())
+        );
         for (sampled, expected) in reused.iter().zip(&animated) {
             assert_eq!(sampled.mesh_id, expected.mesh_id);
             assert_eq!(sampled.material_id, expected.material_id);

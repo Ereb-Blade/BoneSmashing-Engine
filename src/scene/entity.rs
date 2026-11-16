@@ -17,10 +17,10 @@ pub struct RenderObject {
     pub transform: Transform,
     pub mesh_id: MeshId,
     pub material_id: MaterialId,
-    local_matrix: Mat4,
     skin_matrices: Vec<Mat4>,
     asset_source: Option<AssetSource>,
     model_group: Option<ModelGroupId>,
+    parent_node: Option<ModelGroupId>,
 }
 
 impl RenderObject {
@@ -30,10 +30,10 @@ impl RenderObject {
             transform,
             mesh_id,
             material_id,
-            local_matrix: Mat4::IDENTITY,
             skin_matrices: Vec::new(),
             asset_source: None,
             model_group: None,
+            parent_node: None,
         }
     }
 
@@ -62,13 +62,12 @@ impl RenderObject {
         self.model_group = model_group;
     }
 
-    pub fn with_local_matrix(mut self, local_matrix: Mat4) -> Self {
-        self.local_matrix = local_matrix;
-        self
+    pub fn parent_node(&self) -> Option<ModelGroupId> {
+        self.parent_node
     }
 
-    pub fn set_local_matrix(&mut self, local_matrix: Mat4) {
-        self.local_matrix = local_matrix;
+    pub(crate) fn set_parent_node(&mut self, parent_node: Option<ModelGroupId>) {
+        self.parent_node = parent_node;
     }
 
     pub fn with_skin_matrices(mut self, skin_matrices: Vec<Mat4>) -> Self {
@@ -86,6 +85,6 @@ impl RenderObject {
     }
 
     pub fn model_matrix(&self) -> Mat4 {
-        self.transform.to_matrix() * self.local_matrix
+        self.transform.to_matrix()
     }
 }

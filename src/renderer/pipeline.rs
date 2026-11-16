@@ -498,10 +498,7 @@ fn vs_shadow(v: VsIn, instance: InstanceInput) -> ShadowOut {
 }
 
 @fragment
-fn fs_shadow(v: ShadowOut, @builtin(front_facing) front_facing: bool) {
-    if !front_facing && material.double_sided == 0u {
-        discard;
-    }
+fn fs_shadow(v: ShadowOut) {
     let uv = transform_uv(get_uv(
         material.base_color_tex_coord,
         v.uv_01.xy,

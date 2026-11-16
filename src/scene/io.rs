@@ -5,11 +5,11 @@ use crate::renderer::state::{ParsedAsset, RendererSettings, parse_asset};
 use crate::scene::{ModelGroupId, RenderObject, Transform, World};
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const SCENE_FORMAT_VERSION: u32 = 4;
+const SCENE_FORMAT_VERSION: u32 = 7;
 const MAX_SCENE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SCENE_OBJECTS: usize = 100_000;
 const MAX_SCENE_ASSETS: usize = 256;
@@ -34,7 +34,12 @@ pub struct SceneFile {
 #[serde(deny_unknown_fields)]
 pub struct SceneGroup {
     pub name: String,
-    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_group: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gltf_node_index: Option<usize>,
     pub position: [f32; 3],
     pub rotation: [f32; 4],
     pub scale: [f32; 3],
@@ -57,6 +62,8 @@ pub struct SceneObject {
     pub source: SceneObjectSource,
     #[serde(default)]
     pub model_group: Option<usize>,
+    #[serde(default)]
+    pub parent_node: Option<usize>,
     #[serde(default)]
     pub name: String,
     pub position: [f32; 3],
@@ -193,28 +200,51 @@ impl SceneFile {
             .collect();
         let mut stored_asset_paths =
             HashMap::with_capacity(world.objects().len().min(MAX_SCENE_ASSETS));
-        for group in world.model_groups() {
-            if !stored_asset_paths.contains_key(&group.source_path) {
-                let path = fs::canonicalize(&group.source_path).map_err(|error| {
-                    format!(
-                        "Could not resolve model path {}: {error}",
-                        group.source_path.display()
-                    )
-                })?;
-                let stored_path = path
-                    .strip_prefix(&scene_directory)
-                    .unwrap_or(&path)
-                    .to_str()
-                    .ok_or_else(|| format!("Model path is not valid UTF-8: {}", path.display()))?
-                    .to_owned();
-                stored_asset_paths.insert(group.source_path.clone(), stored_path);
-            }
+        for (group_id, group) in world
+            .model_group_ids()
+            .iter()
+            .copied()
+            .zip(world.model_groups())
+        {
+            let stored_path = if let Some(source_path) = &group.source_path {
+                if !stored_asset_paths.contains_key(source_path) {
+                    let path = fs::canonicalize(source_path).map_err(|error| {
+                        format!(
+                            "Could not resolve model path {}: {error}",
+                            source_path.display()
+                        )
+                    })?;
+                    let stored_path = path
+                        .strip_prefix(&scene_directory)
+                        .unwrap_or(&path)
+                        .to_str()
+                        .ok_or_else(|| {
+                            format!("Model path is not valid UTF-8: {}", path.display())
+                        })?
+                        .to_owned();
+                    stored_asset_paths.insert(source_path.clone(), stored_path);
+                }
+                Some(
+                    stored_asset_paths
+                        .get(source_path)
+                        .ok_or_else(|| "Model path was not prepared for saving".to_owned())?
+                        .clone(),
+                )
+            } else {
+                None
+            };
             groups.push(SceneGroup {
                 name: group.name.clone(),
-                path: stored_asset_paths
-                    .get(&group.source_path)
-                    .ok_or_else(|| "Model path was not prepared for saving".to_owned())?
-                    .clone(),
+                path: stored_path,
+                parent_group: world
+                    .model_group_parent(group_id)
+                    .map(|parent| {
+                        group_indices.get(&parent).copied().ok_or_else(|| {
+                            format!("Model group '{}' references a missing parent", group.name)
+                        })
+                    })
+                    .transpose()?,
+                gltf_node_index: world.gltf_node_index(group_id),
                 position: group.transform.position.to_array(),
                 rotation: group.transform.rotation.to_array(),
                 scale: group.transform.scale.to_array(),
@@ -264,9 +294,18 @@ impl SceneFile {
                 })?),
                 None => None,
             };
+            let parent_node = object
+                .parent_node()
+                .map(|id| {
+                    group_indices.get(&id).copied().ok_or_else(|| {
+                        format!("Object '{}' references a missing parent node", object.name)
+                    })
+                })
+                .transpose()?;
             objects.push(SceneObject {
                 source,
                 model_group,
+                parent_node,
                 name: object.name.clone(),
                 position: object.transform.position.to_array(),
                 rotation: object.transform.rotation.to_array(),
@@ -420,15 +459,55 @@ impl SceneFile {
                     "Scene object {index} references an unknown model group"
                 ));
             }
+            if object
+                .parent_node
+                .is_some_and(|parent| parent >= self.groups.len())
+            {
+                return Err(format!(
+                    "Scene object {index} references an unknown parent node"
+                ));
+            }
             if let Some(group_id) = object.model_group {
                 match &object.source {
                     SceneObjectSource::Asset { path, .. }
-                        if path == &self.groups[group_id].path => {}
+                        if self.groups[group_id].path.as_deref() == Some(path.as_str()) => {}
                     _ => {
                         return Err(format!(
                             "Scene object {index} model does not match its parent group"
                         ));
                     }
+                }
+            }
+            if let Some(parent_node) = object.parent_node {
+                let Some(owner) = object.model_group else {
+                    return Err(format!(
+                        "Scene object {index} has a parent node but no model group"
+                    ));
+                };
+                let mut current = Some(parent_node);
+                let mut belongs_to_model = false;
+                let mut visited = 0;
+                while let Some(node_index) = current {
+                    if node_index == owner {
+                        belongs_to_model = true;
+                        break;
+                    }
+                    current = self
+                        .groups
+                        .get(node_index)
+                        .ok_or_else(|| {
+                            format!("Scene object {index} references an invalid parent hierarchy")
+                        })?
+                        .parent_group;
+                    visited += 1;
+                    if visited > self.groups.len() {
+                        return Err("Model group hierarchy contains a cycle".to_owned());
+                    }
+                }
+                if !belongs_to_model {
+                    return Err(format!(
+                        "Scene object {index} parent is outside its model hierarchy"
+                    ));
                 }
             }
         }
@@ -437,7 +516,15 @@ impl SceneFile {
             let rotation = Quat::from_array(group.rotation);
             let scale = Vec3::from_array(group.scale);
             if group.name.trim().is_empty()
-                || group.path.trim().is_empty()
+                || group
+                    .path
+                    .as_ref()
+                    .is_some_and(|path| path.trim().is_empty())
+                || (group.path.is_none() && group.animation.is_some())
+                || (group.path.is_some() && group.gltf_node_index.is_some())
+                || group
+                    .parent_group
+                    .is_some_and(|parent| parent >= self.groups.len() || parent == index)
                 || !position.is_finite()
                 || !rotation.is_finite()
                 || !rotation.length_squared().is_finite()
@@ -448,6 +535,16 @@ impl SceneFile {
                 })
             {
                 return Err(format!("Model group {index} has invalid data"));
+            }
+        }
+        for start in 0..self.groups.len() {
+            let mut visited = HashSet::new();
+            let mut current = Some(start);
+            while let Some(index) = current {
+                if !visited.insert(index) {
+                    return Err("Model group hierarchy contains a cycle".to_owned());
+                }
+                current = self.groups[index].parent_group;
             }
         }
         Ok(())
@@ -511,7 +608,7 @@ pub fn load_scene(path: &Path) -> Result<LoadedScene, String> {
     let mut file: SceneFile = serde_json::from_slice(&bytes)
         .map_err(|error| format!("Could not parse scene {}: {error}", path.display()))?;
     let legacy_scene = file.version == 1;
-    if matches!(file.version, 1 | 2 | 3) {
+    if matches!(file.version, 1 | 2 | 3 | 4 | 5 | 6) {
         file.version = SCENE_FORMAT_VERSION;
     }
     file.validate()?;
@@ -545,14 +642,18 @@ pub fn load_scene(path: &Path) -> Result<LoadedScene, String> {
     let mut assets = BTreeMap::new();
     let mut referenced_assets = BTreeMap::<PathBuf, ()>::new();
     for (index, group) in file.groups.iter_mut().enumerate() {
-        let resolved_path = resolve_asset_path(&group.path, scene_directory).map_err(|error| {
-            format!("Model group {index} references an unavailable model: {error}")
-        })?;
-        group.path = resolved_path
-            .to_str()
-            .ok_or_else(|| format!("Model path is not valid UTF-8: {}", resolved_path.display()))?
-            .to_owned();
-        referenced_assets.insert(resolved_path, ());
+        if let Some(path) = group.path.as_mut() {
+            let resolved_path = resolve_asset_path(path, scene_directory).map_err(|error| {
+                format!("Model group {index} references an unavailable model: {error}")
+            })?;
+            *path = resolved_path
+                .to_str()
+                .ok_or_else(|| {
+                    format!("Model path is not valid UTF-8: {}", resolved_path.display())
+                })?
+                .to_owned();
+            referenced_assets.insert(resolved_path, ());
+        }
     }
     for (index, object) in file.objects.iter_mut().enumerate() {
         let SceneObjectSource::Asset { path, .. } = &mut object.source else {
@@ -603,7 +704,7 @@ pub fn load_scene(path: &Path) -> Result<LoadedScene, String> {
             ));
         }
         if let Some(group_id) = object.model_group {
-            if file.groups[group_id].path != *path {
+            if file.groups[group_id].path.as_deref() != Some(path.as_str()) {
                 return Err(format!(
                     "Scene object {index} model does not match its parent group"
                 ));
@@ -665,7 +766,9 @@ fn upgrade_legacy_model_groups(file: &mut SceneFile) {
             let group_id = file.groups.len();
             file.groups.push(SceneGroup {
                 name,
-                path: path.clone(),
+                path: Some(path.clone()),
+                parent_group: None,
+                gltf_node_index: None,
                 position: root_position,
                 rotation: [0.0, 0.0, 0.0, 1.0],
                 scale: [1.0, 1.0, 1.0],
@@ -723,14 +826,34 @@ pub fn build_world(
     file.validate()?;
     let mut world = World::new();
     for group in &file.groups {
-        let group_path = PathBuf::from(&group.path);
-        if !assets.contains_key(&group_path) {
-            return Err(format!(
-                "Model group '{}' references a model that was not loaded",
-                group.name
-            ));
+        let id = if let Some(path) = &group.path {
+            let group_path = PathBuf::from(path);
+            if !assets.contains_key(&group_path) {
+                return Err(format!(
+                    "Model group '{}' references a model that was not loaded",
+                    group.name
+                ));
+            }
+            world.add_model_group(group.name.clone(), group_path, group.transform())
+        } else {
+            world.add_empty_node(group.name.clone(), group.transform())
+        };
+        if let Some(node_index) = group.gltf_node_index {
+            world
+                .set_gltf_node_index(id, Some(node_index))
+                .map_err(|error| format!("Invalid glTF node metadata: {error}"))?;
         }
-        world.add_model_group(group.name.clone(), group_path, group.transform());
+    }
+    let group_ids = world.model_group_ids().to_vec();
+    for (index, group) in file.groups.iter().enumerate() {
+        if let Some(parent_index) = group.parent_group {
+            let parent_id = *group_ids
+                .get(parent_index)
+                .ok_or_else(|| format!("Model group {index} references an unknown parent"))?;
+            world
+                .set_model_group_parent(group_ids[index], Some(parent_id))
+                .map_err(|error| format!("Invalid parent for model group {index}: {error}"))?;
+        }
     }
     for (index, object) in file.objects.iter().enumerate() {
         let render_object = match &object.source {
@@ -773,15 +896,20 @@ pub fn build_world(
                 render_object
             }
         };
-        if let Some(group_id) = object.model_group {
-            let group_id = ModelGroupId(group_id);
-            if world.add_group_object(group_id, render_object).is_none() {
-                return Err(format!(
-                    "Scene object {index} references an unknown model group"
-                ));
-            }
+        let object_id = if let Some(group_id) = object.model_group {
+            world
+                .add_group_object(ModelGroupId(group_id), render_object)
+                .ok_or_else(|| format!("Scene object {index} references an unknown model group"))?
         } else {
-            world.add_object(render_object);
+            world.add_object(render_object)
+        };
+        if let Some(parent_index) = object.parent_node {
+            let parent_id = *group_ids
+                .get(parent_index)
+                .ok_or_else(|| format!("Scene object {index} references an unknown parent node"))?;
+            world
+                .set_object_parent_node(object_id, Some(parent_id))
+                .map_err(|error| format!("Invalid parent for scene object {index}: {error}"))?;
         }
     }
     Ok(world)
@@ -836,6 +964,157 @@ mod tests {
                 .validate()
                 .unwrap_err()
                 .contains("Model group 0 has invalid data")
+        );
+        fs::remove_dir_all(scene_directory).unwrap();
+    }
+
+    #[test]
+    fn saves_nested_model_group_hierarchy_and_rejects_cycles() {
+        let scene_directory = std::env::temp_dir().join(format!(
+            "bone-smashing-nested-scene-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&scene_directory).unwrap();
+        let model_path = scene_directory.join("model.glb");
+        fs::write(&model_path, b"model placeholder").unwrap();
+        let mut world = World::new();
+        let parent = world.add_empty_node("Parent", Transform::default());
+        let child = world.add_model_group("Child", model_path.clone(), Transform::default());
+        world.set_model_group_parent(child, Some(parent)).unwrap();
+        let gltf_node = world.add_empty_node("glTF node", Transform::default());
+        world.set_gltf_node_index(gltf_node, Some(4)).unwrap();
+        world
+            .set_model_group_parent(gltf_node, Some(child))
+            .unwrap();
+        let object_id = world
+            .add_group_object(
+                child,
+                RenderObject::new(Transform::default(), MeshId(0), MaterialId(0))
+                    .with_asset_source(model_path, 0),
+            )
+            .unwrap();
+        world
+            .set_object_parent_node(object_id, Some(gltf_node))
+            .unwrap();
+
+        let file = SceneFile::from_world(&world, &scene_directory.join("scene.bse-scene")).unwrap();
+        assert_eq!(file.version, SCENE_FORMAT_VERSION);
+        assert_eq!(file.groups[0].parent_group, None);
+        assert_eq!(file.groups[0].path, None);
+        assert_eq!(file.groups[1].parent_group, Some(0));
+        assert!(file.groups[1].path.is_some());
+        assert_eq!(file.groups[2].parent_group, Some(1));
+        assert_eq!(file.groups[2].gltf_node_index, Some(4));
+        assert_eq!(file.objects[0].parent_node, Some(2));
+        let encoded = serde_json::to_vec(&file).unwrap();
+        let decoded: SceneFile = serde_json::from_slice(&encoded).unwrap();
+        decoded.validate().unwrap();
+        let assets = decoded
+            .groups
+            .iter()
+            .filter_map(|group| {
+                group.path.as_ref().map(|path| {
+                    let path = PathBuf::from(path);
+                    (
+                        path.clone(),
+                        vec![
+                            RenderObject::new(Transform::default(), MeshId(0), MaterialId(0))
+                                .with_asset_source(path, 0),
+                        ],
+                    )
+                })
+            })
+            .collect();
+        let rebuilt = build_world(&decoded, 1, 1, assets).unwrap();
+        let rebuilt_parent = rebuilt.model_group_ids()[0];
+        let rebuilt_child = rebuilt.model_group_ids()[1];
+        let rebuilt_gltf_node = rebuilt.model_group_ids()[2];
+        assert!(
+            rebuilt
+                .model_group(rebuilt_parent)
+                .unwrap()
+                .source_path
+                .is_none()
+        );
+        assert_eq!(
+            rebuilt.model_group_parent(rebuilt_child),
+            Some(rebuilt_parent)
+        );
+        assert_eq!(rebuilt.gltf_node_index(rebuilt_gltf_node), Some(4));
+        assert_eq!(
+            rebuilt.model_group_parent(rebuilt_gltf_node),
+            Some(rebuilt_child)
+        );
+        assert_eq!(rebuilt.objects()[0].parent_node(), Some(rebuilt_gltf_node));
+
+        let mut cyclic = decoded;
+        cyclic.groups[0].parent_group = Some(1);
+        assert!(
+            cyclic
+                .validate()
+                .unwrap_err()
+                .contains("hierarchy contains a cycle")
+        );
+        fs::remove_dir_all(scene_directory).unwrap();
+    }
+
+    #[test]
+    fn migrates_version_four_scenes_without_parent_fields() {
+        let scene_directory = std::env::temp_dir().join(format!(
+            "bone-smashing-v4-scene-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&scene_directory).unwrap();
+        let scene_path = scene_directory.join("legacy.bse-scene");
+        fs::write(&scene_path, br#"{"version":4,"objects":[]}"#).unwrap();
+
+        let loaded = load_scene(&scene_path).unwrap();
+
+        assert_eq!(loaded.file.version, SCENE_FORMAT_VERSION);
+        assert!(loaded.file.groups.is_empty());
+        fs::remove_dir_all(scene_directory).unwrap();
+    }
+
+    #[test]
+    fn migrates_version_five_scenes_with_model_paths() {
+        let scene_directory = std::env::temp_dir().join(format!(
+            "bone-smashing-v5-scene-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&scene_directory).unwrap();
+        let model_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("models")
+            .join("sample.obj");
+        fs::copy(model_path, scene_directory.join("sample.obj")).unwrap();
+        let scene_path = scene_directory.join("legacy.bse-scene");
+        fs::write(
+            &scene_path,
+            br#"{"version":5,"groups":[{"name":"Model","path":"sample.obj","parent_group":null,"position":[0,0,0],"rotation":[0,0,0,1],"scale":[1,1,1]}],"objects":[]}"#,
+        )
+        .unwrap();
+
+        let loaded = load_scene(&scene_path).unwrap();
+
+        assert_eq!(loaded.file.version, SCENE_FORMAT_VERSION);
+        assert!(
+            loaded.file.groups[0]
+                .path
+                .as_deref()
+                .unwrap()
+                .ends_with("sample.obj")
         );
         fs::remove_dir_all(scene_directory).unwrap();
     }
@@ -1063,6 +1342,7 @@ mod tests {
                     material_id: 5,
                 },
                 model_group: None,
+                parent_node: None,
                 name: String::new(),
                 position: [1.0, 2.0, 3.0],
                 rotation: Quat::IDENTITY.to_array(),
@@ -1107,6 +1387,7 @@ mod tests {
                 material_id: 0,
             },
             model_group: None,
+            parent_node: None,
             name: String::new(),
             position: [f32::NAN, 0.0, 0.0],
             rotation: Quat::IDENTITY.to_array(),
@@ -1127,6 +1408,7 @@ mod tests {
                     material_id: 0,
                 },
                 model_group: Some(0),
+                parent_node: None,
                 name: String::new(),
                 position: Vec3::ZERO.to_array(),
                 rotation: Quat::IDENTITY.to_array(),

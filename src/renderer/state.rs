@@ -67,7 +67,7 @@ pub struct LightUniform {
     pub ambient_bottom: [f32; 4],
 }
 
-const SHADOW_MAP_SIZE: u32 = 2048;
+const SHADOW_MAP_SIZE: u32 = 3072;
 
 fn scaled_render_dimension(dimension: u32, scale: f32) -> u32 {
     ((dimension as f32 * scale).round() as u32).max(1)
@@ -395,14 +395,14 @@ fn create_shadow_view(device: &wgpu::Device) -> wgpu::TextureView {
 fn directional_shadow_matrix(ray_direction: Vec3) -> Mat4 {
     let center = Vec3::new(0.0, 1.5, 0.0);
     let ray_direction = ray_direction.normalize();
-    let eye = center - ray_direction * 25.0;
+    let eye = center - ray_direction * 20.0;
     let up = if ray_direction.dot(Vec3::Y).abs() > 0.98 {
         Vec3::X
     } else {
         Vec3::Y
     };
     let view = crate::math::look_at_rh(eye, center, up);
-    crate::math::orthographic_rh(-18.0, 18.0, -18.0, 18.0, 0.1, 60.0) * view
+    crate::math::orthographic_rh(-7.5, 7.5, -7.5, 7.5, 1.0, 40.0) * view
 }
 
 const INITIAL_INSTANCE_CAPACITY: usize = 256;
@@ -644,8 +644,8 @@ impl Renderer {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::FilterMode::Nearest,
             compare: Some(wgpu::CompareFunction::LessEqual),
             ..Default::default()

@@ -4,6 +4,17 @@ use crate::renderer::mesh::{UvSetsVertex, Vertex};
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 pub const SHADER: &str = r#"
+const SHADOW_PCF_OFFSETS = array<vec2<f32>, 8>(
+    vec2<f32>(-0.326, -0.406),
+    vec2<f32>(-0.840, -0.074),
+    vec2<f32>(-0.696, 0.457),
+    vec2<f32>(-0.203, 0.621),
+    vec2<f32>(0.962, -0.195),
+    vec2<f32>(0.473, -0.480),
+    vec2<f32>(0.519, 0.767),
+    vec2<f32>(0.185, -0.893),
+);
+
 struct Camera {
     view_proj: mat4x4<f32>,
     inverse_view_proj: mat4x4<f32>,
@@ -340,8 +351,24 @@ fn get_local_position(v: VsIn, instance: InstanceInput) -> vec4<f32> {
     return local_position;
 }
 
-fn shadow_visibility(world_pos: vec3<f32>, normal: vec3<f32>, light_dir: vec3<f32>) -> f32 {
-    let light_clip = shadow_matrix * vec4<f32>(world_pos, 1.0);
+fn get_face_normal(world_pos: vec3<f32>, shading_normal: vec3<f32>) -> vec3<f32> {
+    var face_normal = safe_normalize(cross(dpdx(world_pos), dpdy(world_pos)), shading_normal);
+    if dot(face_normal, shading_normal) < 0.0 {
+        face_normal = -face_normal;
+    }
+    return face_normal;
+}
+
+fn shadow_visibility(
+    world_pos: vec3<f32>,
+    offset_normal: vec3<f32>,
+    face_normal: vec3<f32>,
+    light_dir: vec3<f32>,
+) -> f32 {
+    let normal_light = clamp(dot(face_normal, light_dir), 0.0, 1.0);
+    let offset_normal_light = clamp(dot(offset_normal, light_dir), 0.0, 1.0);
+    let normal_bias = 0.024 * (1.0 - offset_normal_light);
+    let light_clip = shadow_matrix * vec4<f32>(world_pos + offset_normal * normal_bias, 1.0);
     let projected = light_clip.xyz / light_clip.w;
     let uv = projected.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
     if projected.z <= 0.0 || projected.z >= 1.0
@@ -350,19 +377,17 @@ fn shadow_visibility(world_pos: vec3<f32>, normal: vec3<f32>, light_dir: vec3<f3
     }
 
     let texel = 1.0 / vec2<f32>(textureDimensions(t_shadow));
-    let bias = max(0.0008 * (1.0 - dot(normal, light_dir)), 0.00025);
+    let bias = max(0.0003 * (1.0 - normal_light), 0.0001);
     var visibility = 0.0;
-    for (var y = 0; y < 2; y += 1) {
-        for (var x = 0; x < 2; x += 1) {
-            visibility += textureSampleCompare(
-                t_shadow,
-                s_shadow,
-                uv + (vec2<f32>(f32(x), f32(y)) - vec2<f32>(0.5)) * texel,
-                projected.z - bias,
-            );
-        }
+    for (var index = 0u; index < 8u; index += 1u) {
+        visibility += textureSampleCompare(
+            t_shadow,
+            s_shadow,
+            uv + SHADOW_PCF_OFFSETS[index] * texel * 2.5,
+            projected.z - bias,
+        );
     }
-    return visibility * 0.25;
+    return visibility / 8.0;
 }
 
 struct VsIn {
@@ -591,7 +616,8 @@ fn fs_glass(
     if !front_facing {
         normal = -normal;
     }
-    let geometric_normal = normal;
+    let shadow_offset_normal = normal;
+    let geometric_normal = get_face_normal(v.world_pos, normal);
     normal = apply_normal_map(
         normal,
         v.world_tangent,
@@ -629,7 +655,12 @@ fn fs_glass(
     let fill_radiance = light.fill_color.rgb * light.fill_direction_intensity.w;
     var key_visibility = 1.0;
     if light.color.a > 0.5 {
-        key_visibility = shadow_visibility(v.world_pos, geometric_normal, key_dir);
+        key_visibility = shadow_visibility(
+            v.world_pos,
+            shadow_offset_normal,
+            geometric_normal,
+            key_dir,
+        );
     }
     let direct_reflection = evaluate_direct_light(
         normal,
@@ -785,7 +816,8 @@ fn fs_main(
     if !front_facing {
         normal = -normal;
     }
-    let geometric_normal = normal;
+    let shadow_offset_normal = normal;
+    let geometric_normal = get_face_normal(v.world_pos, normal);
     normal = apply_normal_map(
         normal,
         v.world_tangent,
@@ -839,7 +871,12 @@ fn fs_main(
 
     var key_visibility = 1.0;
     if light.color.a > 0.5 {
-        key_visibility = shadow_visibility(v.world_pos, geometric_normal, key_dir);
+        key_visibility = shadow_visibility(
+            v.world_pos,
+            shadow_offset_normal,
+            geometric_normal,
+            key_dir,
+        );
     }
     var radiance = evaluate_direct_light(
         normal,
@@ -1320,7 +1357,7 @@ impl RenderPipelineBundle {
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState {
-                cull_mode: Some(wgpu::Face::Front),
+                cull_mode: Some(wgpu::Face::Back),
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {

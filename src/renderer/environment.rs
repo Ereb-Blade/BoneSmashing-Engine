@@ -4,6 +4,15 @@ use std::sync::OnceLock;
 
 const DIFFUSE_IRRADIANCE_WIDTH: u32 = 128;
 const DIFFUSE_IRRADIANCE_HEIGHT: u32 = 64;
+const MAX_HDR_CHANNEL: f32 = 60_000.0;
+
+fn sanitize_hdr_channel(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, MAX_HDR_CHANNEL)
+    } else {
+        0.0
+    }
+}
 
 pub struct Environment {
     _texture: wgpu::Texture,
@@ -204,9 +213,9 @@ impl Environment {
         let mut base = Vec::with_capacity((width * height * 4) as usize);
         for pixel in rgb.chunks_exact(3) {
             base.extend_from_slice(&[
-                sanitize_hdr(pixel[0]),
-                sanitize_hdr(pixel[1]),
-                sanitize_hdr(pixel[2]),
+                sanitize_hdr_channel(pixel[0]),
+                sanitize_hdr_channel(pixel[1]),
+                sanitize_hdr_channel(pixel[2]),
                 1.0,
             ]);
         }
@@ -243,14 +252,6 @@ impl Environment {
             mip_height = next_height;
         }
         let irradiance = convolve_diffuse(&levels, width, height);
-
-        fn sanitize_hdr(value: f32) -> f32 {
-            if value.is_finite() {
-                value.clamp(0.0, 65_504.0)
-            } else {
-                0.0
-            }
-        }
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("HDR environment equirectangular texture"),
@@ -930,6 +931,16 @@ fn softbox(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hdr_channels_are_sanitized_for_rgba16float() {
+        assert_eq!(sanitize_hdr_channel(f32::NAN), 0.0);
+        assert_eq!(sanitize_hdr_channel(f32::INFINITY), 0.0);
+        assert_eq!(sanitize_hdr_channel(f32::NEG_INFINITY), 0.0);
+        assert_eq!(sanitize_hdr_channel(-1.0), 0.0);
+        assert_eq!(sanitize_hdr_channel(70_000.0), MAX_HDR_CHANNEL);
+        assert_eq!(sanitize_hdr_channel(12.5), 12.5);
+    }
 
     #[test]
     fn ggx_prefilter_preserves_a_constant_environment() {

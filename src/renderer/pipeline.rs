@@ -4,15 +4,11 @@ use crate::renderer::mesh::{UvSetsVertex, Vertex};
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 pub const SHADER: &str = r#"
-const SHADOW_PCF_OFFSETS = array<vec2<f32>, 8>(
-    vec2<f32>(-0.326, -0.406),
-    vec2<f32>(-0.840, -0.074),
-    vec2<f32>(-0.696, 0.457),
-    vec2<f32>(-0.203, 0.621),
-    vec2<f32>(0.962, -0.195),
-    vec2<f32>(0.473, -0.480),
-    vec2<f32>(0.519, 0.767),
-    vec2<f32>(0.185, -0.893),
+const SHADOW_PCF_OFFSETS = array<vec2<f32>, 4>(
+    vec2<f32>(-0.707, -0.707),
+    vec2<f32>(0.707, -0.707),
+    vec2<f32>(-0.707, 0.707),
+    vec2<f32>(0.707, 0.707),
 );
 
 struct Camera {
@@ -205,6 +201,11 @@ fn diffuse_irradiance(normal: vec3<f32>) -> vec3<f32> {
     return textureSampleLevel(t_irradiance, s_environment, environment_uv(normal), 0.0).rgb;
 }
 
+fn sanitize_hdr_color(color: vec3<f32>) -> vec3<f32> {
+    let non_nan_color = select(vec3<f32>(0.0), color, color == color);
+    return clamp(non_nan_color, vec3<f32>(0.0), vec3<f32>(60000.0));
+}
+
 fn transform_uv(uv: vec2<f32>, transform: array<vec4<f32>, 2>) -> vec2<f32> {
     return vec2<f32>(
         dot(transform[0].xy, uv) + transform[0].z,
@@ -282,17 +283,18 @@ fn vs_skybox(@builtin(vertex_index) vertex_index: u32) -> SkyboxOut {
 @fragment
 fn fs_skybox(input: SkyboxOut) -> @location(0) vec4<f32> {
     let environment = sample_environment(input.direction, 0.0);
-    return vec4<f32>(environment, 1.0);
+    return vec4<f32>(sanitize_hdr_color(environment), 1.0);
 }
 
 fn tonemap_aces(color: vec3<f32>) -> vec3<f32> {
+    let safe_color = sanitize_hdr_color(color);
     let a = 2.51;
     let b = 0.03;
     let c = 2.43;
     let d = 0.59;
     let e = 0.14;
     return clamp(
-        (color * (a * color + b)) / (color * (c * color + d) + e),
+        (safe_color * (a * safe_color + b)) / (safe_color * (c * safe_color + d) + e),
         vec3<f32>(0.0),
         vec3<f32>(1.0),
     );
@@ -322,12 +324,12 @@ fn vs_postprocess(@builtin(vertex_index) vertex_index: u32) -> PostProcessOut {
 
 @fragment
 fn fs_postprocess(input: PostProcessOut) -> @location(0) vec4<f32> {
-    let hdr = textureSample(t_postprocess, s_postprocess, input.uv).rgb;
+    let hdr = sanitize_hdr_color(textureSample(t_postprocess, s_postprocess, input.uv).rgb);
     let debug_view = u32(light.fill_color.a + 0.5);
     if debug_view >= 1u && debug_view <= 3u {
         return vec4<f32>(clamp(hdr, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
     }
-    return vec4<f32>(tonemap_aces(hdr * exp2(light.ambient_bottom.a)), 1.0);
+    return vec4<f32>(tonemap_aces(sanitize_hdr_color(hdr * exp2(light.ambient_bottom.a))), 1.0);
 }
 
 fn get_local_position(v: VsIn, instance: InstanceInput) -> vec4<f32> {
@@ -379,7 +381,7 @@ fn shadow_visibility(
     let texel = 1.0 / vec2<f32>(textureDimensions(t_shadow));
     let bias = max(0.0003 * (1.0 - normal_light), 0.0001);
     var visibility = 0.0;
-    for (var index = 0u; index < 8u; index += 1u) {
+    for (var index = 0u; index < 4u; index += 1u) {
         visibility += textureSampleCompare(
             t_shadow,
             s_shadow,
@@ -387,7 +389,7 @@ fn shadow_visibility(
             projected.z - bias,
         );
     }
-    return visibility / 8.0;
+    return visibility / 4.0;
 }
 
 struct VsIn {
@@ -626,15 +628,18 @@ fn fs_glass(
     );
     let debug_view = u32(light.fill_color.a + 0.5);
     if debug_view == 1u {
-        return vec4<f32>(normal * 0.5 + 0.5, surface_color.a);
+        return vec4<f32>(sanitize_hdr_color(normal * 0.5 + 0.5), surface_color.a);
     }
     if debug_view == 2u {
-        return surface_color;
+        return vec4<f32>(sanitize_hdr_color(surface_color.rgb), surface_color.a);
     }
     let view_dir = safe_normalize(camera.view_pos.xyz - v.world_pos, normal);
     let roughness = clamp(material.roughness * metallic_roughness.g, 0.045, 1.0);
     if debug_view == 3u {
-        return vec4<f32>(roughness, material.metallic, 0.0, surface_color.a);
+        return vec4<f32>(
+            sanitize_hdr_color(vec3<f32>(roughness, material.metallic, 0.0)),
+            surface_color.a,
+        );
     }
     let specular_texture = textureSample(t_specular, s_diffuse, specular_uv);
     let specular_color_texture = textureSample(t_specular_color, s_diffuse, specular_color_uv);
@@ -741,7 +746,7 @@ fn fs_glass(
         + direct_reflection
         + emissive;
     let coverage = select(1.0, surface_color.a, material.alpha_mode == 2u);
-    return vec4<f32>(mix(background, color, coverage), 1.0);
+    return vec4<f32>(sanitize_hdr_color(mix(background, color, coverage)), 1.0);
 }
 
 @fragment
@@ -826,15 +831,16 @@ fn fs_main(
     );
     let debug_view = u32(light.fill_color.a + 0.5);
     if debug_view == 1u {
-        return vec4<f32>(normal * 0.5 + 0.5, surface_color.a);
+        return vec4<f32>(sanitize_hdr_color(normal * 0.5 + 0.5), surface_color.a);
     }
     if debug_view == 2u {
-        return surface_color;
+        return vec4<f32>(sanitize_hdr_color(surface_color.rgb), surface_color.a);
     }
     let view_dir = safe_normalize(camera.view_pos.xyz - v.world_pos, normal);
     let metallic = clamp(material.metallic * metallic_roughness.b, 0.0, 1.0);
     var roughness = clamp(material.roughness * metallic_roughness.g, 0.045, 1.0);
     let specular_glossiness = textureSample(t_specular_color, s_diffuse, specular_color_uv);
+    let specular_texture = textureSample(t_specular, s_diffuse, specular_uv);
     if material.pbr_workflow == 1u {
         roughness = clamp(
             1.0 - (1.0 - material.roughness) * specular_glossiness.a,
@@ -843,17 +849,20 @@ fn fs_main(
         );
     }
     if debug_view == 3u {
-        return vec4<f32>(roughness, metallic, 0.0, surface_color.a);
+        return vec4<f32>(
+            sanitize_hdr_color(vec3<f32>(roughness, metallic, 0.0)),
+            surface_color.a,
+        );
     }
     if material.unlit > 0.5 {
-        return surface_color;
+        return vec4<f32>(sanitize_hdr_color(surface_color.rgb), surface_color.a);
     }
     let ior_f0 = pow((material.ior - 1.0) / (material.ior + 1.0), 2.0);
     var dielectric_f0 = vec3<f32>(ior_f0);
     var dielectric_specular_weight = clamp(
         material.specular_color_factor
-            * textureSample(t_specular_color, s_diffuse, specular_color_uv).rgb
-            * (material.specular_factor * textureSample(t_specular, s_diffuse, specular_uv).a),
+            * specular_glossiness.rgb
+            * (material.specular_factor * specular_texture.a),
         vec3<f32>(0.0),
         vec3<f32>(1.0),
     );
@@ -901,7 +910,7 @@ fn fs_main(
         specular_weight,
     );
 
-    let n_dot_v = max(dot(normal, view_dir), 0.0);
+    let n_dot_v = clamp(dot(normal, view_dir), 0.0, 1.0);
     let fresnel_roughness = (
         f0 + (max(vec3<f32>(1.0 - roughness), f0) - f0)
             * pow(1.0 - n_dot_v, 5.0)
@@ -934,22 +943,22 @@ fn fs_main(
     let specular_ambient =
         environment * (single_scatter + multiple_scatter) * env_intensity
             * clamp(
-                pow(n_dot_v + ambient_occlusion, exp2(-16.0 * roughness - 1.0))
+                pow(max(n_dot_v + ambient_occlusion, 1e-5), exp2(-16.0 * roughness - 1.0))
                     - 1.0 + ambient_occlusion,
                 0.0,
                 1.0,
             );
     if debug_view == 4u {
-        return vec4<f32>(diffuse_ambient, surface_color.a);
+        return vec4<f32>(sanitize_hdr_color(diffuse_ambient), surface_color.a);
     }
     if debug_view == 5u {
-        return vec4<f32>(specular_ambient, surface_color.a);
+        return vec4<f32>(sanitize_hdr_color(specular_ambient), surface_color.a);
     }
 
     let emissive = material.emissive_factor * material.emissive_strength
         * textureSample(t_emissive, s_diffuse, emissive_uv).rgb;
     let color = radiance + diffuse_ambient + specular_ambient + emissive;
-    return vec4<f32>(color, surface_color.a);
+    return vec4<f32>(sanitize_hdr_color(color), surface_color.a);
 }
 "#;
 
@@ -1434,7 +1443,10 @@ impl RenderPipelineBundle {
                     })],
                     compilation_options: Default::default(),
                 }),
-                primitive: wgpu::PrimitiveState::default(),
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: Some(wgpu::Face::Back),
+                    ..Default::default()
+                },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
                     depth_write_enabled,
@@ -1496,7 +1508,6 @@ impl RenderPipelineBundle {
             multiview: None,
             cache: None,
         });
-
         (
             pipeline,
             transparent_pipeline,

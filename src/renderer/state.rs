@@ -142,8 +142,8 @@ impl Default for RendererSettings {
             shadows_enabled: true,
             debug_view: 0,
             unlocked_fps: false,
-            render_scale: 1.0,
-            msaa_samples: 4,
+            render_scale: 0.75,
+            msaa_samples: 1,
         }
     }
 }
@@ -403,6 +403,38 @@ fn directional_shadow_matrix(ray_direction: Vec3) -> Mat4 {
     };
     let view = crate::math::look_at_rh(eye, center, up);
     crate::math::orthographic_rh(-7.5, 7.5, -7.5, 7.5, 1.0, 40.0) * view
+}
+
+fn mesh_in_view(mesh: &crate::renderer::mesh::Mesh, model: Mat4, view_projection: Mat4) -> bool {
+    if mesh.bounds_radius <= 0.0 {
+        return true;
+    }
+
+    let world_center = model.transform_point3(mesh.bounds_center);
+    let max_scale = model
+        .x_axis
+        .truncate()
+        .length()
+        .max(model.y_axis.truncate().length())
+        .max(model.z_axis.truncate().length());
+    let world_radius = mesh.bounds_radius * max_scale;
+    let directions = [
+        Vec3::ZERO,
+        Vec3::X,
+        -Vec3::X,
+        Vec3::Y,
+        -Vec3::Y,
+        Vec3::Z,
+        -Vec3::Z,
+    ];
+
+    directions.iter().any(|direction| {
+        let clip = view_projection * (world_center + *direction * world_radius).extend(1.0);
+        if clip.w <= 0.0 {
+            return false;
+        }
+        clip.x.abs() <= clip.w && clip.y.abs() <= clip.w && clip.z >= 0.0 && clip.z <= clip.w
+    })
 }
 
 const INITIAL_INSTANCE_CAPACITY: usize = 256;
@@ -926,9 +958,7 @@ impl Renderer {
             self.surface.configure(&self.device, &self.config);
         }
         self.settings = settings;
-        if render_scale_changed {
-            self.resize_render_targets();
-        } else if msaa_samples_changed {
+        if msaa_samples_changed {
             let shader = self
                 .device
                 .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -947,6 +977,10 @@ impl Renderer {
             self.transparent_pipeline = transparent_pipeline;
             self.glass_pipeline = glass_pipeline;
             self.skybox_pipeline = skybox_pipeline;
+        }
+        if render_scale_changed {
+            self.resize_render_targets();
+        } else if msaa_samples_changed {
             let w = scaled_render_dimension(self.config.width, settings.render_scale);
             let h = scaled_render_dimension(self.config.height, settings.render_scale);
             self.resize_msaa_targets(w, h);
@@ -1760,8 +1794,14 @@ impl Renderer {
         self.transparent_objects.clear();
         self.skin_matrices.clear();
         self.skin_matrices.push(Mat4::IDENTITY);
+        let view_projection = camera.build_view_projection_matrix();
         for (object_index, obj) in objects.iter().enumerate() {
             let model_matrix = world.group_model_matrix(obj);
+            if let Some(mesh) = self.meshes.get(obj.mesh_id.0) {
+                if !mesh_in_view(mesh, model_matrix, view_projection) {
+                    continue;
+                }
+            }
             let Ok(skin_offset) = u32::try_from(self.skin_matrices.len()) else {
                 eprintln!("Не удалось отрисовать объект: превышен диапазон индексов скелета");
                 continue;
@@ -1805,7 +1845,9 @@ impl Renderer {
         self.all_instances.clear();
         self.draw_batches.clear();
 
-        for (&(mesh_id, material_id), instances) in &self.batches {
+        let mut opaque_batches: Vec<_> = self.batches.iter().collect();
+        opaque_batches.sort_by_key(|((mesh_id, material_id), _)| (mesh_id.0, material_id.0));
+        for (&(mesh_id, material_id), instances) in opaque_batches {
             if instances.is_empty() {
                 continue;
             }

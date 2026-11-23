@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use glam::Vec3;
 use wgpu::util::DeviceExt;
 
 pub(crate) const MAX_IMPORTED_TEXTURE_DIMENSION: u32 = 4096;
@@ -591,6 +592,8 @@ pub struct Mesh {
     pub uv_sets_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
     pub num_indices: u32,
+    pub bounds_center: Vec3,
+    pub bounds_radius: f32,
 }
 
 impl Mesh {
@@ -635,6 +638,22 @@ impl Mesh {
         indices: &[u32],
         label: Option<&str>,
     ) -> Self {
+        let bounds_center = if vertices.is_empty() {
+            Vec3::ZERO
+        } else {
+            let mut min = Vec3::splat(f32::MAX);
+            let mut max = Vec3::splat(f32::MIN);
+            for vertex in vertices {
+                let position = Vec3::from(vertex.position);
+                min = min.min(position);
+                max = max.max(position);
+            }
+            (min + max) * 0.5
+        };
+        let bounds_radius = vertices
+            .iter()
+            .map(|vertex| Vec3::from(vertex.position).distance(bounds_center))
+            .fold(0.0_f32, f32::max);
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: label.map(|l| format!("{l} vertex buffer")).as_deref(),
             contents: bytemuck::cast_slice(vertices),
@@ -681,6 +700,8 @@ impl Mesh {
             uv_sets_buffer,
             index_buffer,
             num_indices: indices.len() as u32,
+            bounds_center,
+            bounds_radius,
         }
     }
 

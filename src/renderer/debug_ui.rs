@@ -1925,6 +1925,26 @@ impl DebugUi {
                                             "Acquire {:.2} ms  |  Submit {:.2} ms",
                                             timings.acquire_cpu_ms, timings.encode_submit_cpu_ms
                                         ));
+                                        let gpu_text = timings
+                                            .gpu_frame_ms
+                                            .map_or("unavailable".to_owned(), |time| {
+                                                format!("{time:.2} ms")
+                                            });
+                                        ui.small(format!(
+                                            "GPU: {gpu_text} | Draw calls: {}",
+                                            timings.draw_calls
+                                        ));
+                                        ui.small(format!(
+                                            "Triangles: {} | Meshes: {} | Materials: {}",
+                                            timings.triangle_count,
+                                            timings.active_meshes,
+                                            timings.active_materials
+                                        ));
+                                        ui.small(format!(
+                                            "Batches: {} | Instances: {}",
+                                            timings.render_batches,
+                                            timings.active_instances
+                                        ));
                                     });
                                 ui.collapsing("Render settings", |ui| {
                                     ui.add(

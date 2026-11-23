@@ -10,10 +10,11 @@ mod scene;
 use app::App;
 use winit::event_loop::{ControlFlow, EventLoop};
 
-fn main() {
-    let event_loop = EventLoop::new().unwrap();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut app = App::new();
-    event_loop.run_app(&mut app).unwrap();
+    event_loop.run_app(&mut app)?;
+    Ok(())
 }

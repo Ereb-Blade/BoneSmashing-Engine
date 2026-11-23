@@ -128,6 +128,13 @@ pub struct RenderTimings {
     pub scene_cpu_ms: f32,
     pub acquire_cpu_ms: f32,
     pub encode_submit_cpu_ms: f32,
+    pub gpu_frame_ms: Option<f32>,
+    pub draw_calls: usize,
+    pub triangle_count: usize,
+    pub active_meshes: usize,
+    pub active_materials: usize,
+    pub render_batches: usize,
+    pub active_instances: usize,
 }
 
 impl Default for RendererSettings {
@@ -234,7 +241,7 @@ fn create_scene_color_texture(
     copy_usage: wgpu::TextureUsages,
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("opaque scene color"),
+        label: Some("scene color snapshot"),
         size: wgpu::Extent3d {
             width: w,
             height: h,
@@ -409,32 +416,53 @@ fn mesh_in_view(mesh: &crate::renderer::mesh::Mesh, model: Mat4, view_projection
     if mesh.bounds_radius <= 0.0 {
         return true;
     }
-
     let world_center = model.transform_point3(mesh.bounds_center);
-    let max_scale = model
-        .x_axis
-        .truncate()
-        .length()
-        .max(model.y_axis.truncate().length())
-        .max(model.z_axis.truncate().length());
-    let world_radius = mesh.bounds_radius * max_scale;
-    let directions = [
-        Vec3::ZERO,
-        Vec3::X,
-        -Vec3::X,
-        Vec3::Y,
-        -Vec3::Y,
-        Vec3::Z,
-        -Vec3::Z,
+    let conservative_scale = (model.x_axis.truncate().length_squared()
+        + model.y_axis.truncate().length_squared()
+        + model.z_axis.truncate().length_squared())
+    .sqrt();
+    sphere_in_view(
+        world_center,
+        mesh.bounds_radius * conservative_scale,
+        view_projection,
+    )
+}
+
+fn sphere_in_view(center: Vec3, radius: f32, view_projection: Mat4) -> bool {
+    let columns = view_projection.to_cols_array_2d();
+    let row = |index: usize| {
+        glam::Vec4::new(
+            columns[0][index],
+            columns[1][index],
+            columns[2][index],
+            columns[3][index],
+        )
+    };
+    let row0 = row(0);
+    let row1 = row(1);
+    let row2 = row(2);
+    let row3 = row(3);
+    let mut planes = [
+        row3 + row0,
+        row3 - row0,
+        row3 + row1,
+        row3 - row1,
+        row2,
+        row3 - row2,
     ];
 
-    directions.iter().any(|direction| {
-        let clip = view_projection * (world_center + *direction * world_radius).extend(1.0);
-        if clip.w <= 0.0 {
-            return false;
+    for plane in &mut planes {
+        let length = plane.truncate().length();
+        if !length.is_finite() || length <= f32::EPSILON {
+            return true;
         }
-        clip.x.abs() <= clip.w && clip.y.abs() <= clip.w && clip.z >= 0.0 && clip.z <= clip.w
-    })
+        *plane /= length;
+    }
+
+    let center = center.extend(1.0);
+    planes
+        .into_iter()
+        .all(|plane| plane.dot(center) >= -(radius))
 }
 
 const INITIAL_INSTANCE_CAPACITY: usize = 256;
@@ -442,6 +470,35 @@ const INITIAL_SKIN_MATRIX_CAPACITY: usize = 256;
 type DrawBatch = (MeshId, MaterialId, std::ops::Range<u32>, bool);
 type TransparentObject = (f32, usize, MeshId, MaterialId, InstanceRaw);
 type ShadowBatch = (MeshId, MaterialId, std::ops::Range<u32>);
+
+fn transparent_depth(world_center: Vec3, camera_eye: Vec3, camera_forward: Vec3) -> f32 {
+    (world_center - camera_eye).dot(camera_forward)
+}
+
+fn sort_transparent_objects(objects: &mut [TransparentObject]) {
+    objects.sort_unstable_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+}
+
+fn should_prepare_instance(camera_visible: bool, casts_shadow: bool) -> bool {
+    camera_visible || casts_shadow
+}
+
+fn uses_glass_pipeline(transmission_factor: f32) -> bool {
+    transmission_factor > 0.0
+}
+
+fn is_transparent_material(alpha_mode: u32, transmission_factor: f32) -> bool {
+    alpha_mode == 2 || uses_glass_pipeline(transmission_factor)
+}
+
+fn material_casts_shadow(transmission_factor: f32) -> bool {
+    !uses_glass_pipeline(transmission_factor)
+}
 
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -463,6 +520,8 @@ pub struct Renderer {
     pub materials: Vec<Material>,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
+    shadow_instance_buffer: wgpu::Buffer,
+    shadow_instance_capacity: usize,
     camera_buffer: wgpu::Buffer,
     _light_buffer: wgpu::Buffer,
     shared_bind_group: wgpu::BindGroup,
@@ -491,10 +550,15 @@ pub struct Renderer {
     missing_mesh_warnings: HashSet<MeshId>,
     missing_material_warnings: HashSet<MaterialId>,
     batches: HashMap<(MeshId, MaterialId), Vec<InstanceRaw>>,
+    shadow_batches: HashMap<(MeshId, MaterialId), Vec<InstanceRaw>>,
     transparent_objects: Vec<TransparentObject>,
     skin_matrices: Vec<Mat4>,
     all_instances: Vec<InstanceRaw>,
+    shadow_instances: Vec<InstanceRaw>,
     draw_batches: Vec<DrawBatch>,
+    shadow_draw_batches: Vec<ShadowBatch>,
+    active_mesh_ids: HashSet<MeshId>,
+    active_material_ids: HashSet<MaterialId>,
     cached_shadow_instances: Vec<InstanceRaw>,
     cached_shadow_skin_matrices: Vec<Mat4>,
     cached_shadow_batches: Vec<ShadowBatch>,
@@ -538,10 +602,12 @@ fn create_environment_bind_group(
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>) -> Self {
+    pub async fn new(window: Arc<Window>) -> Result<Self, String> {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
-        let surface = instance.create_surface(window.clone()).unwrap();
+        let surface = instance
+            .create_surface(window.clone())
+            .map_err(|error| format!("Could not create window surface: {error}"))?;
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -550,7 +616,7 @@ impl Renderer {
                 force_fallback_adapter: false,
             })
             .await
-            .expect("нет подходящего GPU-адаптера");
+            .map_err(|error| format!("Could not find a suitable GPU adapter: {error:?}"))?;
 
         let mut device_descriptor = wgpu::DeviceDescriptor::default();
         let adapter_features = adapter.features();
@@ -561,7 +627,7 @@ impl Renderer {
         let (device, queue) = adapter
             .request_device(&device_descriptor)
             .await
-            .expect("не удалось создать device");
+            .map_err(|error| format!("Could not create GPU device: {error}"))?;
         let supported_msaa_samples = supported_msaa_sample_counts(&adapter);
         let mut settings = RendererSettings::default();
         if !supported_msaa_samples.contains(&settings.msaa_samples) {
@@ -602,14 +668,14 @@ impl Renderer {
             config.width,
             config.height,
             HDR_FORMAT,
-            wgpu::TextureUsages::COPY_SRC,
+            wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
         );
         let (hdr_output_texture, hdr_output_view) = create_scene_color_texture(
             &device,
             config.width,
             config.height,
             HDR_FORMAT,
-            wgpu::TextureUsages::COPY_DST,
+            wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
         );
 
         let camera_uniform = CameraUniform::new();
@@ -715,7 +781,7 @@ impl Renderer {
             },
             Some("dark grey floor"),
         )
-        .expect("не удалось загрузить текстуру");
+        .map_err(|error| format!("Could not create default material: {error}"))?;
 
         let red_material = Material::solid_color(
             &device,
@@ -810,6 +876,13 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let shadow_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shadow instance buffer"),
+            size: (INITIAL_INSTANCE_CAPACITY * std::mem::size_of::<InstanceRaw>())
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let mut renderer = Self {
             surface,
@@ -831,6 +904,8 @@ impl Renderer {
             materials,
             instance_buffer,
             instance_capacity: INITIAL_INSTANCE_CAPACITY,
+            shadow_instance_buffer,
+            shadow_instance_capacity: INITIAL_INSTANCE_CAPACITY,
             camera_buffer,
             _light_buffer: light_buffer,
             shared_bind_group,
@@ -859,10 +934,15 @@ impl Renderer {
             missing_mesh_warnings: HashSet::new(),
             missing_material_warnings: HashSet::new(),
             batches: HashMap::new(),
+            shadow_batches: HashMap::new(),
             transparent_objects: Vec::new(),
             skin_matrices: Vec::with_capacity(INITIAL_SKIN_MATRIX_CAPACITY),
             all_instances: Vec::new(),
+            shadow_instances: Vec::new(),
             draw_batches: Vec::new(),
+            shadow_draw_batches: Vec::new(),
+            active_mesh_ids: HashSet::new(),
+            active_material_ids: HashSet::new(),
             cached_shadow_instances: Vec::new(),
             cached_shadow_skin_matrices: Vec::new(),
             cached_shadow_batches: Vec::new(),
@@ -872,7 +952,7 @@ impl Renderer {
             environment_load: None,
         };
         renderer.start_initial_environment_load();
-        renderer
+        Ok(renderer)
     }
 
     pub fn resize(&mut self, w: u32, h: u32) {
@@ -894,7 +974,7 @@ impl Renderer {
             w,
             h,
             HDR_FORMAT,
-            wgpu::TextureUsages::COPY_SRC,
+            wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
         );
         let (scene_color_sampler, scene_color_bind_group) = create_scene_color_bind_group(
             &self.device,
@@ -906,7 +986,7 @@ impl Renderer {
             w,
             h,
             HDR_FORMAT,
-            wgpu::TextureUsages::COPY_DST,
+            wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
         );
         let (postprocess_sampler, postprocess_bind_group) = create_scene_color_bind_group(
             &self.device,
@@ -1791,16 +1871,37 @@ impl Renderer {
         for instances in self.batches.values_mut() {
             instances.clear();
         }
+        for instances in self.shadow_batches.values_mut() {
+            instances.clear();
+        }
         self.transparent_objects.clear();
         self.skin_matrices.clear();
         self.skin_matrices.push(Mat4::IDENTITY);
         let view_projection = camera.build_view_projection_matrix();
+        let camera_forward = Vec3::new(
+            camera.yaw.cos() * camera.pitch.cos(),
+            camera.pitch.sin(),
+            camera.yaw.sin() * camera.pitch.cos(),
+        )
+        .normalize();
         for (object_index, obj) in objects.iter().enumerate() {
-            let model_matrix = world.group_model_matrix(obj);
-            if let Some(mesh) = self.meshes.get(obj.mesh_id.0) {
-                if !mesh_in_view(mesh, model_matrix, view_projection) {
-                    continue;
-                }
+            let Some(object_id) = world.object_id_at(object_index) else {
+                continue;
+            };
+            let model_matrix = world
+                .group_model_matrix_for_id(object_id)
+                .unwrap_or_else(|| obj.model_matrix());
+            let mesh = self.meshes.get(obj.mesh_id.0);
+            let camera_visible =
+                mesh.is_none_or(|mesh| mesh_in_view(mesh, model_matrix, view_projection));
+            let material = self.materials.get(obj.material_id.0);
+            let is_transparent = material.is_some_and(|material| {
+                is_transparent_material(material.alpha_mode, material.params.transmission_factor)
+            });
+            let casts_shadow = material
+                .is_some_and(|material| material_casts_shadow(material.params.transmission_factor));
+            if !should_prepare_instance(camera_visible, casts_shadow) {
+                continue;
             }
             let Ok(skin_offset) = u32::try_from(self.skin_matrices.len()) else {
                 eprintln!("Не удалось отрисовать объект: превышен диапазон индексов скелета");
@@ -1812,17 +1913,21 @@ impl Renderer {
             };
             self.skin_matrices.extend_from_slice(obj.skin_matrices());
             let instance = InstanceRaw::from_model(model_matrix, skin_offset, skin_count);
-            if self
-                .materials
-                .get(obj.material_id.0)
-                .is_some_and(|material| {
-                    material.alpha_mode == 2 || material.params.transmission_factor > 0.0
-                })
-            {
-                let position = model_matrix.transform_point3(glam::Vec3::ZERO);
-                let distance_squared = position.distance_squared(camera.eye);
+            if casts_shadow {
+                self.shadow_batches
+                    .entry((obj.mesh_id, obj.material_id))
+                    .or_default()
+                    .push(instance);
+            }
+            if !camera_visible {
+                continue;
+            }
+            if is_transparent {
+                let local_center = mesh.map_or(Vec3::ZERO, |mesh| mesh.bounds_center);
+                let world_center = model_matrix.transform_point3(local_center);
+                let view_depth = transparent_depth(world_center, camera.eye, camera_forward);
                 self.transparent_objects.push((
-                    distance_squared,
+                    view_depth,
                     object_index,
                     obj.mesh_id,
                     obj.material_id,
@@ -1835,15 +1940,25 @@ impl Renderer {
                     .push(instance);
             }
         }
-        self.transparent_objects.sort_unstable_by(|left, right| {
-            right
-                .0
-                .total_cmp(&left.0)
-                .then_with(|| left.1.cmp(&right.1))
-        });
+        sort_transparent_objects(&mut self.transparent_objects);
 
         self.all_instances.clear();
+        self.shadow_instances.clear();
         self.draw_batches.clear();
+        self.shadow_draw_batches.clear();
+
+        let mut shadow_batches: Vec<_> = self.shadow_batches.iter().collect();
+        shadow_batches.sort_by_key(|((mesh_id, material_id), _)| (mesh_id.0, material_id.0));
+        for (&(mesh_id, material_id), instances) in shadow_batches {
+            if instances.is_empty() {
+                continue;
+            }
+            let start = self.shadow_instances.len() as u32;
+            let count = instances.len() as u32;
+            self.shadow_instances.extend_from_slice(instances);
+            self.shadow_draw_batches
+                .push((mesh_id, material_id, start..start + count));
+        }
 
         let mut opaque_batches: Vec<_> = self.batches.iter().collect();
         opaque_batches.sort_by_key(|((mesh_id, material_id), _)| (mesh_id.0, material_id.0));
@@ -1864,6 +1979,31 @@ impl Renderer {
             self.draw_batches
                 .push((mesh_id, material_id, start..start + 1, true));
         }
+
+        let visible_instance_count = self.all_instances.len();
+
+        self.active_mesh_ids.clear();
+        self.active_material_ids.clear();
+        for (mesh_id, material_id, _, _) in &self.draw_batches {
+            self.active_mesh_ids.insert(*mesh_id);
+            self.active_material_ids.insert(*material_id);
+        }
+        let triangle_count = self
+            .draw_batches
+            .iter()
+            .filter_map(|(mesh_id, _, range, _)| {
+                self.meshes
+                    .get(mesh_id.0)
+                    .map(|mesh| mesh.num_indices as usize / 3 * range.len())
+            })
+            .sum();
+        self.timings.draw_calls = self.draw_batches.len();
+        self.timings.triangle_count = triangle_count;
+        self.timings.active_meshes = self.active_mesh_ids.len();
+        self.timings.active_materials = self.active_material_ids.len();
+        self.timings.render_batches = self.draw_batches.len();
+        self.timings.active_instances = visible_instance_count;
+        self.timings.gpu_frame_ms = None;
 
         let skin_buffer_bytes = self.skin_matrices.len() * std::mem::size_of::<Mat4>();
         let max_storage_binding_size =
@@ -1934,23 +2074,35 @@ impl Renderer {
         }
 
         let shadow_matrix = directional_shadow_matrix(key_direction);
-        let opaque_instance_count = self
-            .draw_batches
-            .iter()
-            .filter(|batch| !batch.3)
-            .map(|batch| batch.2.end as usize - batch.2.start as usize)
-            .sum::<usize>();
         let render_shadows = self.settings.shadows_enabled
             && (!self.shadow_cache_valid
                 || self.cached_shadow_matrix != shadow_matrix
-                || self.cached_shadow_instances != self.all_instances[..opaque_instance_count]
+                || self.cached_shadow_instances != self.shadow_instances
                 || self.cached_shadow_skin_matrices != self.skin_matrices
-                || !self
-                    .draw_batches
-                    .iter()
-                    .filter(|batch| !batch.3)
-                    .map(|(mesh, material, range, _)| (*mesh, *material, range.clone()))
-                    .eq(self.cached_shadow_batches.iter().cloned()));
+                || self.shadow_draw_batches != self.cached_shadow_batches);
+        if render_shadows {
+            if self.shadow_instances.len() > self.shadow_instance_capacity {
+                self.shadow_instance_capacity = self
+                    .shadow_instances
+                    .len()
+                    .checked_next_power_of_two()
+                    .unwrap_or(self.shadow_instances.len());
+                self.shadow_instance_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("shadow instance buffer"),
+                    size: (self.shadow_instance_capacity * std::mem::size_of::<InstanceRaw>())
+                        as wgpu::BufferAddress,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            if !self.shadow_instances.is_empty() {
+                self.queue.write_buffer(
+                    &self.shadow_instance_buffer,
+                    0,
+                    bytemuck::cast_slice(&self.shadow_instances),
+                );
+            }
+        }
 
         self.timings.scene_cpu_ms = scene_started.elapsed().as_secs_f32() * 1000.0;
         let acquire_started = Instant::now();
@@ -1995,12 +2147,9 @@ impl Renderer {
             });
             pass.set_pipeline(&self.shadow_pipeline);
             pass.set_bind_group(0, &self.shadow_shared_bind_group, &[]);
-            pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+            pass.set_vertex_buffer(1, self.shadow_instance_buffer.slice(..));
 
-            for (mesh_id, material_id, range, transparent) in &self.draw_batches {
-                if *transparent {
-                    continue;
-                }
+            for (mesh_id, material_id, range) in &self.shadow_draw_batches {
                 let (Some(mesh), Some(material)) = (
                     self.meshes.get(mesh_id.0),
                     self.materials.get(material_id.0),
@@ -2017,16 +2166,12 @@ impl Renderer {
             }
             self.cached_shadow_instances.clear();
             self.cached_shadow_instances
-                .extend_from_slice(&self.all_instances[..opaque_instance_count]);
+                .extend_from_slice(&self.shadow_instances);
             self.cached_shadow_skin_matrices
                 .clone_from(&self.skin_matrices);
             self.cached_shadow_batches.clear();
-            self.cached_shadow_batches.extend(
-                self.draw_batches
-                    .iter()
-                    .filter(|batch| !batch.3)
-                    .map(|(mesh, material, range, _)| (*mesh, *material, range.clone())),
-            );
+            self.cached_shadow_batches
+                .clone_from(&self.shadow_draw_batches);
             self.cached_shadow_matrix = shadow_matrix;
             self.shadow_cache_valid = true;
         }
@@ -2185,12 +2330,10 @@ impl Renderer {
 
                 match (mesh_opt, mat_opt) {
                     (Some(mesh), Some(material)) => {
-                        if material.params.transmission_factor > 0.0 {
-                            pass.set_bind_group(3, &self.scene_color_bind_group, &[]);
-                            pass.set_pipeline(&self.glass_pipeline);
-                        } else {
-                            pass.set_pipeline(&self.transparent_pipeline);
+                        if uses_glass_pipeline(material.params.transmission_factor) {
+                            continue;
                         }
+                        pass.set_pipeline(&self.transparent_pipeline);
                         pass.set_bind_group(1, &material.bind_group, &[]);
                         pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                         pass.set_vertex_buffer(2, mesh.skin_buffer.slice(..));
@@ -2219,6 +2362,97 @@ impl Renderer {
                         }
                     }
                 }
+            }
+        }
+
+        let has_glass = self
+            .draw_batches
+            .iter()
+            .any(|(_, material_id, _, transparent)| {
+                *transparent
+                    && self.materials.get(material_id.0).is_some_and(|material| {
+                        uses_glass_pipeline(material.params.transmission_factor)
+                    })
+            });
+        if has_glass {
+            // Glass must sample the opaque scene plus alpha-blended cabin geometry.
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self._hdr_output_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self._scene_color_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: scaled_render_dimension(self.config.width, self.settings.render_scale),
+                    height: scaled_render_dimension(self.config.height, self.settings.render_scale),
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            let (color_view, resolve_target) = if multisampled {
+                (
+                    self.msaa_view
+                        .as_ref()
+                        .expect("MSAA color target exists for multisampled rendering"),
+                    Some(&self.hdr_output_view),
+                )
+            } else {
+                (&self.hdr_output_view, None)
+            };
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("glass refraction pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: color_view,
+                    resolve_target,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_bind_group(0, &self.shared_bind_group, &[]);
+            pass.set_bind_group(2, &self.environment_bind_group, &[]);
+            pass.set_bind_group(3, &self.scene_color_bind_group, &[]);
+            pass.set_pipeline(&self.glass_pipeline);
+            pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+
+            for (mesh_id, material_id, range, transparent) in &self.draw_batches {
+                if !transparent {
+                    continue;
+                }
+                let (Some(mesh), Some(material)) = (
+                    self.meshes.get(mesh_id.0),
+                    self.materials.get(material_id.0),
+                ) else {
+                    continue;
+                };
+                if !uses_glass_pipeline(material.params.transmission_factor) {
+                    continue;
+                }
+                pass.set_bind_group(1, &material.bind_group, &[]);
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(2, mesh.skin_buffer.slice(..));
+                pass.set_vertex_buffer(3, mesh.tangent_buffer.slice(..));
+                pass.set_vertex_buffer(4, mesh.uv_sets_buffer.slice(..));
+                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.num_indices, 0, range.clone());
             }
         }
 
@@ -2256,6 +2490,53 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transparent_sort_uses_camera_depth_instead_of_radial_distance() {
+        let camera_eye = Vec3::ZERO;
+        let camera_forward = Vec3::X;
+        let near_off_axis = Vec3::new(2.0, 100.0, 0.0);
+        let far_on_axis = Vec3::new(10.0, 0.0, 0.0);
+        let instance = InstanceRaw::from_model(Mat4::IDENTITY, 0, 0);
+        let mut objects = vec![
+            (
+                transparent_depth(near_off_axis, camera_eye, camera_forward),
+                0,
+                MeshId(0),
+                MaterialId(0),
+                instance,
+            ),
+            (
+                transparent_depth(far_on_axis, camera_eye, camera_forward),
+                1,
+                MeshId(1),
+                MaterialId(1),
+                instance,
+            ),
+        ];
+
+        sort_transparent_objects(&mut objects);
+
+        assert_eq!(objects[0].1, 1);
+        assert_eq!(objects[1].1, 0);
+    }
+
+    #[test]
+    fn offscreen_opaque_objects_are_still_prepared_for_shadow_pass() {
+        assert!(should_prepare_instance(false, true));
+        assert!(should_prepare_instance(true, false));
+        assert!(!should_prepare_instance(false, false));
+    }
+
+    #[test]
+    fn alpha_blended_opaque_materials_cast_cutout_shadows_but_transmission_does_not() {
+        assert!(material_casts_shadow(0.0));
+        assert!(!material_casts_shadow(0.5));
+        assert!(is_transparent_material(2, 0.0));
+        assert!(is_transparent_material(0, 0.5));
+        assert!(uses_glass_pipeline(0.5));
+        assert!(!uses_glass_pipeline(0.0));
+    }
 
     #[test]
     fn light_uniform_matches_wgsl_layout() {
@@ -2307,6 +2588,102 @@ mod tests {
         assert!(ndc.x.abs() < 1e-5);
         assert!(ndc.y.abs() < 1e-5);
         assert!((0.0..1.0).contains(&ndc.z));
+    }
+
+    #[test]
+    fn frustum_culling_keeps_large_scene_mesh_at_all_camera_yaws() {
+        let view_distance = 20.0;
+        let proj = crate::math::perspective_rh(
+            45.0_f32.to_radians(),
+            16.0 / 9.0,
+            crate::config::Z_NEAR,
+            crate::config::Z_FAR,
+        );
+
+        for step in 0..360 {
+            let yaw = (step as f32).to_radians();
+            let eye = Vec3::new(yaw.sin() * view_distance, 4.0, yaw.cos() * view_distance);
+            let forward = Vec3::ZERO - eye;
+            let view = crate::math::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
+            let _ = forward;
+            assert!(
+                sphere_in_view(Vec3::ZERO, 12.0, proj * view),
+                "large mesh was culled at yaw {step}"
+            );
+        }
+    }
+
+    #[test]
+    fn frustum_culling_uses_wgpu_zero_to_one_depth_range() {
+        let projection = crate::math::perspective_rh(
+            45.0_f32.to_radians(),
+            1.0,
+            crate::config::Z_NEAR,
+            crate::config::Z_FAR,
+        );
+        let view = crate::math::look_at_rh(Vec3::ZERO, Vec3::X, Vec3::Y);
+        let view_projection = projection * view;
+
+        assert!(!sphere_in_view(
+            Vec3::new(0.05, 0.0, 0.0),
+            0.01,
+            view_projection
+        ));
+        assert!(sphere_in_view(
+            Vec3::new(0.12, 0.0, 0.0),
+            0.03,
+            view_projection
+        ));
+        assert!(!sphere_in_view(
+            Vec3::new(1001.0, 0.0, 0.0),
+            0.1,
+            view_projection
+        ));
+        assert!(sphere_in_view(
+            Vec3::new(999.95, 0.0, 0.0),
+            0.1,
+            view_projection
+        ));
+    }
+
+    #[test]
+    fn default_floor_bounds_remain_visible_while_camera_rotates() {
+        let projection = crate::math::perspective_rh(
+            45.0_f32.to_radians(),
+            16.0 / 9.0,
+            crate::config::Z_NEAR,
+            crate::config::Z_FAR,
+        );
+        let eye = Vec3::new(0.0, 2.0, 6.0);
+        for step in 0..360 {
+            let yaw = (step as f32).to_radians();
+            let forward = Vec3::new(yaw.cos(), -0.2, yaw.sin()).normalize();
+            let view = crate::math::look_at_rh(eye, eye + forward, Vec3::Y);
+            assert!(
+                sphere_in_view(Vec3::new(0.0, -1.0, 0.0), 15.0, projection * view),
+                "default floor bounds were culled at yaw {step}"
+            );
+        }
+    }
+
+    #[test]
+    fn glass_sphere_bounds_remain_visible_when_camera_tracks_it() {
+        let projection = crate::math::perspective_rh(
+            45.0_f32.to_radians(),
+            16.0 / 9.0,
+            crate::config::Z_NEAR,
+            crate::config::Z_FAR,
+        );
+        let sphere_center = Vec3::new(2.0, -0.32, 0.0);
+        for step in 0..360 {
+            let angle = (step as f32).to_radians();
+            let eye = sphere_center + Vec3::new(angle.cos(), 0.0, angle.sin()) * 6.0;
+            let view = crate::math::look_at_rh(eye, sphere_center, Vec3::Y);
+            assert!(
+                sphere_in_view(sphere_center, 0.68, projection * view),
+                "glass sphere was culled at camera angle {step}"
+            );
+        }
     }
 
     #[test]

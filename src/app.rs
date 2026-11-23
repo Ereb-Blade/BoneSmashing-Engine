@@ -195,18 +195,18 @@ impl App {
                     Transform::from_translation(position),
                 );
                 let node_ids = create_gltf_node_groups(world, group, &model.node_hierarchy)?;
-                if !model.animations.is_empty() {
-                    if let Some(group) = world.model_group_mut(group) {
-                        group.animation_clips = model
-                            .animations
-                            .iter()
-                            .map(|animation| ModelAnimationClip {
-                                name: animation.name.clone(),
-                                duration: animation.duration,
-                            })
-                            .collect();
-                        group.animation = Some(ModelAnimationPlayback::default());
-                    }
+                if !model.animations.is_empty()
+                    && let Some(group) = world.model_group_mut(group)
+                {
+                    group.animation_clips = model
+                        .animations
+                        .iter()
+                        .map(|animation| ModelAnimationClip {
+                            name: animation.name.clone(),
+                            duration: animation.duration,
+                        })
+                        .collect();
+                    group.animation = Some(ModelAnimationPlayback::default());
                 }
                 for (instance_index, instance) in model.instances.iter().enumerate() {
                     let node_id = *node_ids.get(instance.node_index).ok_or_else(|| {
@@ -579,13 +579,19 @@ impl ApplicationHandler for App {
             }
             self.last_time = Instant::now();
             self.window = Some(window.clone());
-            self.renderer = Some(pollster::block_on(Renderer::new(window.clone())));
-            if let Some(renderer) = self.renderer.as_ref() {
-                self.debug_ui = Some(DebugUi::new(
-                    &window,
-                    &renderer.device,
-                    renderer.surface_format(),
-                ));
+            match pollster::block_on(Renderer::new(window.clone())) {
+                Ok(renderer) => {
+                    self.debug_ui = Some(DebugUi::new(
+                        &window,
+                        &renderer.device,
+                        renderer.surface_format(),
+                    ));
+                    self.renderer = Some(renderer);
+                }
+                Err(error) => {
+                    eprintln!("Could not initialize renderer: {error}");
+                    event_loop.exit();
+                }
             }
 
             self.world.add_object(RenderObject::new(
@@ -771,10 +777,10 @@ impl ApplicationHandler for App {
         _device_id: DeviceId,
         event: DeviceEvent,
     ) {
-        if self.input.cursor_locked {
-            if let DeviceEvent::MouseMotion { delta } = event {
-                self.input.process_mouse_motion(delta);
-            }
+        if self.input.cursor_locked
+            && let DeviceEvent::MouseMotion { delta } = event
+        {
+            self.input.process_mouse_motion(delta);
         }
     }
 
@@ -809,10 +815,11 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 let is_pressed = event.state == ElementState::Pressed;
                 if let PhysicalKey::Code(keycode) = event.physical_key {
-                    if keycode == KeyCode::F1 && is_pressed {
-                        if let Some(debug_ui) = self.debug_ui.as_mut() {
-                            debug_ui.toggle();
-                        }
+                    if keycode == KeyCode::F1
+                        && is_pressed
+                        && let Some(debug_ui) = self.debug_ui.as_mut()
+                    {
+                        debug_ui.toggle();
                     }
                     if keycode == KeyCode::Escape && is_pressed {
                         let _ = window.set_cursor_grab(CursorGrabMode::None);

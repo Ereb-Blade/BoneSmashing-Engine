@@ -1417,62 +1417,71 @@ impl RenderPipelineBundle {
         use crate::renderer::mesh::TangentVertex;
         use crate::renderer::state::InstanceRaw;
 
-        let create_pipeline = |label, pipeline_layout, entry_point, blend, depth_write_enabled| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[
-                        Vertex::layout(),
-                        InstanceRaw::layout(),
-                        crate::renderer::mesh::SkinVertex::layout(),
-                        TangentVertex::layout(),
-                        UvSetsVertex::layout(),
-                    ],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: shader,
-                    entry_point: Some(entry_point),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: HDR_FORMAT,
-                        blend,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    cull_mode: Some(wgpu::Face::Back),
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled,
-                    depth_compare: wgpu::CompareFunction::Less,
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState {
-                    count: sample_count,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview: None,
-                cache: None,
-            })
-        };
-        let pipeline = create_pipeline("opaque pipeline", layout, "fs_main", None, true);
+        let create_pipeline =
+            |label, pipeline_layout, entry_point, blend, depth_write_enabled, cull_mode| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[
+                            Vertex::layout(),
+                            InstanceRaw::layout(),
+                            crate::renderer::mesh::SkinVertex::layout(),
+                            TangentVertex::layout(),
+                            UvSetsVertex::layout(),
+                        ],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: shader,
+                        entry_point: Some(entry_point),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: HDR_FORMAT,
+                            blend,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        cull_mode,
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: DEPTH_FORMAT,
+                        depth_write_enabled,
+                        depth_compare: wgpu::CompareFunction::Less,
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    }),
+                    multisample: wgpu::MultisampleState {
+                        count: sample_count,
+                        mask: !0,
+                        alpha_to_coverage_enabled: false,
+                    },
+                    multiview: None,
+                    cache: None,
+                })
+            };
+        let pipeline = create_pipeline(
+            "opaque pipeline",
+            layout,
+            "fs_main",
+            None,
+            true,
+            Some(wgpu::Face::Back),
+        );
         let transparent_pipeline = create_pipeline(
             "transparent pipeline",
             layout,
             "fs_main",
             Some(wgpu::BlendState::ALPHA_BLENDING),
             false,
+            None,
         );
         let glass_pipeline =
-            create_pipeline("glass pipeline", glass_layout, "fs_glass", None, false);
+            create_pipeline("glass pipeline", glass_layout, "fs_glass", None, true, None);
         let skybox_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("environment background pipeline"),
             layout: Some(layout),

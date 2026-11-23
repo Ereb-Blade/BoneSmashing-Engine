@@ -2,6 +2,7 @@ use glam::{Quat, Vec3};
 
 use crate::scene::Transform;
 use crate::scene::entity::RenderObject;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -62,6 +63,12 @@ pub struct World {
     model_group_indices: HashMap<ModelGroupId, usize>,
     next_model_group_id: usize,
     rotating_cube_id: Option<ObjectId>,
+    cached_local_group_matrices: RefCell<HashMap<ModelGroupId, glam::Mat4>>,
+    cached_world_group_matrices: RefCell<HashMap<ModelGroupId, glam::Mat4>>,
+    cached_local_object_matrices: RefCell<HashMap<ObjectId, glam::Mat4>>,
+    cached_world_object_matrices: RefCell<HashMap<ObjectId, glam::Mat4>>,
+    dirty_groups: RefCell<HashSet<ModelGroupId>>,
+    dirty_objects: RefCell<HashSet<ObjectId>>,
 }
 
 impl Default for World {
@@ -83,7 +90,82 @@ impl World {
             model_group_indices: HashMap::new(),
             next_model_group_id: 0,
             rotating_cube_id: None,
+            cached_local_group_matrices: RefCell::new(HashMap::new()),
+            cached_world_group_matrices: RefCell::new(HashMap::new()),
+            cached_local_object_matrices: RefCell::new(HashMap::new()),
+            cached_world_object_matrices: RefCell::new(HashMap::new()),
+            dirty_groups: RefCell::new(HashSet::new()),
+            dirty_objects: RefCell::new(HashSet::new()),
         }
+    }
+
+    fn group_is_descendant_of(&self, group_id: ModelGroupId, root: ModelGroupId) -> bool {
+        let mut current = Some(group_id);
+        let mut visited = 0;
+        while let Some(id) = current {
+            if id == root {
+                return true;
+            }
+            current = self.model_group_parent(id);
+            visited += 1;
+            if visited > self.model_groups.len() {
+                return false;
+            }
+        }
+        false
+    }
+
+    fn mark_group_dirty(&mut self, root: ModelGroupId) {
+        let mut stack = vec![root];
+        while let Some(group_id) = stack.pop() {
+            self.dirty_groups.borrow_mut().insert(group_id);
+            self.cached_world_group_matrices
+                .borrow_mut()
+                .remove(&group_id);
+            let object_ids: Vec<_> = self
+                .objects
+                .iter()
+                .enumerate()
+                .filter_map(|(index, object)| {
+                    let attached = object
+                        .model_group()
+                        .is_some_and(|owner| self.group_is_descendant_of(owner, group_id))
+                        || object
+                            .parent_node()
+                            .is_some_and(|node| self.group_is_descendant_of(node, group_id));
+                    attached.then(|| self.object_ids[index])
+                })
+                .collect();
+            for object_id in object_ids {
+                self.dirty_objects.borrow_mut().insert(object_id);
+                self.cached_world_object_matrices
+                    .borrow_mut()
+                    .remove(&object_id);
+            }
+            for object_id in self
+                .model_group(group_id)
+                .map(|group| group.objects.clone())
+                .unwrap_or_default()
+            {
+                self.dirty_objects.borrow_mut().insert(object_id);
+                self.cached_world_object_matrices
+                    .borrow_mut()
+                    .remove(&object_id);
+            }
+            stack.extend(
+                self.model_group_ids
+                    .iter()
+                    .copied()
+                    .filter(|&candidate| self.model_group_parent(candidate) == Some(group_id)),
+            );
+        }
+    }
+
+    fn mark_object_dirty(&mut self, object_id: ObjectId) {
+        self.dirty_objects.borrow_mut().insert(object_id);
+        self.cached_world_object_matrices
+            .borrow_mut()
+            .remove(&object_id);
     }
 
     /// Чистый метод добавления объекта без привязки к анимациям
@@ -102,6 +184,7 @@ impl World {
         self.object_indices.insert(id, self.objects.len());
         self.object_ids.push(id);
         self.objects.push(object);
+        self.mark_object_dirty(id);
         id
     }
 
@@ -145,6 +228,7 @@ impl World {
             animation: None,
             objects: Vec::new(),
         });
+        self.mark_group_dirty(id);
         id
     }
 
@@ -232,11 +316,12 @@ impl World {
         if !self.can_set_model_group_parent(child, parent) {
             return Err("Model group parent is missing or would create a cycle".to_owned());
         }
-        self.model_groups[*self
+        let index = *self
             .model_group_indices
             .get(&child)
-            .expect("validated model group must have an index")]
-        .parent = parent;
+            .expect("validated model group must have an index");
+        self.model_groups[index].parent = parent;
+        self.mark_group_dirty(child);
         Ok(())
     }
 
@@ -332,32 +417,92 @@ impl World {
     }
 
     pub fn group_model_matrix(&self, object: &RenderObject) -> glam::Mat4 {
-        object
-            .parent_node()
-            .or_else(|| object.model_group())
-            .map_or_else(
-                || object.model_matrix(),
-                |id| self.model_group_world_matrix(id) * object.model_matrix(),
-            )
+        let object_id = self
+            .objects
+            .iter()
+            .enumerate()
+            .find_map(|(index, candidate)| {
+                std::ptr::eq(candidate, object).then(|| self.object_ids[index])
+            });
+        let Some(object_id) = object_id else {
+            return object
+                .parent_node()
+                .or_else(|| object.model_group())
+                .map_or_else(
+                    || object.model_matrix(),
+                    |id| self.model_group_world_matrix(id) * object.model_matrix(),
+                );
+        };
+        self.group_model_matrix_for_id(object_id)
+            .unwrap_or_else(|| object.model_matrix())
+    }
+
+    pub fn group_model_matrix_for_id(&self, object_id: ObjectId) -> Option<glam::Mat4> {
+        let object = self.get_object(object_id)?;
+        let local_matrix = object.model_matrix();
+        let parent_node = object.parent_node().or_else(|| object.model_group());
+        let Some(parent_node) = parent_node else {
+            return Some(local_matrix);
+        };
+        let local_changed = self
+            .cached_local_object_matrices
+            .borrow()
+            .get(&object_id)
+            .is_none_or(|cached| *cached != local_matrix);
+        let matrix = self.model_group_world_matrix(parent_node) * local_matrix;
+        if !self.dirty_objects.borrow().contains(&object_id)
+            && !local_changed
+            && self
+                .cached_world_object_matrices
+                .borrow()
+                .get(&object_id)
+                .is_some_and(|cached| *cached == matrix)
+        {
+            return Some(matrix);
+        }
+        self.cached_local_object_matrices
+            .borrow_mut()
+            .insert(object_id, local_matrix);
+        self.cached_world_object_matrices
+            .borrow_mut()
+            .insert(object_id, matrix);
+        self.dirty_objects.borrow_mut().remove(&object_id);
+        Some(matrix)
     }
 
     pub fn model_group_world_matrix(&self, id: ModelGroupId) -> glam::Mat4 {
-        let mut chain = Vec::new();
-        let mut current = Some(id);
-        while let Some(group_id) = current {
-            let Some(group) = self.model_group(group_id) else {
-                return glam::Mat4::IDENTITY;
-            };
-            chain.push(group.transform.to_matrix());
-            current = group.parent;
-            if chain.len() > self.model_groups.len() {
-                return glam::Mat4::IDENTITY;
-            }
+        let Some(group) = self.model_group(id) else {
+            return glam::Mat4::IDENTITY;
+        };
+        let local = group.transform.to_matrix();
+        let local_changed = self
+            .cached_local_group_matrices
+            .borrow()
+            .get(&id)
+            .is_none_or(|cached| *cached != local);
+        let parent_world = group.parent.map_or(glam::Mat4::IDENTITY, |parent| {
+            self.model_group_world_matrix(parent)
+        });
+        let world = parent_world * local;
+        if !self.dirty_groups.borrow().contains(&id)
+            && !local_changed
+            && self
+                .cached_world_group_matrices
+                .borrow()
+                .get(&id)
+                .is_some_and(|cached| *cached == world)
+        {
+            return world;
         }
-        chain
-            .into_iter()
-            .rev()
-            .fold(glam::Mat4::IDENTITY, |parent, local| parent * local)
+
+        self.cached_local_group_matrices
+            .borrow_mut()
+            .insert(id, local);
+        self.cached_world_group_matrices
+            .borrow_mut()
+            .insert(id, world);
+        self.dirty_groups.borrow_mut().remove(&id);
+        world
     }
 
     /// Явно назначаем, какой объект должен вращаться
@@ -411,6 +556,7 @@ impl World {
         self.get_object_mut(object_id)
             .expect("validated render object must remain available")
             .set_parent_node(parent);
+        self.mark_object_dirty(object_id);
         Ok(())
     }
 
@@ -439,6 +585,7 @@ impl World {
         self.object_ids.swap_remove(index);
         if let Some(&moved_id) = self.object_ids.get(index) {
             self.object_indices.insert(moved_id, index);
+            self.mark_object_dirty(moved_id);
         }
         self.standalone_objects.retain(|&object_id| object_id != id);
         if self.rotating_cube_id == Some(id) {
@@ -449,6 +596,9 @@ impl World {
         {
             group.objects.retain(|&object_id| object_id != id);
         }
+        self.dirty_objects.borrow_mut().remove(&id);
+        self.cached_world_object_matrices.borrow_mut().remove(&id);
+        self.cached_local_object_matrices.borrow_mut().remove(&id);
         Some(removed)
     }
 
@@ -499,7 +649,11 @@ impl World {
         self.model_group_ids.swap_remove(index);
         if let Some(&moved_id) = self.model_group_ids.get(index) {
             self.model_group_indices.insert(moved_id, index);
+            self.mark_group_dirty(moved_id);
         }
+        self.dirty_groups.borrow_mut().remove(&id);
+        self.cached_local_group_matrices.borrow_mut().remove(&id);
+        self.cached_world_group_matrices.borrow_mut().remove(&id);
         Some(group)
     }
 
@@ -637,11 +791,11 @@ impl World {
     }
 
     pub fn update(&mut self, dt: f32) {
-        if let Some(cube_id) = self.rotating_cube_id {
-            if let Some(cube) = self.get_object_mut(cube_id) {
-                let rotation_delta = Quat::from_rotation_y(1.0 * dt);
-                cube.transform.rotation = rotation_delta * cube.transform.rotation;
-            }
+        if let Some(cube_id) = self.rotating_cube_id
+            && let Some(cube) = self.get_object_mut(cube_id)
+        {
+            let rotation_delta = Quat::from_rotation_y(1.0 * dt);
+            cube.transform.rotation = rotation_delta * cube.transform.rotation;
         }
     }
 
@@ -650,6 +804,9 @@ impl World {
     }
 
     pub(crate) fn objects_mut(&mut self) -> &mut [RenderObject] {
+        for &object_id in &self.object_ids.clone() {
+            self.mark_object_dirty(object_id);
+        }
         &mut self.objects
     }
 }
@@ -849,6 +1006,73 @@ mod tests {
             .transform_point3(Vec3::ZERO);
 
         assert_eq!(position, Vec3::new(10.0, 2.0, 1.0));
+    }
+
+    #[test]
+    fn parent_transform_change_propagates_to_nested_groups() {
+        let mut world = World::new();
+        let parent = world.add_empty_node(
+            "Parent",
+            Transform::from_translation(Vec3::new(10.0, 0.0, 0.0)),
+        );
+        let child = world.add_empty_node(
+            "Child",
+            Transform::from_translation(Vec3::new(0.0, 3.0, 0.0)),
+        );
+        world.set_model_group_parent(child, Some(parent)).unwrap();
+
+        let before = world.model_group_world_matrix(child);
+        world.model_group_mut(parent).unwrap().transform.position = Vec3::new(20.0, 5.0, 0.0);
+        let after = world.model_group_world_matrix(child);
+
+        assert_eq!(
+            before.transform_point3(Vec3::ZERO),
+            Vec3::new(10.0, 3.0, 0.0)
+        );
+        assert_eq!(
+            after.transform_point3(Vec3::ZERO),
+            Vec3::new(20.0, 8.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn world_matrix_cache_returns_current_matrix_without_mutation() {
+        let mut world = World::new();
+        let group = world.add_empty_node(
+            "Node",
+            Transform::from_translation(Vec3::new(1.0, 2.0, 3.0)),
+        );
+
+        let first = world.model_group_world_matrix(group);
+        let second = world.model_group_world_matrix(group);
+        world.model_group_mut(group).unwrap().transform.position = Vec3::new(4.0, 5.0, 6.0);
+        let updated = world.model_group_world_matrix(group);
+
+        assert_eq!(first, second);
+        assert_eq!(
+            updated.transform_point3(Vec3::ZERO),
+            Vec3::new(4.0, 5.0, 6.0)
+        );
+    }
+
+    #[test]
+    fn removing_parent_removes_cached_descendant_world_matrices() {
+        let mut world = World::new();
+        let parent = world.add_empty_node("Parent", Transform::default());
+        let child = world.add_empty_node("Child", Transform::from_translation(Vec3::X));
+        world.set_model_group_parent(child, Some(parent)).unwrap();
+
+        assert_eq!(
+            world
+                .model_group_world_matrix(child)
+                .transform_point3(Vec3::ZERO),
+            Vec3::X
+        );
+        world.remove_model_group(parent).unwrap();
+
+        assert!(world.model_group(parent).is_none());
+        assert!(world.model_group(child).is_none());
+        assert_eq!(world.model_group_world_matrix(child), glam::Mat4::IDENTITY);
     }
 
     #[test]

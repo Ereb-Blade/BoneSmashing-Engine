@@ -608,7 +608,7 @@ pub fn load_scene(path: &Path) -> Result<LoadedScene, String> {
     let mut file: SceneFile = serde_json::from_slice(&bytes)
         .map_err(|error| format!("Could not parse scene {}: {error}", path.display()))?;
     let legacy_scene = file.version == 1;
-    if matches!(file.version, 1 | 2 | 3 | 4 | 5 | 6) {
+    if matches!(file.version, 1..=6) {
         file.version = SCENE_FORMAT_VERSION;
     }
     file.validate()?;
@@ -703,12 +703,12 @@ pub fn load_scene(path: &Path) -> Result<LoadedScene, String> {
                 "Scene object {index} references invalid model instance {instance_index}"
             ));
         }
-        if let Some(group_id) = object.model_group {
-            if file.groups[group_id].path.as_deref() != Some(path.as_str()) {
-                return Err(format!(
-                    "Scene object {index} model does not match its parent group"
-                ));
-            }
+        if let Some(group_id) = object.model_group
+            && file.groups[group_id].path.as_deref() != Some(path.as_str())
+        {
+            return Err(format!(
+                "Scene object {index} model does not match its parent group"
+            ));
         }
     }
 

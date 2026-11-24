@@ -211,7 +211,7 @@ impl Environment {
         label: &str,
     ) -> Self {
         let mut base = Vec::with_capacity((width * height * 4) as usize);
-        for pixel in rgb.chunks_exact(3) {
+        for pixel in rgb.as_chunks::<3>().0 {
             base.extend_from_slice(&[
                 sanitize_hdr_channel(pixel[0]),
                 sanitize_hdr_channel(pixel[1]),
@@ -946,7 +946,7 @@ mod tests {
     fn ggx_prefilter_preserves_a_constant_environment() {
         let source = vec![2.0, 1.0, 0.5, 1.0];
         let filtered = prefilter_specular_level(&[source], &[(1, 1)], 4, 2, 0.8, 32);
-        for pixel in filtered.chunks_exact(4) {
+        for pixel in filtered.as_chunks::<4>().0 {
             assert!((pixel[0] - 2.0).abs() < 1e-5);
             assert!((pixel[1] - 1.0).abs() < 1e-5);
             assert!((pixel[2] - 0.5).abs() < 1e-5);
@@ -982,7 +982,7 @@ mod tests {
             irradiance.len(),
             (DIFFUSE_IRRADIANCE_WIDTH * DIFFUSE_IRRADIANCE_HEIGHT * 4) as usize
         );
-        for pixel in irradiance.chunks_exact(4) {
+        for pixel in irradiance.as_chunks::<4>().0 {
             assert!((pixel[0] - 2.0).abs() < 1e-5);
             assert!((pixel[1] - 1.0).abs() < 1e-5);
             assert!((pixel[2] - 0.5).abs() < 1e-5);

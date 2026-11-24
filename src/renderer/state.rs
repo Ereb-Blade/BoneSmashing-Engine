@@ -1,3 +1,10 @@
+#![allow(
+    clippy::large_enum_variant,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::collapsible_if
+)]
+
 use glam::{Mat4, Vec3};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -639,6 +646,9 @@ impl Renderer {
             .request_device(&device_descriptor)
             .await
             .map_err(|error| format!("Could not create GPU device: {error}"))?;
+        device.on_uncaptured_error(Box::new(|error| {
+            eprintln!("GPU uncaptured error: {:?}", error);
+        }));
         let supported_msaa_samples = supported_msaa_sample_counts(&adapter);
         let mut settings = RendererSettings::default();
         if !supported_msaa_samples.contains(&settings.msaa_samples) {
@@ -2013,7 +2023,38 @@ impl Renderer {
                     .map(|mesh| mesh.num_indices as usize / 3 * range.len())
             })
             .sum();
-        self.timings.draw_calls = self.draw_batches.len();
+        let opaque_draw_calls = self
+            .draw_batches
+            .iter()
+            .filter(|(mesh_id, material_id, _, transparent)| {
+                !transparent
+                    && self.meshes.get(mesh_id.0).is_some()
+                    && self.materials.get(material_id.0).is_some()
+            })
+            .count();
+        let transparent_draw_calls = self
+            .draw_batches
+            .iter()
+            .filter(|(mesh_id, material_id, _, transparent)| {
+                *transparent
+                    && self.meshes.get(mesh_id.0).is_some()
+                    && self.materials.get(material_id.0).is_some_and(|material| {
+                        !uses_glass_pipeline(material.params.transmission_factor)
+                    })
+            })
+            .count();
+        let glass_draw_calls = self
+            .draw_batches
+            .iter()
+            .filter(|(mesh_id, material_id, _, transparent)| {
+                *transparent
+                    && self.meshes.get(mesh_id.0).is_some()
+                    && self.materials.get(material_id.0).is_some_and(|material| {
+                        uses_glass_pipeline(material.params.transmission_factor)
+                    })
+            })
+            .count();
+        self.timings.draw_calls = 2 + opaque_draw_calls + transparent_draw_calls + glass_draw_calls;
         self.timings.triangle_count = triangle_count;
         self.timings.active_meshes = self.active_mesh_ids.len();
         self.timings.active_materials = self.active_material_ids.len();
@@ -2164,6 +2205,14 @@ impl Renderer {
             pass.set_pipeline(&self.shadow_pipeline);
             pass.set_bind_group(0, &self.shadow_shared_bind_group, &[]);
             pass.set_vertex_buffer(1, self.shadow_instance_buffer.slice(..));
+            self.timings.draw_calls += self
+                .shadow_draw_batches
+                .iter()
+                .filter(|(mesh_id, material_id, _)| {
+                    self.meshes.get(mesh_id.0).is_some()
+                        && self.materials.get(material_id.0).is_some()
+                })
+                .count();
 
             for (mesh_id, material_id, range) in &self.shadow_draw_batches {
                 let (Some(mesh), Some(material)) = (

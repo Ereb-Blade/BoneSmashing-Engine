@@ -1100,7 +1100,7 @@ impl GltfModelData {
                     .unwrap_or_else(|| (0..positions.len() as u32).collect());
 
                 if indices.is_empty()
-                    || indices.len() % 3 != 0
+                    || !indices.len().is_multiple_of(3)
                     || u32::try_from(indices.len()).is_err()
                     || indices
                         .iter()
@@ -2132,8 +2132,7 @@ fn build_instances(
                 if !inverse_mesh.is_finite() {
                     return Err("skinned mesh node has a non-invertible transform".to_owned());
                 }
-                let matrices = skin
-                    .joints
+                skin.joints
                     .iter()
                     .zip(&skin.inverse_bind_matrices)
                     .map(|(&joint, inverse_bind)| {
@@ -2150,8 +2149,7 @@ fn build_instances(
                         }
                         Ok(matrix)
                     })
-                    .collect::<Result<Vec<_>, String>>()?;
-                matrices
+                    .collect::<Result<Vec<_>, String>>()?
             } else {
                 Vec::new()
             };
@@ -2266,9 +2264,9 @@ fn convert_image(image: &gltf::image::Data) -> Result<GltfImageData, String> {
     let mut rgba = Vec::with_capacity(rgba_len);
     for pixel in image.pixels.chunks_exact(channels * bytes_per_channel) {
         let mut values = [0.0; 4];
-        for channel in 0..channels {
+        for (channel, value) in values[..channels].iter_mut().enumerate() {
             let offset = channel * bytes_per_channel;
-            values[channel] = match bytes_per_channel {
+            *value = match bytes_per_channel {
                 1 => pixel[offset] as f32 / 255.0,
                 2 => {
                     u16::from_le_bytes([pixel[offset], pixel[offset + 1]]) as f32 / u16::MAX as f32
@@ -2686,7 +2684,7 @@ mod tests {
         assert!(!loaded.node_hierarchy.is_empty());
         assert!(loaded.node_hierarchy.iter().all(|node| {
             node.parent_index
-                .map_or(true, |parent| parent < loaded.node_hierarchy.len())
+                .is_none_or(|parent| parent < loaded.node_hierarchy.len())
         }));
         assert!(
             loaded

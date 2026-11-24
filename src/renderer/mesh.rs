@@ -377,14 +377,15 @@ impl MeshData {
             })?;
             let fallback_normals = calculate_normals(&mesh.positions, &mesh.indices);
 
-            for index in 0..vertex_count {
+            for (index, &fallback_normal) in fallback_normals.iter().enumerate().take(vertex_count)
+            {
                 let position = [
                     mesh.positions[index * 3],
                     mesh.positions[index * 3 + 1],
                     mesh.positions[index * 3 + 2],
                 ];
                 let normal = if mesh.normals.is_empty() {
-                    fallback_normals[index]
+                    fallback_normal
                 } else {
                     let normal = [
                         mesh.normals[index * 3],
@@ -395,7 +396,7 @@ impl MeshData {
                     if normal.length_squared() > f32::EPSILON {
                         normal.normalize().to_array()
                     } else {
-                        fallback_normals[index]
+                        fallback_normal
                     }
                 };
                 let tex_coords = if mesh.texcoords.is_empty() {
@@ -451,7 +452,7 @@ impl MeshData {
 
 pub(crate) fn calculate_normals(positions: &[f32], indices: &[u32]) -> Vec<[f32; 3]> {
     let mut normals = vec![glam::Vec3::ZERO; positions.len() / 3];
-    for triangle in indices.chunks_exact(3) {
+    for triangle in indices.as_chunks::<3>().0 {
         let a = triangle[0] as usize;
         let b = triangle[1] as usize;
         let c = triangle[2] as usize;
@@ -490,10 +491,8 @@ pub(crate) fn calculate_tangents_with_uv(
 ) -> Vec<[f32; 4]> {
     let mut tangent_sums = vec![glam::Vec3::ZERO; vertices.len()];
     let mut bitangent_sums = vec![glam::Vec3::ZERO; vertices.len()];
-    for triangle in indices.chunks_exact(3) {
-        let [a, b, c] = triangle else {
-            unreachable!();
-        };
+    for triangle in indices.as_chunks::<3>().0 {
+        let [a, b, c] = triangle;
         let (a, b, c) = (*a as usize, *b as usize, *c as usize);
         let position_a = glam::Vec3::from_array(vertices[a].position);
         let position_b = glam::Vec3::from_array(vertices[b].position);

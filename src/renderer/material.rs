@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments, clippy::items_after_test_module)]
+
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MaterialParams {
@@ -227,7 +229,7 @@ fn linear_to_srgb(value: f32) -> f32 {
 }
 
 fn apply_linear_color_gain(rgba: &mut [u8], gain: f32) {
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         for channel in &mut pixel[..3] {
             let linear = srgb_to_linear(*channel as f32 / 255.0) * gain;
             *channel = (linear_to_srgb(linear.clamp(0.0, 1.0)) * 255.0).round() as u8;
@@ -288,7 +290,7 @@ mod tests {
         let mipmaps = generate_mip_levels(&[255; 3 * 5 * 4], 3, 5, false, false);
 
         assert_eq!(mipmaps.len(), 3);
-        assert_eq!(mipmaps[1].len(), 1 * 2 * 4);
+        assert_eq!(mipmaps[1].len(), 8);
         assert_eq!(mipmaps[2].len(), 4);
     }
 
@@ -319,6 +321,7 @@ mod tests {
     }
 }
 
+#[allow(clippy::items_after_test_module)]
 impl Material {
     pub fn from_rgba(
         device: &wgpu::Device,

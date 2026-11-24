@@ -1273,12 +1273,16 @@ mod tests {
             up: Vec3::Y,
             aspect: 16.0 / 9.0,
         };
-        let mut settings = RendererSettings::default();
-        settings.exposure_ev = 1.25;
-        settings.render_scale = 0.75;
-        let mut params = MaterialParams::default();
-        params.roughness = 0.37;
-        params.metallic = 0.62;
+        let settings = RendererSettings {
+            exposure_ev: 1.25,
+            render_scale: 0.75,
+            ..RendererSettings::default()
+        };
+        let params = MaterialParams {
+            roughness: 0.37,
+            metallic: 0.62,
+            ..MaterialParams::default()
+        };
         let mut world = World::new();
         world.add_object(RenderObject::new(
             Transform::default(),

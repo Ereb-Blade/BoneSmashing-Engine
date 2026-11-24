@@ -238,9 +238,8 @@ impl World {
         mut object: RenderObject,
     ) -> Option<ObjectId> {
         let group_index = *self.model_group_indices.get(&group_id)?;
-        if self.model_groups.get(group_index)?.source_path.is_none() {
-            return None;
-        }
+        let group = self.model_groups.get(group_index)?;
+        group.source_path.as_ref()?;
         object.set_model_group(Some(group_id));
         let object_id = self.push_object(object);
         self.model_groups[group_index].objects.push(object_id);

@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments, clippy::collapsible_if)]
+
 use crate::camera::Camera;
 use crate::core::{MATERIAL_DEFAULT, MESH_CUBE};
 use crate::renderer::material::MaterialParams;

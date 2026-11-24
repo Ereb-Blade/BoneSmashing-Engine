@@ -412,18 +412,29 @@ fn directional_shadow_matrix(ray_direction: Vec3) -> Mat4 {
     crate::math::orthographic_rh(-7.5, 7.5, -7.5, 7.5, 1.0, 40.0) * view
 }
 
-fn mesh_in_view(mesh: &crate::renderer::mesh::Mesh, model: Mat4, view_projection: Mat4) -> bool {
-    if mesh.bounds_radius <= 0.0 {
+fn object_in_view(
+    bounds: Option<(Vec3, f32)>,
+    model: Mat4,
+    is_skinned: bool,
+    view_projection: Mat4,
+) -> bool {
+    if is_skinned {
         return true;
     }
-    let world_center = model.transform_point3(mesh.bounds_center);
+    let Some((bounds_center, bounds_radius)) = bounds else {
+        return true;
+    };
+    if bounds_radius <= 0.0 {
+        return true;
+    }
+    let world_center = model.transform_point3(bounds_center);
     let conservative_scale = (model.x_axis.truncate().length_squared()
         + model.y_axis.truncate().length_squared()
         + model.z_axis.truncate().length_squared())
     .sqrt();
     sphere_in_view(
         world_center,
-        mesh.bounds_radius * conservative_scale,
+        bounds_radius * conservative_scale,
         view_projection,
     )
 }
@@ -1892,8 +1903,13 @@ impl Renderer {
                 .group_model_matrix_for_id(object_id)
                 .unwrap_or_else(|| obj.model_matrix());
             let mesh = self.meshes.get(obj.mesh_id.0);
-            let camera_visible =
-                mesh.is_none_or(|mesh| mesh_in_view(mesh, model_matrix, view_projection));
+            let bounds = mesh.map(|mesh| (mesh.bounds_center, mesh.bounds_radius));
+            let camera_visible = object_in_view(
+                bounds,
+                model_matrix,
+                !obj.skin_matrices().is_empty(),
+                view_projection,
+            );
             let material = self.materials.get(obj.material_id.0);
             let is_transparent = material.is_some_and(|material| {
                 is_transparent_material(material.alpha_mode, material.params.transmission_factor)
@@ -2643,6 +2659,31 @@ mod tests {
             Vec3::new(999.95, 0.0, 0.0),
             0.1,
             view_projection
+        ));
+    }
+
+    #[test]
+    fn skinned_meshes_are_not_culled_by_bind_pose_bounds() {
+        let projection = crate::math::perspective_rh(
+            45.0_f32.to_radians(),
+            1.0,
+            crate::config::Z_NEAR,
+            crate::config::Z_FAR,
+        );
+        let view = crate::math::look_at_rh(Vec3::ZERO, Vec3::X, Vec3::Y);
+        let bounds = Some((Vec3::new(0.05, 0.0, 0.0), 0.01));
+
+        assert!(!object_in_view(
+            bounds,
+            Mat4::IDENTITY,
+            false,
+            projection * view
+        ));
+        assert!(object_in_view(
+            bounds,
+            Mat4::IDENTITY,
+            true,
+            projection * view
         ));
     }
 

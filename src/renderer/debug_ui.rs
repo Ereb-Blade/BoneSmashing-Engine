@@ -271,6 +271,7 @@ pub struct DebugUi {
     scene_environment_request: Option<Option<PathBuf>>,
     scene_environment_load_pending: bool,
     selected_scene_item: Option<SceneSelection>,
+    morph_filter: String,
     history: UndoHistory,
     gizmo_mode: GizmoMode,
     gizmo_drag: Option<GizmoDrag>,
@@ -889,6 +890,7 @@ impl DebugUi {
             scene_environment_request: None,
             scene_environment_load_pending: false,
             selected_scene_item: None,
+            morph_filter: String::new(),
             history: UndoHistory::default(),
             gizmo_mode: GizmoMode::Move,
             gizmo_drag: None,
@@ -1096,6 +1098,8 @@ impl DebugUi {
         let mut name_change = None;
         let mut animation_change = None;
         let mut parent_change = None;
+        let mut morph_weights_change = None;
+        let mut pause_morph_animation = None;
         let selection_is_valid = self
             .selected_scene_item
             .is_some_and(|selected| selection_is_valid(world, selected));
@@ -1876,6 +1880,13 @@ impl DebugUi {
                                                             object_id,
                                                         )),
                                                     ) => {
+                                                        let animation_group = world
+                                                            .get_object(object_id)
+                                                            .and_then(RenderObject::model_group);
+                                                        let animation_playing = animation_group
+                                                            .and_then(|id| world.model_group(id))
+                                                            .and_then(|group| group.animation)
+                                                            .is_some_and(|playback| playback.playing);
                                                         if let Some(object) =
                                                             world.get_object_mut(object_id)
                                                         {
@@ -1901,12 +1912,148 @@ impl DebugUi {
                                                                     Some((selection, before));
                                                                 scene_modified = true;
                                                             }
+                                                            let morph_before =
+                                                                object.morph_weights().to_vec();
+                                                            if !morph_before.is_empty() {
+                                                                ui.separator();
+                                                                let active_count = morph_before
+                                                                    .iter()
+                                                                    .filter(|weight| **weight != 0.0)
+                                                                    .count();
+                                                                ui.label(format!(
+                                                                    "Morph targets ({}, active {})",
+                                                                    morph_before.len(),
+                                                                    active_count
+                                                                ));
+                                                                let mut reset_weights = false;
+                                                                ui.horizontal(|ui| {
+                                                                    if ui
+                                                                        .add_enabled(
+                                                                            !animation_playing,
+                                                                            egui::Button::new(
+                                                                                "Reset all",
+                                                                            ),
+                                                                        )
+                                                                        .clicked()
+                                                                    {
+                                                                        reset_weights = true;
+                                                                    }
+                                                                    if animation_playing
+                                                                        && ui
+                                                                            .button("Pause animation")
+                                                                            .clicked()
+                                                                    {
+                                                                        pause_morph_animation =
+                                                                            animation_group;
+                                                                    }
+                                                                });
+                                                                if animation_playing {
+                                                                    ui.weak(
+                                                                        "Pause animation before editing weights.",
+                                                                    );
+                                                                }
+                                                                ui.horizontal(|ui| {
+                                                                    ui.label("Filter");
+                                                                    ui.text_edit_singleline(
+                                                                        &mut self.morph_filter,
+                                                                    );
+                                                                    if ui.button("Clear").clicked() {
+                                                                        self.morph_filter.clear();
+                                                                    }
+                                                                });
+                                                                let target_names = object
+                                                                    .morph_target_names()
+                                                                    .to_vec();
+                                                                let filter = self
+                                                                    .morph_filter
+                                                                    .trim()
+                                                                    .to_lowercase();
+                                                                let mut matched_target = false;
+                                                                ui.add_enabled_ui(
+                                                                    !animation_playing,
+                                                                    |ui| {
+                                                                        if reset_weights {
+                                                                            object
+                                                                                .morph_weights_mut()
+                                                                                .fill(0.0);
+                                                                        }
+                                                                        for (index, weight) in
+                                                                            object
+                                                                                .morph_weights_mut()
+                                                                                .iter_mut()
+                                                                                .enumerate()
+                                                                        {
+                                                                            let label = target_names
+                                                                                .get(index)
+                                                                                .map(String::as_str)
+                                                                                .filter(|name| {
+                                                                                    !name.is_empty()
+                                                                                })
+                                                                                .map(|name| {
+                                                                                    format!(
+                                                                                        "{}. {}",
+                                                                                        index + 1,
+                                                                                        name
+                                                                                    )
+                                                                                })
+                                                                                .unwrap_or_else(
+                                                                                    || {
+                                                                                        format!(
+                                                                                            "Target {}",
+                                                                                            index + 1
+                                                                                        )
+                                                                                    },
+                                                                                );
+                                                                            if !filter.is_empty()
+                                                                                && !label
+                                                                                    .to_lowercase()
+                                                                                    .contains(
+                                                                                        &filter,
+                                                                                    )
+                                                                            {
+                                                                                continue;
+                                                                            }
+                                                                            matched_target = true;
+                                                                            if ui
+                                                                                .add(
+                                                                                    egui::Slider::new(
+                                                                                        weight,
+                                                                                        0.0..=1.0,
+                                                                                    )
+                                                                                    .text(label),
+                                                                                )
+                                                                                .changed()
+                                                                            {
+                                                                                scene_modified = true;
+                                                                            }
+                                                                        }
+                                                                    },
+                                                                );
+                                                                if !filter.is_empty() && !matched_target {
+                                                                    ui.weak("No targets match this filter.");
+                                                                }
+                                                                if reset_weights
+                                                                    && morph_before
+                                                                        .iter()
+                                                                        .any(|weight| *weight != 0.0)
+                                                                {
+                                                                    scene_modified = true;
+                                                                }
+                                                                if object.morph_weights() != morph_before
+                                                                {
+                                                                    morph_weights_change =
+                                                                        Some((selection, morph_before));
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                     None => {
                                                         ui.weak("Select an object to inspect it.");
                                                     }
                                                 });
+                                            if self.selected_scene_item != selected_scene_item {
+                                                self.morph_filter.clear();
+                                            }
                                             self.selected_scene_item = selected_scene_item;
                                         }
                                     });
@@ -2269,11 +2416,20 @@ impl DebugUi {
                     });
             }
         });
+        if let Some(group_id) = pause_morph_animation
+            && let Some(group) = world.model_group_mut(group_id)
+            && let Some(playback) = group.animation.as_mut()
+        {
+            animation_change = Some((group_id, *playback));
+            playback.playing = false;
+            scene_modified = true;
+        }
         let render_state_modified =
             settings != settings_before || selected_params != selected_params_before;
         let mut changed_name = None;
         let mut changed_animation = None;
         let mut changed_parent = None;
+        let mut changed_morph_weights = None;
         if let Some((selection, before)) = name_change
             && let Some(name) = selected_name_mut(world, selection)
         {
@@ -2307,10 +2463,22 @@ impl DebugUi {
                 changed_parent = Some((group_id, after, after_transform));
             }
         }
+        if let Some((selection, before)) = morph_weights_change {
+            let (SceneSelection::Part(object_id) | SceneSelection::Object(object_id)) = selection
+            else {
+                unreachable!("morph weights only belong to scene objects");
+            };
+            if let Some(object) = world.get_object_mut(object_id) {
+                let after = object.morph_weights().to_vec();
+                object.set_morph_weights(&before);
+                changed_morph_weights = Some((object_id, after));
+            }
+        }
         if render_state_modified
             || changed_name.is_some()
             || changed_animation.is_some()
             || changed_parent.is_some()
+            || changed_morph_weights.is_some()
         {
             self.history.record(
                 world,
@@ -2327,6 +2495,11 @@ impl DebugUi {
             && let Some(group) = world.model_group_mut(group_id)
         {
             group.animation = Some(after);
+        }
+        if let Some((object_id, after)) = changed_morph_weights
+            && let Some(object) = world.get_object_mut(object_id)
+        {
+            object.set_morph_weights(&after);
         }
         if let Some((group_id, after_parent, after_transform)) = changed_parent {
             world

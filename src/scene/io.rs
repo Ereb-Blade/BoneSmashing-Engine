@@ -71,6 +71,8 @@ pub struct SceneObject {
     pub scale: [f32; 3],
     #[serde(default)]
     pub material_override: Option<SceneMaterialOverride>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub morph_weights: Vec<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -311,6 +313,7 @@ impl SceneFile {
                 rotation: object.transform.rotation.to_array(),
                 scale: object.transform.scale.to_array(),
                 material_override: None,
+                morph_weights: object.morph_weights().to_vec(),
             });
         }
         let file = Self {
@@ -356,11 +359,17 @@ impl SceneFile {
                 .map(|path| store_scene_path(path, &scene_directory))
                 .transpose()?,
         });
-        for (saved_object, params) in self.objects.iter_mut().zip(material_params) {
+        for ((saved_object, params), world_object) in self
+            .objects
+            .iter_mut()
+            .zip(material_params)
+            .zip(world.objects())
+        {
             saved_object.material_override = Some(SceneMaterialOverride {
                 roughness: params.roughness,
                 metallic: params.metallic,
             });
+            saved_object.morph_weights = world_object.morph_weights().to_vec();
         }
         self.validate()?;
         Ok(())
@@ -443,6 +452,16 @@ impl SceneFile {
             }) {
                 return Err(format!(
                     "Scene object {index} has an invalid material override"
+                ));
+            }
+            if object.morph_weights.len() > 256
+                || object
+                    .morph_weights
+                    .iter()
+                    .any(|weight| !weight.is_finite())
+            {
+                return Err(format!(
+                    "Scene object {index} has invalid morph target weights"
                 ));
             }
             if let SceneObjectSource::Asset { path, .. } = &object.source {
@@ -892,6 +911,15 @@ pub fn build_world(
                 render_object.transform = object.transform();
                 if !object.name.is_empty() {
                     render_object.name.clone_from(&object.name);
+                }
+                if !object.morph_weights.is_empty() {
+                    if object.morph_weights.len() == render_object.morph_weights().len() {
+                        render_object.set_morph_weights(&object.morph_weights);
+                    } else {
+                        return Err(format!(
+                            "Scene object {index} morph weight count does not match its model primitive"
+                        ));
+                    }
                 }
                 render_object
             }
@@ -1352,6 +1380,7 @@ mod tests {
                 rotation: Quat::IDENTITY.to_array(),
                 scale: [2.0, 2.0, 2.0],
                 material_override: None,
+                morph_weights: Vec::new(),
             }],
             camera: None,
             renderer_settings: None,
@@ -1397,6 +1426,7 @@ mod tests {
             rotation: Quat::IDENTITY.to_array(),
             scale: Vec3::ONE.to_array(),
             material_override: None,
+            morph_weights: Vec::new(),
         });
         assert!(file.validate().unwrap_err().contains("invalid transform"));
     }
@@ -1418,6 +1448,7 @@ mod tests {
                 rotation: Quat::IDENTITY.to_array(),
                 scale: Vec3::ONE.to_array(),
                 material_override: None,
+                morph_weights: Vec::new(),
             }],
             camera: None,
             renderer_settings: None,
@@ -1587,5 +1618,38 @@ mod tests {
         );
         assert_eq!(loaded.file.objects[1].position, [0.0, 2.0, 0.0]);
         assert_eq!(loaded.file.objects[3].position, [0.0, 2.0, 0.0]);
+    }
+
+    #[test]
+    fn restores_saved_morph_target_weights() {
+        let file = SceneFile {
+            version: SCENE_FORMAT_VERSION,
+            groups: Vec::new(),
+            objects: vec![SceneObject {
+                source: SceneObjectSource::Asset {
+                    path: "model.glb".to_owned(),
+                    instance_index: 0,
+                },
+                model_group: None,
+                parent_node: None,
+                name: "Morph".to_owned(),
+                position: Vec3::ZERO.to_array(),
+                rotation: Quat::IDENTITY.to_array(),
+                scale: Vec3::ONE.to_array(),
+                material_override: None,
+                morph_weights: vec![0.25, 0.75],
+            }],
+            camera: None,
+            renderer_settings: None,
+            environment: None,
+        };
+        let instance = RenderObject::new(Transform::default(), MeshId(0), MaterialId(0))
+            .with_name("Morph")
+            .with_morph_weights(vec![0.0, 0.0]);
+        let mut assets = HashMap::new();
+        assets.insert(PathBuf::from("model.glb"), vec![instance]);
+
+        let world = build_world(&file, 1, 1, assets).unwrap();
+        assert_eq!(world.objects()[0].morph_weights(), &[0.25, 0.75]);
     }
 }

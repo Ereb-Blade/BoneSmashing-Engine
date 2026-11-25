@@ -18,6 +18,8 @@ pub struct RenderObject {
     pub mesh_id: MeshId,
     pub material_id: MaterialId,
     skin_matrices: Vec<Mat4>,
+    morph_weights: Vec<f32>,
+    morph_target_names: Vec<String>,
     asset_source: Option<AssetSource>,
     model_group: Option<ModelGroupId>,
     parent_node: Option<ModelGroupId>,
@@ -31,6 +33,8 @@ impl RenderObject {
             mesh_id,
             material_id,
             skin_matrices: Vec::new(),
+            morph_weights: Vec::new(),
+            morph_target_names: Vec::new(),
             asset_source: None,
             model_group: None,
             parent_node: None,
@@ -75,6 +79,16 @@ impl RenderObject {
         self
     }
 
+    pub fn with_morph_weights(mut self, morph_weights: Vec<f32>) -> Self {
+        self.morph_weights = morph_weights;
+        self
+    }
+
+    pub fn with_morph_target_names(mut self, names: Vec<String>) -> Self {
+        self.morph_target_names = names;
+        self
+    }
+
     pub fn set_skin_matrices(&mut self, skin_matrices: &[Mat4]) {
         self.skin_matrices.clear();
         self.skin_matrices.extend_from_slice(skin_matrices);
@@ -82,6 +96,23 @@ impl RenderObject {
 
     pub fn skin_matrices(&self) -> &[Mat4] {
         &self.skin_matrices
+    }
+
+    pub fn set_morph_weights(&mut self, weights: &[f32]) {
+        self.morph_weights.clear();
+        self.morph_weights.extend_from_slice(weights);
+    }
+
+    pub fn morph_weights(&self) -> &[f32] {
+        &self.morph_weights
+    }
+
+    pub fn morph_weights_mut(&mut self) -> &mut [f32] {
+        &mut self.morph_weights
+    }
+
+    pub fn morph_target_names(&self) -> &[String] {
+        &self.morph_target_names
     }
 
     pub fn model_matrix(&self) -> Mat4 {

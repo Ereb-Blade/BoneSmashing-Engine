@@ -10,7 +10,7 @@ egui-wgpu = { version = "0.32.3", default-features = false }
 egui-winit = { version = "0.32.3", default-features = false }
 half = "2.7.1"
 glam = { version = "0.34.3", features = ["bytemuck"] }
-gltf = { version = "1.4", features = ["KHR_materials_unlit", "KHR_materials_ior", "KHR_materials_transmission", "KHR_materials_volume", "KHR_materials_specular", "KHR_materials_emissive_strength", "KHR_materials_pbrSpecularGlossiness", "KHR_texture_transform", "extensions", "import"] }
+gltf = { version = "1.4", features = ["KHR_materials_unlit", "KHR_materials_ior", "KHR_materials_transmission", "KHR_materials_volume", "KHR_materials_specular", "KHR_materials_emissive_strength", "KHR_materials_pbrSpecularGlossiness", "KHR_texture_transform", "extensions", "extras", "import"] }
 image = { version = "0.25.10", features = ["exr", "hdr"] }
 pollster = "1.0.1"
 rfd = { version = "0.15.4", default-features = false }

@@ -225,6 +225,8 @@ impl App {
                             )
                             .with_name(instance.name.clone())
                             .with_skin_matrices(instance.skin_matrices.clone())
+                            .with_morph_weights(instance.morph_weights.clone())
+                            .with_morph_target_names(instance.morph_target_names.clone())
                             .with_asset_source(path.to_path_buf(), instance_index),
                         )
                         .ok_or_else(|| {
@@ -294,6 +296,8 @@ impl App {
                                 )
                                 .with_name(instance.name.clone())
                                 .with_skin_matrices(instance.skin_matrices.clone())
+                                .with_morph_weights(instance.morph_weights.clone())
+                                .with_morph_target_names(instance.morph_target_names.clone())
                                 .with_asset_source(path.clone(), index)
                             })
                             .collect();
@@ -559,6 +563,7 @@ impl App {
                 };
                 if let Some(object) = world.get_object_mut(object_id) {
                     object.set_skin_matrices(&instance.skin_matrices);
+                    object.set_morph_weights(&instance.morph_weights);
                 }
             }
         }
@@ -717,6 +722,10 @@ impl ApplicationHandler for App {
                                             )
                                             .with_name(instance.name.clone())
                                             .with_skin_matrices(instance.skin_matrices.clone())
+                                            .with_morph_weights(instance.morph_weights.clone())
+                                            .with_morph_target_names(
+                                                instance.morph_target_names.clone(),
+                                            )
                                             .with_asset_source(
                                                 sample_model.clone(),
                                                 instance_index,

@@ -264,7 +264,7 @@ glTF анимация поддерживает:
 - seek;
 - animation clip selection.
 
-Morph target weights намеренно отклоняются как unsupported.
+Morph targets загружаются с POSITION/NORMAL/TANGENT displacements; веса применяются на CPU и загружаются в динамические vertex/tangent buffers. Поддержаны glTF weight animations, поиск и сброс в инспекторе; имена целей читаются из `mesh.extras.targetNames`, если они присутствуют.
 
 Анимационные модели загружаются в `animation_models: HashMap<PathBuf, LoadedGltfModel>`. Сэмплинг выполняется только при изменении clip/time.
 
@@ -886,7 +886,7 @@ Glass shader использует:
 9. GPU culling and indirect rendering.
 10. Occlusion culling.
 11. Animation state machine and blending.
-12. Morph target support.
+12. Редакторский controls для morph target weights и blending clips.
 13. Physics/collision.
 14. Central logger and diagnostic report.
 15. GPU frame profiling.

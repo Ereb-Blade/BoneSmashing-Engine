@@ -1890,6 +1890,13 @@ impl Renderer {
         );
         self.timings.ui_cpu_ms = ui_started.elapsed().as_secs_f32() * 1000.0;
         let objects = world.objects();
+        for object in objects {
+            if !object.morph_weights().is_empty()
+                && let Some(mesh) = self.meshes.get_mut(object.mesh_id.0)
+            {
+                mesh.update_morph_weights(&self.queue, object.morph_weights());
+            }
+        }
         let scene_started = Instant::now();
         let key_direction = self.settings.key_light_direction();
         let light_uniform = LightUniform {

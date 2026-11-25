@@ -19,6 +19,15 @@ pub struct MeshData {
     pub indices: Vec<u32>,
     pub skin_vertices: Vec<SkinVertex>,
     pub tangents: Vec<[f32; 4]>,
+    pub morph_targets: Vec<MorphTargetData>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MorphTargetData {
+    pub name: String,
+    pub positions: Vec<[f32; 3]>,
+    pub normals: Option<Vec<[f32; 3]>>,
+    pub tangents: Option<Vec<[f32; 3]>>,
 }
 
 #[derive(Debug)]
@@ -107,8 +116,7 @@ impl ObjModelData {
                 let image = downscale_obj_texture(image);
                 let image = image.to_rgba8();
                 let image = image::imageops::flip_vertical(&image);
-                let raw_bytes_for_texture =
-                    u64::try_from(image.as_raw().len()).unwrap_or(u64::MAX);
+                let raw_bytes_for_texture = u64::try_from(image.as_raw().len()).unwrap_or(u64::MAX);
                 let mipmap_bytes_for_texture =
                     obj_texture_mipmap_bytes(image.width(), image.height());
                 let next_raw_bytes = raw_bytes.saturating_add(raw_bytes_for_texture);
@@ -308,7 +316,9 @@ fn obj_texture_mipmap_bytes(width: u32, height: u32) -> u64 {
     let mut mip_height = height;
     while mip_width > 0 && mip_height > 0 {
         bytes = bytes.saturating_add(
-            u64::from(mip_width).saturating_mul(u64::from(mip_height)).saturating_mul(4),
+            u64::from(mip_width)
+                .saturating_mul(u64::from(mip_height))
+                .saturating_mul(4),
         );
         mip_width = (mip_width / 2).max(1);
         mip_height = (mip_height / 2).max(1);
@@ -508,6 +518,7 @@ impl MeshData {
             indices,
             skin_vertices,
             tangents,
+            morph_targets: Vec::new(),
         })
     }
 }
@@ -655,6 +666,9 @@ pub struct Mesh {
     pub num_indices: u32,
     pub bounds_center: Vec3,
     pub bounds_radius: f32,
+    base_vertices: Vec<Vertex>,
+    base_tangents: Vec<[f32; 4]>,
+    morph_targets: Vec<MorphTargetData>,
 }
 
 impl Mesh {
@@ -679,7 +693,7 @@ impl Mesh {
     }
 
     pub fn from_mesh_data(device: &wgpu::Device, data: &MeshData, label: Option<&str>) -> Self {
-        Self::from_slices_with_skin(
+        let mut mesh = Self::from_slices_with_skin(
             device,
             &data.vertices,
             &data.uv_sets,
@@ -687,7 +701,9 @@ impl Mesh {
             &data.tangents,
             &data.indices,
             label,
-        )
+        );
+        mesh.morph_targets = data.morph_targets.clone();
+        mesh
     }
 
     fn from_slices_with_skin(
@@ -718,7 +734,7 @@ impl Mesh {
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: label.map(|l| format!("{l} vertex buffer")).as_deref(),
             contents: bytemuck::cast_slice(vertices),
-            usage: wgpu::BufferUsages::VERTEX,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
         let skin_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -745,7 +761,7 @@ impl Mesh {
         let tangent_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: label.map(|l| format!("{l} tangent buffer")).as_deref(),
             contents: bytemuck::cast_slice(&tangent_vertices),
-            usage: wgpu::BufferUsages::VERTEX,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -763,7 +779,85 @@ impl Mesh {
             num_indices: indices.len() as u32,
             bounds_center,
             bounds_radius,
+            base_vertices: vertices.to_vec(),
+            base_tangents: tangent_vertices.iter().map(|tangent| tangent.0).collect(),
+            morph_targets: Vec::new(),
         }
+    }
+
+    pub fn update_morph_weights(&mut self, queue: &wgpu::Queue, weights: &[f32]) {
+        if self.morph_targets.is_empty() {
+            return;
+        }
+
+        let mut vertices = self.base_vertices.clone();
+        let mut tangents = self.base_tangents.clone();
+        for (target_index, target) in self.morph_targets.iter().enumerate() {
+            let weight = weights
+                .get(target_index)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(-1000.0, 1000.0);
+            if weight == 0.0 {
+                continue;
+            }
+            for (index, vertex) in vertices.iter_mut().enumerate() {
+                if let Some(displacement) = target.positions.get(index) {
+                    vertex.position[0] += displacement[0] * weight;
+                    vertex.position[1] += displacement[1] * weight;
+                    vertex.position[2] += displacement[2] * weight;
+                }
+                if let Some(normal_displacements) = target.normals.as_ref()
+                    && let Some(displacement) = normal_displacements.get(index)
+                {
+                    vertex.normal[0] += displacement[0] * weight;
+                    vertex.normal[1] += displacement[1] * weight;
+                    vertex.normal[2] += displacement[2] * weight;
+                }
+                if let Some(tangent_displacements) = target.tangents.as_ref()
+                    && let Some(displacement) = tangent_displacements.get(index)
+                    && let Some(tangent) = tangents.get_mut(index)
+                {
+                    tangent[0] += displacement[0] * weight;
+                    tangent[1] += displacement[1] * weight;
+                    tangent[2] += displacement[2] * weight;
+                }
+            }
+        }
+
+        for vertex in &mut vertices {
+            let normal = Vec3::from_array(vertex.normal);
+            if normal.length_squared() > f32::EPSILON {
+                let normalized = normal.normalize();
+                vertex.normal = normalized.to_array();
+            } else {
+                vertex.normal = [0.0, 1.0, 0.0];
+            }
+        }
+
+        if !vertices.is_empty() {
+            let mut min = Vec3::splat(f32::MAX);
+            let mut max = Vec3::splat(f32::MIN);
+            for vertex in &vertices {
+                let position = Vec3::from_array(vertex.position);
+                min = min.min(position);
+                max = max.max(position);
+            }
+            self.bounds_center = (min + max) * 0.5;
+            self.bounds_radius = vertices
+                .iter()
+                .map(|vertex| Vec3::from_array(vertex.position).distance(self.bounds_center))
+                .fold(0.0_f32, f32::max);
+        }
+
+        let tangent_vertices: Vec<TangentVertex> =
+            tangents.iter().copied().map(TangentVertex).collect();
+        queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        queue.write_buffer(
+            &self.tangent_buffer,
+            0,
+            bytemuck::cast_slice(&tangent_vertices),
+        );
     }
 
     pub fn cube(device: &wgpu::Device) -> Self {

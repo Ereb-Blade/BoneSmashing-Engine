@@ -9,8 +9,8 @@ use crate::core::{MaterialId, MeshId};
 use crate::scene::Transform;
 
 use super::mesh::{
-    MAX_IMPORTED_TEXTURE_DIMENSION, MeshData, SkinVertex, UvSetsVertex, Vertex, calculate_normals,
-    calculate_tangents, calculate_tangents_with_uv,
+    MAX_IMPORTED_TEXTURE_DIMENSION, MeshData, MorphTargetData, SkinVertex, UvSetsVertex, Vertex,
+    calculate_normals, calculate_tangents, calculate_tangents_with_uv,
 };
 
 const MAX_IMPORTED_IMAGE_DATA_BYTES: usize = 128 * 1024 * 1024;
@@ -44,6 +44,24 @@ fn instance_name(node: &gltf::Node<'_>, mesh: &gltf::Mesh<'_>, primitive_index: 
     } else {
         base_name
     }
+}
+
+fn read_morph_target_names(extras: Option<&str>, target_count: usize) -> Vec<String> {
+    let names = extras
+        .and_then(|extras| serde_json::from_str::<serde_json::Value>(extras).ok())
+        .and_then(|extras| extras.get("targetNames")?.as_array().cloned())
+        .unwrap_or_default();
+    (0..target_count)
+        .map(|index| {
+            names
+                .get(index)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Target {}", index + 1))
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -224,6 +242,8 @@ pub struct GltfPrimitiveInstance {
     pub node_index: usize,
     pub node_transform: Mat4,
     pub skin_matrices: Vec<Mat4>,
+    pub morph_weights: Vec<f32>,
+    pub morph_target_names: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -310,6 +330,7 @@ enum AnimationPath {
     Translation,
     Rotation,
     Scale,
+    MorphTargetWeights,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -326,6 +347,7 @@ struct AnimationChannelData {
     interpolation: Interpolation,
     times: Vec<f32>,
     values: Vec<[f32; 4]>,
+    morph_values: Option<Vec<f32>>,
 }
 
 #[derive(Debug)]
@@ -345,11 +367,14 @@ struct AnimationInstanceData {
     primitive_index: usize,
     node_index: usize,
     skin_index: Option<usize>,
+    morph_weights: Vec<f32>,
+    morph_target_names: Vec<String>,
 }
 
 #[derive(Debug)]
 struct GltfAnimationData {
     base_nodes: Vec<NodePose>,
+    base_morph_weights: Vec<Vec<f32>>,
     parents: Vec<Option<usize>>,
     skins: Vec<SkinData>,
     instances: Vec<AnimationInstanceData>,
@@ -358,6 +383,7 @@ struct GltfAnimationData {
     mesh_ids: Vec<MeshId>,
     material_ids: Vec<MaterialId>,
     sample_nodes: Vec<NodePose>,
+    sample_morph_weights: Vec<Vec<f32>>,
     sample_globals: Vec<Mat4>,
     sample_computed: Vec<bool>,
     sample_visiting: Vec<bool>,
@@ -378,8 +404,9 @@ impl GltfAnimationData {
             .get(animation_index)
             .ok_or_else(|| format!("animation index {animation_index} is out of range"))?;
         let mut nodes = self.base_nodes.clone();
+        let mut morph_weights = self.base_morph_weights.clone();
         let duration = self.animation_infos[animation_index].duration;
-        apply_animation_channels(clip, duration, time, &mut nodes)?;
+        apply_animation_channels(clip, duration, time, &mut nodes, &mut morph_weights)?;
 
         let globals = calculate_global_transforms(&nodes, &self.parents)?;
         self.instances
@@ -407,6 +434,11 @@ impl GltfAnimationData {
                     node_index: instance.node_index,
                     node_transform,
                     skin_matrices,
+                    morph_weights: morph_weights
+                        .get(instance.node_index)
+                        .cloned()
+                        .unwrap_or_else(|| instance.morph_weights.clone()),
+                    morph_target_names: instance.morph_target_names.clone(),
                 })
             })
             .collect()
@@ -427,8 +459,20 @@ impl GltfAnimationData {
             .get(animation_index)
             .ok_or_else(|| format!("animation index {animation_index} is out of range"))?;
         self.sample_nodes.copy_from_slice(&self.base_nodes);
+        self.sample_morph_weights
+            .resize_with(self.base_morph_weights.len(), Vec::new);
+        for (index, weights) in self.base_morph_weights.iter().enumerate() {
+            self.sample_morph_weights[index].clear();
+            self.sample_morph_weights[index].extend_from_slice(weights);
+        }
         let duration = self.animation_infos[animation_index].duration;
-        apply_animation_channels(clip, duration, time, &mut self.sample_nodes)?;
+        apply_animation_channels(
+            clip,
+            duration,
+            time,
+            &mut self.sample_nodes,
+            &mut self.sample_morph_weights,
+        )?;
         node_transforms.clear();
         node_transforms.extend(
             self.sample_nodes
@@ -463,6 +507,8 @@ impl GltfAnimationData {
                     node_index: instance.node_index,
                     node_transform,
                     skin_matrices: Vec::new(),
+                    morph_weights: Vec::new(),
+                    morph_target_names: instance.morph_target_names.clone(),
                 });
             }
             let sampled = &mut output[index];
@@ -483,9 +529,88 @@ impl GltfAnimationData {
                         .push(inverse_mesh * self.sample_globals[joint] * *inverse_bind);
                 }
             }
+            sampled.morph_weights.clear();
+            sampled.morph_weights.extend_from_slice(
+                self.sample_morph_weights
+                    .get(instance.node_index)
+                    .unwrap_or(&instance.morph_weights),
+            );
         }
         Ok(())
     }
+}
+
+fn sample_morph_channel(
+    channel: &AnimationChannelData,
+    time: f32,
+    target_count: usize,
+) -> Vec<f32> {
+    let Some(values) = channel.morph_values.as_ref() else {
+        return vec![0.0; target_count];
+    };
+    let last = channel.times.len().saturating_sub(1);
+    if target_count == 0 {
+        return Vec::new();
+    }
+    let frame_value = |frame: usize| -> Option<&[f32]> {
+        let offset = if matches!(channel.interpolation, Interpolation::CubicSpline) {
+            frame
+                .checked_mul(target_count)?
+                .checked_mul(3)?
+                .checked_add(target_count)?
+        } else {
+            frame.checked_mul(target_count)?
+        };
+        let block_end = offset.checked_add(target_count)?;
+        values.get(offset..block_end)
+    };
+    if time <= channel.times[0] {
+        return frame_value(0).unwrap_or(&[]).to_vec();
+    }
+    if time >= channel.times[last] {
+        return frame_value(last).unwrap_or(&[]).to_vec();
+    }
+    let upper = channel.times.partition_point(|&key_time| key_time <= time);
+    let lower = upper.saturating_sub(1);
+    if matches!(channel.interpolation, Interpolation::Step) {
+        return frame_value(lower).unwrap_or(&[]).to_vec();
+    }
+
+    let start = frame_value(lower).unwrap_or(&[]);
+    let end = frame_value(upper).unwrap_or(&[]);
+    let start_time = channel.times[lower];
+    let end_time = channel.times[upper];
+    let duration = end_time - start_time;
+    let factor = ((time - start_time) / duration).clamp(0.0, 1.0);
+    if matches!(channel.interpolation, Interpolation::CubicSpline) {
+        let mut result = vec![0.0; target_count];
+        for (index, result_value) in result.iter_mut().enumerate() {
+            let out_offset = lower * target_count * 3 + target_count * 2 + index;
+            let in_offset = upper * target_count * 3 + index;
+            let out_tangent = values.get(out_offset).copied().unwrap_or(0.0);
+            let in_tangent = values.get(in_offset).copied().unwrap_or(0.0);
+            let start_value = start.get(index).copied().unwrap_or(0.0);
+            let end_value = end.get(index).copied().unwrap_or(0.0);
+            let t2 = factor * factor;
+            let t3 = t2 * factor;
+            let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+            let h10 = t3 - 2.0 * t2 + factor;
+            let h01 = -2.0 * t3 + 3.0 * t2;
+            let h11 = t3 - t2;
+            *result_value = h00 * start_value
+                + h10 * duration * out_tangent
+                + h01 * end_value
+                + h11 * duration * in_tangent;
+        }
+        return result;
+    }
+    (0..target_count)
+        .map(|index| {
+            let from = start.get(index).copied().unwrap_or(0.0);
+            let to = end.get(index).copied().unwrap_or(0.0);
+            from + (to - from) * factor
+        })
+        .collect()
 }
 
 fn apply_animation_channels(
@@ -493,9 +618,25 @@ fn apply_animation_channels(
     duration: f32,
     time: f32,
     nodes: &mut [NodePose],
+    morph_weights: &mut [Vec<f32>],
 ) -> Result<(), String> {
     let time = time.clamp(0.0, duration);
     for channel in &clip.channels {
+        if matches!(channel.path, AnimationPath::MorphTargetWeights) {
+            let weights = morph_weights
+                .get_mut(channel.node_index)
+                .ok_or_else(|| "animation targets a missing morph node".to_owned())?;
+            let sampled = sample_morph_channel(channel, time, weights.len());
+            if sampled.len() != weights.len() {
+                return Err(format!(
+                    "animation targets {} morph weights but node contains {}",
+                    sampled.len(),
+                    weights.len()
+                ));
+            }
+            weights.copy_from_slice(&sampled);
+            continue;
+        }
         let mut value = sample_channel(channel, time);
         if matches!(channel.path, AnimationPath::Rotation) {
             let rotation = Quat::from_array(value);
@@ -519,6 +660,9 @@ fn apply_animation_channels(
             AnimationPath::Rotation => {
                 node.rotation = Quat::from_xyzw(value[0], value[1], value[2], value[3]).normalize();
                 node.animated = true;
+            }
+            AnimationPath::MorphTargetWeights => {
+                unreachable!("morph channels are handled before sampling")
             }
         }
     }
@@ -593,6 +737,7 @@ pub struct GltfModelData {
     pub primitives: Vec<GltfPrimitiveData>,
     instances: Vec<AnimationInstanceData>,
     nodes: Vec<NodePose>,
+    morph_weights: Vec<Vec<f32>>,
     node_names: Vec<String>,
     parents: Vec<Option<usize>>,
     skins: Vec<SkinData>,
@@ -1038,12 +1183,6 @@ impl GltfModelData {
                         mesh.name().unwrap_or("unnamed")
                     ));
                 }
-                if primitive.morph_targets().next().is_some() {
-                    return Err(format!(
-                        "mesh '{}' uses unsupported morph targets",
-                        mesh.name().unwrap_or("unnamed")
-                    ));
-                }
 
                 let reader = primitive.reader(|buffer| {
                     buffers
@@ -1059,6 +1198,76 @@ impl GltfModelData {
                         )
                     })?
                     .collect();
+                let morph_target_names = read_morph_target_names(
+                    mesh.extras().as_ref().map(|extras| extras.get()),
+                    primitive.morph_targets().count(),
+                );
+                let mut morph_targets = Vec::new();
+                for (target_index, morph_target) in primitive.morph_targets().enumerate() {
+                    let read_vec3 = |accessor: gltf::Accessor<'_>| {
+                        gltf::accessor::Iter::<[f32; 3]>::new(accessor, |buffer| {
+                            buffers
+                                .get(buffer.index())
+                                .map(|buffer_data| buffer_data.0.as_slice())
+                        })
+                        .map(|values| values.collect::<Vec<_>>())
+                    };
+                    let Some(position_values) = morph_target.positions().and_then(read_vec3) else {
+                        return Err(format!(
+                            "mesh '{}' morph target {target_index} has no POSITION displacement",
+                            mesh.name().unwrap_or("unnamed")
+                        ));
+                    };
+                    if position_values.len() != positions.len()
+                        || position_values
+                            .iter()
+                            .flatten()
+                            .any(|value| !value.is_finite())
+                    {
+                        return Err(format!(
+                            "mesh '{}' morph target {target_index} contains invalid POSITION displacements",
+                            mesh.name().unwrap_or("unnamed")
+                        ));
+                    }
+                    let normal_values = morph_target
+                        .normals()
+                        .and_then(read_vec3)
+                        .map(|values| {
+                            if values.len() != positions.len()
+                                || values.iter().flatten().any(|value| !value.is_finite())
+                            {
+                                Err(format!(
+                                    "mesh '{}' morph target {target_index} contains invalid NORMAL displacements",
+                                    mesh.name().unwrap_or("unnamed")
+                                ))
+                            } else {
+                                Ok(values)
+                            }
+                        })
+                        .transpose()?;
+                    let tangent_values = morph_target
+                        .tangents()
+                        .and_then(read_vec3)
+                        .map(|values| {
+                            if values.len() != positions.len()
+                                || values.iter().flatten().any(|value| !value.is_finite())
+                            {
+                                Err(format!(
+                                    "mesh '{}' morph target {target_index} contains invalid TANGENT displacements",
+                                    mesh.name().unwrap_or("unnamed")
+                                ))
+                            } else {
+                                Ok(values)
+                            }
+                        })
+                        .transpose()?;
+                    morph_targets.push(MorphTargetData {
+                        name: morph_target_names[target_index].clone(),
+                        positions: position_values,
+                        normals: normal_values,
+                        tangents: tangent_values,
+                    });
+                }
                 if positions.is_empty() || positions.len() > u32::MAX as usize {
                     return Err(format!(
                         "mesh '{}' has an invalid vertex count",
@@ -1356,6 +1565,7 @@ impl GltfModelData {
                         indices,
                         skin_vertices,
                         tangents,
+                        morph_targets,
                     },
                     material_index,
                 });
@@ -1364,6 +1574,20 @@ impl GltfModelData {
 
         let (nodes, parents) =
             read_nodes(&document).map_err(|error| format!("{}: {error}", path.display()))?;
+        let mut morph_weights = document
+            .nodes()
+            .map(|node| {
+                node.weights()
+                    .or_else(|| node.mesh().and_then(|mesh| mesh.weights()))
+                    .map(|weights| weights.to_vec())
+                    .unwrap_or_else(|| {
+                        node.mesh()
+                            .and_then(|mesh| mesh.primitives().next())
+                            .map(|primitive| vec![0.0; primitive.morph_targets().count()])
+                            .unwrap_or_default()
+                    })
+            })
+            .collect::<Vec<_>>();
         let mut node_names: Vec<_> = document
             .nodes()
             .map(|node| {
@@ -1394,13 +1618,21 @@ impl GltfModelData {
                 matrix: Mat4::IDENTITY,
                 animated: false,
             });
+            morph_weights.push(Vec::new());
             parents.push(None);
-            for primitive_index in 0..primitives.len() {
+            for (primitive_index, primitive) in primitives.iter().enumerate() {
                 instances.push(AnimationInstanceData {
                     name: format!("Mesh {}", primitive_index + 1),
                     primitive_index,
                     node_index: synthetic_node,
                     skin_index: None,
+                    morph_weights: vec![0.0; primitive.mesh.morph_targets.len()],
+                    morph_target_names: primitive
+                        .mesh
+                        .morph_targets
+                        .iter()
+                        .map(|target| target.name.clone())
+                        .collect(),
                 });
             }
             (nodes, parents)
@@ -1443,6 +1675,7 @@ impl GltfModelData {
             primitives,
             instances,
             nodes,
+            morph_weights,
             node_names,
             parents,
             skins,
@@ -1488,8 +1721,10 @@ impl GltfModelData {
         } else {
             let sample_nodes = self.nodes.clone();
             let node_count = sample_nodes.len();
+            let sample_morph_weights = self.morph_weights.clone();
             Some(GltfAnimationData {
                 base_nodes: self.nodes,
+                base_morph_weights: self.morph_weights,
                 parents: self.parents,
                 skins: self.skins,
                 instances: self.instances,
@@ -1498,6 +1733,7 @@ impl GltfModelData {
                 mesh_ids,
                 material_ids,
                 sample_nodes,
+                sample_morph_weights,
                 sample_globals: Vec::with_capacity(node_count),
                 sample_computed: Vec::with_capacity(node_count),
                 sample_visiting: Vec::with_capacity(node_count),
@@ -1959,12 +2195,7 @@ fn read_animations(
                 gltf::animation::Property::Translation => AnimationPath::Translation,
                 gltf::animation::Property::Rotation => AnimationPath::Rotation,
                 gltf::animation::Property::Scale => AnimationPath::Scale,
-                gltf::animation::Property::MorphTargetWeights => {
-                    return Err(format!(
-                        "animation '{}' uses unsupported morph target weights",
-                        animation.name().unwrap_or("unnamed")
-                    ));
-                }
+                gltf::animation::Property::MorphTargetWeights => AnimationPath::MorphTargetWeights,
             };
             if channel.target().node().index() >= document.nodes().len() {
                 return Err(format!(
@@ -1981,6 +2212,7 @@ fn read_animations(
             let outputs = reader
                 .read_outputs()
                 .ok_or_else(|| "animation channel is missing output values".to_owned())?;
+            let mut morph_values = None;
             let values = match (path, outputs) {
                 (AnimationPath::Translation, ReadOutputs::Translations(values)) => values
                     .map(|value| [value[0], value[1], value[2], 0.0])
@@ -1990,6 +2222,11 @@ fn read_animations(
                     .collect::<Vec<_>>(),
                 (AnimationPath::Rotation, ReadOutputs::Rotations(values)) => {
                     values.into_f32().collect::<Vec<_>>()
+                }
+                (AnimationPath::MorphTargetWeights, ReadOutputs::MorphTargetWeights(values)) => {
+                    let values = values.into_f32().collect::<Vec<_>>();
+                    morph_values = Some(values);
+                    Vec::new()
                 }
                 _ => {
                     return Err(format!(
@@ -2003,7 +2240,16 @@ fn read_animations(
             } else {
                 Some(times.len())
             };
-            if expected_values != Some(values.len())
+            if matches!(path, AnimationPath::MorphTargetWeights) {
+                if morph_values.as_ref().is_none_or(|values| {
+                    values.is_empty() || values.iter().any(|value| !value.is_finite())
+                }) {
+                    return Err(format!(
+                        "animation '{}' has invalid morph target weight output",
+                        animation.name().unwrap_or("unnamed")
+                    ));
+                }
+            } else if expected_values != Some(values.len())
                 || values.iter().flatten().any(|value| !value.is_finite())
                 || matches!(path, AnimationPath::Rotation)
                     && (0..times.len()).any(|index| {
@@ -2026,6 +2272,7 @@ fn read_animations(
                 interpolation,
                 times,
                 values,
+                morph_values,
             });
         }
         infos.push(GltfAnimationInfo {
@@ -2161,6 +2408,8 @@ fn build_instances(
                 node_index: instance.node_index,
                 node_transform,
                 skin_matrices,
+                morph_weights: instance.morph_weights.clone(),
+                morph_target_names: instance.morph_target_names.clone(),
             })
         })
         .collect()
@@ -2218,6 +2467,19 @@ fn collect_node_instances(
                 primitive_index: primitive_data_index,
                 node_index,
                 skin_index,
+                morph_weights: node
+                    .weights()
+                    .or_else(|| mesh.weights())
+                    .map(|weights| weights.to_vec())
+                    .unwrap_or_else(|| {
+                        vec![0.0; primitives[primitive_data_index].mesh.morph_targets.len()]
+                    }),
+                morph_target_names: primitives[primitive_data_index]
+                    .mesh
+                    .morph_targets
+                    .iter()
+                    .map(|target| target.name.clone())
+                    .collect(),
             });
         }
     }
@@ -2326,6 +2588,18 @@ fn convert_image(image: &gltf::image::Data) -> Result<GltfImageData, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_morph_target_names_and_falls_back_when_missing() {
+        assert_eq!(
+            read_morph_target_names(Some(r#"{"targetNames":["Blink","Smile"]}"#), 3),
+            vec!["Blink", "Smile", "Target 3"]
+        );
+        assert_eq!(
+            read_morph_target_names(None, 2),
+            vec!["Target 1", "Target 2"]
+        );
+    }
 
     #[test]
     fn clear_headlight_glass_keeps_its_texture_visible() {
@@ -2750,6 +3024,20 @@ mod tests {
     }
 
     #[test]
+    fn samples_linear_morph_target_weights() {
+        let channel = AnimationChannelData {
+            node_index: 0,
+            path: AnimationPath::MorphTargetWeights,
+            interpolation: Interpolation::Linear,
+            times: vec![0.0, 1.0],
+            values: Vec::new(),
+            morph_values: Some(vec![0.0, 1.0, 1.0, 0.0]),
+        };
+        assert_eq!(sample_morph_channel(&channel, 0.25, 2), vec![0.25, 0.75]);
+        assert_eq!(sample_morph_channel(&channel, 1.0, 2), vec![1.0, 0.0]);
+    }
+
+    #[test]
     fn samples_step_linear_and_cubic_animation_channels() {
         let channel = |interpolation, values| AnimationChannelData {
             node_index: 0,
@@ -2757,6 +3045,7 @@ mod tests {
             interpolation,
             times: vec![0.0, 1.0],
             values,
+            morph_values: None,
         };
         let step = channel(Interpolation::Step, vec![[0.0; 4], [2.0, 0.0, 0.0, 0.0]]);
         let linear = channel(Interpolation::Linear, vec![[0.0; 4], [2.0, 0.0, 0.0, 0.0]]);

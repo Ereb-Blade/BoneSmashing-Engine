@@ -207,11 +207,6 @@ fn is_supported_material_extension(name: &str) -> bool {
             | "KHR_materials_volume"
             | "KHR_materials_specular"
             | "KHR_materials_emissive_strength"
-            | "KHR_materials_clearcoat"
-            | "KHR_materials_sheen"
-            | "KHR_materials_iridescence"
-            | "KHR_materials_anisotropy"
-            | "KHR_materials_dispersion"
     )
 }
 
@@ -662,10 +657,10 @@ impl GltfModelData {
                         .filter(|name| name.starts_with("KHR_materials_"))
                         .find(|name| !is_supported_material_extension(name))
                 }) {
-                    return Err(format!(
-                        "material '{}' uses unsupported extension '{extension}'",
+                    eprintln!(
+                        "glTF material '{}' ignores unsupported extension '{extension}'; importing base PBR material",
                         material.name().unwrap_or("unnamed")
-                    ));
+                    );
                 }
                 let pbr = material.pbr_metallic_roughness();
                 let specular_glossiness = material.pbr_specular_glossiness();
@@ -2487,7 +2482,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_clearcoat_material_extension() {
+    fn accepts_clearcoat_as_partial_fallback() {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let sample_path = manifest_dir
             .join("assets")

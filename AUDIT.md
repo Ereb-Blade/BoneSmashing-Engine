@@ -2,6 +2,8 @@
 
 **Дата аудита:** 2026-11-24
 
+**Актуализация этапа 1:** 2026-11-25
+
 ## 1. Общая информация о проекте
 
 Проект — однопроцессный 3D-движок на Rust:
@@ -28,9 +30,8 @@
 - `cargo test`: пройдена, **105 тестов**, 0 ошибок.
 - Покрытие тестами включает математику камеры и матриц, scene hierarchy, cache matrices, scene serialization и миграции формата, undo/redo, animation sampling, OBJ/glTF импорт, mipmaps, IBL/environment, frustum culling, MSAA и shadow queue.
 - `cargo build --release`: согласно предыдущей проверке проекта сборка проходит.
-- `cargo clippy --all-targets --all-features -- -D warnings`: не проходит.
-- В текущей проверке найдено **29 диагностик для binary target** и **36 для test target**. Основные группы: `too_many_arguments`, collapsible conditions, chunks/array lint, `let_and_return`, `items_after_test_module`, а также API-shape и style lint.
-- Для strict проверки использовались все targets и all-features, а также опция `-D warnings`, то есть не включалась отдельная группа pedantic/nursery сверх настроек lint уровня, автоматически активируемых в данном toolchain для этих Cargo-линейтов. Clippy current toolchain сообщает diagnostics в строгом режиме как errors.
+- `cargo clippy --all-targets --all-features -- -D warnings`: проходит после cleanup.
+- Strict lint-проверка включена в GitHub Actions CI.
 - Live-render/FPS/визуальная проверка не была проведена; по коду нельзя подтверждать FPS или реальную GPU-производительность.
 
 ## 2. Полная структура проекта
@@ -570,64 +571,44 @@ Glass shader использует:
 #### Window creation
 
 Место: [`src/app.rs:571`](src/app.rs:571)
+Статус: исправлено в этапе 1.
 
-Проблема: окно создаётся через `.unwrap()`.
-
-Причина: системная ошибка window creation преобразуется в panic.
-
-Последствия: crash приложения без централизованной диагностики.
-
-Критичность: высокая.
-
-Рекомендация: возвращать `Result`, логировать ошибку и завершать event loop явно.
+Ошибка создания окна теперь обрабатывается через `match`; текст ошибки выводится в stderr, а event loop завершается явно.
 
 #### Surface capabilities
 
-Место: [`src/renderer/state.rs:651`](src/renderer/state.rs:651)
+Место: [`src/renderer/state.rs`](src/renderer/state.rs)
+Статус: исправлено в этапе 1.
 
-Проблема: индексируются `caps.formats[0]` и `caps.alpha_modes[0]`.
-
-Причина: нет проверки непустых массивов.
-
-Последствия: panic при unusual adapter/surface capability state.
-
-Критичность: средняя для desktop, высокая для cross-platform.
-
-Рекомендация: проверить массивы и вернуть engine initialization error.
+Добавлены отдельные selectors для формата, alpha mode и present mode. Пустые capabilities считаются ошибкой и приводят к контролируемому отказу инициализации renderer.
 
 #### Сворачивание окна и resize до нуля
 
 Место: [`src/app.rs:809`](src/app.rs:809) и [`src/renderer/state.rs:969`](src/renderer/state.rs:969)
 
-Проблема: обработчик resize не вызывает `Renderer::resize`, если размер равен нулю. Однако это защитная ветка на уровне application event и не подтверждает обработку нулевых размеров во всех внутренних вызовах.
+Статус: исправлено в этапе 1.
 
-Причина: при минимизации/необычном resize нулевые width/height могут попасть в промежуточные surface configure или render-target creation; в текущем коде начальная конфигурация дополнительно нормализует размер до 1, а resize явно имеет guard.
 
-Последствия: потенциальный panic или invalid surface configuration в периоды minimize/restore.
-
-Критичность: средняя-высокая.
-
-Рекомендация: хранить явное состояние suspended/0-size, запрещать get_current_texture, surface configure и render-target recreation при нулевых размерах и запускать нормальный кадр только после восстановления положительного размера.
+Для нулевого size введено явное состояние `surface_ready = false`. Resize(0, 0) не вызывает surface configure и render-target recreation; `Renderer::render` и redraw не acquire surface до восстановления положительного размера.
 
 #### Необработанные uncaptured GPU validation errors
 
 Место: создание device в [`src/renderer/state.rs:616`](src/renderer/state.rs:616)
 
-Проблема: в проекте не найдено вызовов `device.on_uncaptured_error(...)`, `push_error_scope(...)` или `pop_error_scope(...)`.
+Статус: частично исправлено в этапе 1.
 
 Причина: большинство ошибок GPU передаются при создании device, но runtime validation errors могут происходить при texture/buffer/command creation или submission.
 
 Последствия: ошибка может быть обработана только внутренним wgpu callback и может привести к процессному crash/panic или незаметному invalid frame.
 
-Критичность: высокая.
-
-Рекомендация: добавить централизованный uncaptured-error handler и error scopes вокруг suspect GPU uploads/test modes.
+Добавлен `device.on_uncaptured_error(...)` с выводом диагностики в stderr. Surface Lost, Outdated и Timeout обрабатываются reconfiguration. Error scopes остаются следующей задачей этапа инструментов.
 
 ### P1 — неполная реализация форматов
 
 #### glTF extensions
 
 Место: [`src/renderer/gltf.rs:204`](src/renderer/gltf.rs:204)
+Статус: исправлено в совместимом режиме на этапе 1.
 
 Проблема: clearcoat, sheen, iridescence, anisotropy и dispersion считаются допустимыми, но параметров в shader нет.
 
@@ -637,13 +618,14 @@ Glass shader использует:
 
 Критичность: средняя.
 
-Рекомендация: явно пометить unsupported extensions или reject model вместо принятия partial data.
+Решение этапа 1: импорт не прерывается целиком; неподдержанное расширение игнорируется с диагностическим предупреждением, а базовый PBR-материал сохраняется. Полная реализация clearcoat/sheen/etc остаётся отдельной задачей графического этапа.
 
 ### P1 — память текстур
 
 #### OBJ texture budget
 
 Место: [`src/renderer/mesh.rs:28`](src/renderer/mesh.rs:28)
+Статус: исправлено в этапе 1.
 
 Проблема: для OBJ нет общего image/mipmap budget; ограничиваются только dimension 4096.
 
@@ -671,22 +653,11 @@ Glass shader использует:
 
 ### P1 — strict Clippy
 
-Проверка strict Clippy завершилась с ошибками:
+Статус: исправлено в этапе 1.
 
-- 29 ошибок для binary target;
-- 36 ошибок для test target;
-- в основном excessive function arguments и collapsible conditions;
-- есть также сложные data type signatures.
-
-Проблема: CI с `-D warnings` не проходит.
 
 Причина: style/API-shape debt.
 
-Последствия: больше friction при добавлении изменений.
-
-Критичность: средняя.
-
-Рекомендация: обрабатывать постепенно, начиная с public API signatures и Clippy diagnostics.
 
 ### P1 — фоновые загрузки и race conditions
 
@@ -949,13 +920,17 @@ Glass shader использует:
 ## 11. Дорожная карта разработки
 
 ### Этап 1 — Критические проблемы
+Статус: выполнен.
 
-- убрать `.unwrap()` из window creation;
-- проверять surface formats/alpha modes;
-- завершить strict Clippy cleanup;
-- явно обработать unsupported glTF extensions;
-- ввести OBJ memory budget;
-- настроить baseline CI для tests/check.
+- window creation обрабатывается через `Result`;
+- surface format, alpha mode и present mode валидируются capability selectors;
+- нулевой размер обрабатывается как suspended surface;
+- surface Lost/Outdated/Timeout обрабатываются reconfiguration;
+- uncaptured GPU errors выводятся в diagnostics callback;
+- unsupported glTF extensions используют совместимый PBR fallback с предупреждением;
+- OBJ import имеет общий 128 MiB raw image и 128 MiB mipmap budget;
+- strict Clippy проходит;
+- базовый CI добавлен для check/test/Clippy.
 
 ### Этап 2 — Архитектура
 
@@ -1016,7 +991,7 @@ Glass shader использует:
 1. Устранить crash-пути window/surface initialization.
 2. Ввести general OBJ texture/mipmap budget.
 3. Явно определить поддержку glTF extensions.
-4. Завершить strict Clippy debt до требуемого уровня CI.
+4. Поддерживать strict Clippy и CI зелёными при каждом изменении.
 5. Добавить benchmark baseline и GPU/CPU profiling.
 6. Улучшить fixed shadow volume/cascade.
 7. Разделить `Renderer::render` на named render passes.
@@ -1052,7 +1027,6 @@ Glass shader использует:
 - fixed shadow system;
 - отсутствуют LOD, occlusion, GPU culling и indirect drawing;
 - неполная support policy для glTF extensions;
-- strict Clippy не проходит;
 - нет benchmark/profile baseline;
 - отсутствуют physics/ECS/asset manager.
 

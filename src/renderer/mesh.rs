@@ -9,6 +9,8 @@ use glam::Vec3;
 use wgpu::util::DeviceExt;
 
 pub(crate) const MAX_IMPORTED_TEXTURE_DIMENSION: u32 = 4096;
+const MAX_IMPORTED_OBJ_RAW_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_IMPORTED_OBJ_MIPMAP_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct MeshData {
@@ -61,12 +63,16 @@ impl ObjModelData {
         let texture_directory = path.parent().unwrap_or_else(|| Path::new("."));
         let mut textures = Vec::new();
         let mut texture_cache = HashMap::new();
+        let mut total_raw_bytes = 0_u64;
+        let mut total_mipmap_bytes = 0_u64;
         let mut loaded_materials = Vec::with_capacity(materials.len());
 
         for material in materials {
             let load_texture = |filename: Option<String>,
                                 cache: &mut HashMap<PathBuf, usize>,
-                                textures: &mut Vec<ObjTextureData>|
+                                textures: &mut Vec<ObjTextureData>,
+                                raw_bytes: &mut u64,
+                                mipmap_bytes: &mut u64|
              -> Result<Option<usize>, ObjImportError> {
                 let Some(filename) = filename else {
                     return Ok(None);
@@ -101,6 +107,26 @@ impl ObjModelData {
                 let image = downscale_obj_texture(image);
                 let image = image.to_rgba8();
                 let image = image::imageops::flip_vertical(&image);
+                let raw_bytes_for_texture =
+                    u64::try_from(image.as_raw().len()).unwrap_or(u64::MAX);
+                let mipmap_bytes_for_texture =
+                    obj_texture_mipmap_bytes(image.width(), image.height());
+                let next_raw_bytes = raw_bytes.saturating_add(raw_bytes_for_texture);
+                let next_mipmap_bytes = mipmap_bytes.saturating_add(mipmap_bytes_for_texture);
+                if next_raw_bytes > MAX_IMPORTED_OBJ_RAW_BYTES {
+                    return Err(ObjImportError::Invalid(format!(
+                        "OBJ texture import exceeds the {} MiB raw image budget",
+                        MAX_IMPORTED_OBJ_RAW_BYTES / (1024 * 1024)
+                    )));
+                }
+                if next_mipmap_bytes > MAX_IMPORTED_OBJ_MIPMAP_BYTES {
+                    return Err(ObjImportError::Invalid(format!(
+                        "OBJ texture import exceeds the {} MiB mipmap budget",
+                        MAX_IMPORTED_OBJ_MIPMAP_BYTES / (1024 * 1024)
+                    )));
+                }
+                *raw_bytes = next_raw_bytes;
+                *mipmap_bytes = next_mipmap_bytes;
                 let index = textures.len();
                 textures.push(ObjTextureData {
                     width: image.width(),
@@ -115,9 +141,17 @@ impl ObjModelData {
                 material.diffuse_texture.clone(),
                 &mut texture_cache,
                 &mut textures,
+                &mut total_raw_bytes,
+                &mut total_mipmap_bytes,
             )?;
             let ambient_texture = if let Some(filename) = material.ambient_texture.clone() {
-                load_texture(Some(filename), &mut texture_cache, &mut textures)?
+                load_texture(
+                    Some(filename),
+                    &mut texture_cache,
+                    &mut textures,
+                    &mut total_raw_bytes,
+                    &mut total_mipmap_bytes,
+                )?
             } else {
                 let inferred_filename = material
                     .diffuse_texture
@@ -127,13 +161,24 @@ impl ObjModelData {
                         inferred_obj_occlusion_filename(filename, texture_directory)
                     });
                 if let Some(filename) = inferred_filename {
-                    load_texture(Some(filename), &mut texture_cache, &mut textures)?
+                    load_texture(
+                        Some(filename),
+                        &mut texture_cache,
+                        &mut textures,
+                        &mut total_raw_bytes,
+                        &mut total_mipmap_bytes,
+                    )?
                 } else {
                     None
                 }
             };
-            let normal_texture =
-                load_texture(material.normal_texture, &mut texture_cache, &mut textures)?;
+            let normal_texture = load_texture(
+                material.normal_texture,
+                &mut texture_cache,
+                &mut textures,
+                &mut total_raw_bytes,
+                &mut total_mipmap_bytes,
+            )?;
 
             loaded_materials.push(ObjMaterialData {
                 name: material.name.clone(),
@@ -255,6 +300,23 @@ fn downscale_obj_texture(image: image::DynamicImage) -> image::DynamicImage {
     } else {
         image
     }
+}
+
+fn obj_texture_mipmap_bytes(width: u32, height: u32) -> u64 {
+    let mut bytes = 0_u64;
+    let mut mip_width = width;
+    let mut mip_height = height;
+    while mip_width > 0 && mip_height > 0 {
+        bytes = bytes.saturating_add(
+            u64::from(mip_width).saturating_mul(u64::from(mip_height)).saturating_mul(4),
+        );
+        mip_width = (mip_width / 2).max(1);
+        mip_height = (mip_height / 2).max(1);
+        if mip_width == 1 && mip_height == 1 {
+            break;
+        }
+    }
+    bytes
 }
 
 #[repr(C)]

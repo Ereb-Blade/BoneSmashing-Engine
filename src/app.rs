@@ -568,17 +568,21 @@ impl App {
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
-            let window = Arc::new(
-                event_loop
-                    .create_window(Window::default_attributes().with_title("BoneSmashing Engine"))
-                    .unwrap(),
-            );
+            let window = match event_loop
+                .create_window(Window::default_attributes().with_title("BoneSmashing Engine"))
+            {
+                Ok(window) => Arc::new(window),
+                Err(error) => {
+                    eprintln!("Could not create application window: {error}");
+                    event_loop.exit();
+                    return;
+                }
+            };
             let size = window.inner_size();
             if size.width > 0 && size.height > 0 {
                 self.camera.aspect = size.width as f32 / size.height as f32;
             }
             self.last_time = Instant::now();
-            self.window = Some(window.clone());
             match pollster::block_on(Renderer::new(window.clone())) {
                 Ok(renderer) => {
                     self.debug_ui = Some(DebugUi::new(
@@ -587,10 +591,12 @@ impl ApplicationHandler for App {
                         renderer.surface_format(),
                     ));
                     self.renderer = Some(renderer);
+                    self.window = Some(window.clone());
                 }
                 Err(error) => {
                     eprintln!("Could not initialize renderer: {error}");
                     event_loop.exit();
+                    return;
                 }
             }
 
@@ -810,6 +816,8 @@ impl ApplicationHandler for App {
                 if size.width > 0 && size.height > 0 {
                     renderer.resize(size.width, size.height);
                     self.camera.aspect = size.width as f32 / size.height as f32;
+                } else {
+                    renderer.resize(0, 0);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -877,6 +885,10 @@ impl ApplicationHandler for App {
                 self.last_time = Instant::now();
             }
             WindowEvent::RedrawRequested => {
+                if !renderer.is_surface_ready() {
+                    window.request_redraw();
+                    return;
+                }
                 let now = Instant::now();
                 let dt = now.duration_since(self.last_time).as_secs_f32().min(0.1);
                 self.last_time = now;

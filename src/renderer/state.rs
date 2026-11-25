@@ -114,6 +114,30 @@ fn default_msaa_sample_count(supported: &[u32]) -> u32 {
         .unwrap_or(1)
 }
 
+fn select_surface_format(caps: &wgpu::SurfaceCapabilities) -> Result<wgpu::TextureFormat, String> {
+    caps.formats
+        .iter()
+        .copied()
+        .find(|format| format.is_srgb())
+        .or_else(|| caps.formats.first().copied())
+        .ok_or_else(|| "The GPU surface reports no supported texture formats".to_owned())
+}
+
+fn select_alpha_mode(caps: &wgpu::SurfaceCapabilities) -> Result<wgpu::CompositeAlphaMode, String> {
+    caps.alpha_modes
+        .first()
+        .copied()
+        .ok_or_else(|| "The GPU surface reports no supported alpha modes".to_owned())
+}
+
+fn select_present_mode(caps: &wgpu::SurfaceCapabilities) -> Result<wgpu::PresentMode, String> {
+    [wgpu::PresentMode::Mailbox, wgpu::PresentMode::Fifo]
+        .into_iter()
+        .find(|mode| caps.present_modes.contains(mode))
+        .or_else(|| caps.present_modes.first().copied())
+        .ok_or_else(|| "The GPU surface reports no supported present modes".to_owned())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RendererSettings {
     pub key_light_yaw_degrees: f32,
@@ -521,6 +545,7 @@ fn material_casts_shadow(transmission_factor: f32) -> bool {
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     pub device: wgpu::Device,
+    surface_ready: bool,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
@@ -646,8 +671,8 @@ impl Renderer {
             .request_device(&device_descriptor)
             .await
             .map_err(|error| format!("Could not create GPU device: {error}"))?;
-        device.on_uncaptured_error(Box::new(|error| {
-            eprintln!("GPU uncaptured error: {:?}", error);
+        device.on_uncaptured_error(Box::new(move |error| {
+            eprintln!("GPU uncaptured error: {error:?}");
         }));
         let supported_msaa_samples = supported_msaa_sample_counts(&adapter);
         let mut settings = RendererSettings::default();
@@ -656,20 +681,17 @@ impl Renderer {
         }
 
         let caps = surface.get_capabilities(&adapter);
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(caps.formats[0]);
+        let format = select_surface_format(&caps)?;
+        let alpha_mode = select_alpha_mode(&caps)?;
+        let present_mode = select_present_mode(&caps)?;
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: caps.alpha_modes[0],
+            present_mode,
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -908,6 +930,7 @@ impl Renderer {
         let mut renderer = Self {
             surface,
             device,
+            surface_ready: size.width > 0 && size.height > 0,
             queue,
             config,
             pipeline: pipeline_bundle.pipeline,
@@ -978,12 +1001,18 @@ impl Renderer {
 
     pub fn resize(&mut self, w: u32, h: u32) {
         if w == 0 || h == 0 {
+            self.surface_ready = false;
             return;
         }
         self.config.width = w;
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
         self.resize_render_targets();
+        self.surface_ready = true;
+    }
+
+    pub fn is_surface_ready(&self) -> bool {
+        self.surface_ready
     }
 
     fn resize_render_targets(&mut self) {
@@ -1844,6 +1873,9 @@ impl Renderer {
         fps: f32,
         cpu_frame_time: f32,
     ) {
+        if !self.surface_ready {
+            return;
+        }
         let ui_started = Instant::now();
         let previous_timings = self.timings;
         debug_ui.prepare_frame(
@@ -2165,7 +2197,11 @@ impl Renderer {
         let acquire_started = Instant::now();
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            Err(
+                wgpu::SurfaceError::Lost
+                | wgpu::SurfaceError::Outdated
+                | wgpu::SurfaceError::Timeout,
+            ) => {
                 self.surface.configure(&self.device, &self.config);
                 return;
             }
@@ -2642,6 +2678,39 @@ mod tests {
         assert_eq!(default_msaa_sample_count(&[1, 2, 4, 8]), 4);
         assert_eq!(default_msaa_sample_count(&[1, 2]), 2);
         assert_eq!(default_msaa_sample_count(&[1]), 1);
+    }
+
+    #[test]
+    fn surface_format_selection_requires_a_capability() {
+        let capabilities = wgpu::SurfaceCapabilities {
+            formats: vec![wgpu::TextureFormat::Bgra8UnormSrgb],
+            present_modes: vec![wgpu::PresentMode::Fifo],
+            alpha_modes: vec![wgpu::CompositeAlphaMode::Opaque],
+            usages: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        };
+
+        assert_eq!(
+            select_surface_format(&capabilities).unwrap(),
+            wgpu::TextureFormat::Bgra8UnormSrgb
+        );
+        assert_eq!(
+            select_present_mode(&capabilities).unwrap(),
+            wgpu::PresentMode::Fifo
+        );
+        assert_eq!(
+            select_alpha_mode(&capabilities).unwrap(),
+            wgpu::CompositeAlphaMode::Opaque
+        );
+
+        let empty = wgpu::SurfaceCapabilities {
+            formats: vec![],
+            present_modes: vec![],
+            alpha_modes: vec![],
+            usages: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        };
+        assert!(select_surface_format(&empty).is_err());
+        assert!(select_present_mode(&empty).is_err());
+        assert!(select_alpha_mode(&empty).is_err());
     }
 
     #[test]

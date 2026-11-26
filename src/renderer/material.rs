@@ -1,5 +1,8 @@
 #![allow(clippy::too_many_arguments, clippy::items_after_test_module)]
 
+pub const MATERIAL_TEXTURE_SPECULAR: u32 = 1 << 0;
+pub const MATERIAL_TEXTURE_SPECULAR_COLOR: u32 = 1 << 1;
+
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MaterialParams {
@@ -27,7 +30,7 @@ pub struct MaterialParams {
     pub specular_color_tex_coord: u32,
     pub transmission_tex_coord: u32,
     pub pbr_workflow: u32,
-    pub _pad: u32,
+    pub texture_flags: u32,
     pub thickness_factor: f32,
     pub attenuation_distance: f32,
     pub thickness_tex_coord: u32,
@@ -82,7 +85,7 @@ impl Default for MaterialParams {
             specular_color_tex_coord: 0,
             transmission_tex_coord: 0,
             pbr_workflow: 0,
-            _pad: 0,
+            texture_flags: 0,
             thickness_factor: 0.0,
             attenuation_distance: 0.0,
             thickness_tex_coord: 0,

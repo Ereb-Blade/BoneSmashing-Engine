@@ -402,6 +402,9 @@ struct ProfileSample {
     gpu_render_ms: Option<f32>,
     gpu_shadow_map_ms: Option<f32>,
     gpu_opaque_ms: Option<f32>,
+    gpu_transparent_ms: Option<f32>,
+    gpu_glass_ms: Option<f32>,
+    gpu_postprocess_ms: Option<f32>,
     draw_calls: usize,
     triangles: usize,
     meshes: usize,
@@ -424,6 +427,9 @@ struct ProfileSummary {
     gpu_render_ms: ProfileMetricSummary,
     gpu_shadow_map_ms: ProfileMetricSummary,
     gpu_opaque_ms: ProfileMetricSummary,
+    gpu_transparent_ms: ProfileMetricSummary,
+    gpu_glass_ms: ProfileMetricSummary,
+    gpu_postprocess_ms: ProfileMetricSummary,
 }
 
 #[derive(Serialize)]
@@ -555,6 +561,15 @@ impl ProfileCapture {
             gpu_opaque_ms: has_new_gpu_sample
                 .then_some(timings.gpu_opaque_pass_ms)
                 .flatten(),
+            gpu_transparent_ms: has_new_gpu_sample
+                .then_some(timings.gpu_transparent_pass_ms)
+                .flatten(),
+            gpu_glass_ms: has_new_gpu_sample
+                .then_some(timings.gpu_glass_pass_ms)
+                .flatten(),
+            gpu_postprocess_ms: has_new_gpu_sample
+                .then_some(timings.gpu_postprocess_pass_ms)
+                .flatten(),
             draw_calls: timings.draw_calls,
             triangles: timings.triangle_count,
             meshes: timings.active_meshes,
@@ -596,7 +611,7 @@ impl ProfileCapture {
             .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
         let path = directory.join(format!("profile-{written_at_unix_ms}.json"));
         let log = ProfileLog {
-            schema_version: 1,
+            schema_version: 2,
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
             written_at_unix_ms,
             scene_path: self.scene_path,
@@ -634,6 +649,19 @@ impl ProfileSummary {
             ),
             gpu_opaque_ms: summarize_profile_metric(
                 samples.iter().filter_map(|sample| sample.gpu_opaque_ms),
+            ),
+            gpu_transparent_ms: summarize_profile_metric(
+                samples
+                    .iter()
+                    .filter_map(|sample| sample.gpu_transparent_ms),
+            ),
+            gpu_glass_ms: summarize_profile_metric(
+                samples.iter().filter_map(|sample| sample.gpu_glass_ms),
+            ),
+            gpu_postprocess_ms: summarize_profile_metric(
+                samples
+                    .iter()
+                    .filter_map(|sample| sample.gpu_postprocess_ms),
             ),
         }
     }
@@ -2023,6 +2051,34 @@ impl DebugUi {
         self.profile_capture.is_some()
     }
 
+    pub fn profile_environment_ready(&self, renderer: &Renderer) -> bool {
+        self.scene_environment_request.is_none()
+            && !self.scene_environment_load_pending
+            && !renderer.environment_is_loading()
+    }
+
+    pub fn start_profile_capture(
+        &mut self,
+        camera: &Camera,
+        renderer: &Renderer,
+        world: &World,
+        timings: RenderTimings,
+    ) {
+        if self.profile_capture.is_none() {
+            self.profile_capture = Some(ProfileCapture::new(
+                camera,
+                renderer,
+                world,
+                self.scene_path.clone(),
+                timings,
+            ));
+        }
+    }
+
+    pub fn take_profile_status(&mut self) -> Option<Result<String, String>> {
+        self.profile_status.take()
+    }
+
     pub fn animation_controller_target(&self, world: &World) -> Option<ModelGroupId> {
         if self.active_tab != EditorTab::Animation {
             return None;
@@ -3225,12 +3281,30 @@ impl DebugUi {
                                             .map_or("unavailable".to_owned(), |time| {
                                                 format!("{time:.2} ms")
                                             });
+                                        let transparent_text = timings
+                                            .gpu_transparent_pass_ms
+                                            .map_or("unavailable".to_owned(), |time| {
+                                                format!("{time:.2} ms")
+                                            });
+                                        let glass_text = timings
+                                            .gpu_glass_pass_ms
+                                            .map_or("unavailable".to_owned(), |time| {
+                                                format!("{time:.2} ms")
+                                            });
+                                        let postprocess_text = timings
+                                            .gpu_postprocess_pass_ms
+                                            .map_or("unavailable".to_owned(), |time| {
+                                                format!("{time:.2} ms")
+                                            });
                                         ui.small(format!(
                                             "GPU render: {gpu_text} | Draw calls: {}",
                                             timings.draw_calls
                                         ));
                                         ui.small(format!(
-                                            "GPU passes: shadow map {shadow_text} | opaque {opaque_text}"
+                                            "GPU passes: shadow {shadow_text} | opaque {opaque_text} | transparent {transparent_text}"
+                                        ));
+                                        ui.small(format!(
+                                            "GPU passes: glass {glass_text} | postprocess {postprocess_text}"
                                         ));
                                         ui.small(format!(
                                             "Triangles: {} | Meshes: {} | Materials: {}",

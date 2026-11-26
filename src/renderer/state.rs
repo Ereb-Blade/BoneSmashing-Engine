@@ -17,7 +17,10 @@ use crate::camera::{Camera, CameraUniform};
 use crate::config::DEPTH_FORMAT;
 use crate::core::{MATERIAL_DEFAULT, MESH_PLANE, MaterialId, MeshId};
 use crate::renderer::gltf::{GltfModelData, LoadedGltfModel};
-use crate::renderer::material::{Material, MaterialParams, generate_mip_levels_with_alpha};
+use crate::renderer::material::{
+    MATERIAL_TEXTURE_SPECULAR, MATERIAL_TEXTURE_SPECULAR_COLOR, Material, MaterialParams,
+    generate_mip_levels_with_alpha,
+};
 use crate::renderer::mesh::{Mesh, MeshData, ObjModelData};
 use crate::renderer::pipeline::{HDR_FORMAT, RenderPipelineBundle};
 use crate::renderer::{debug_ui::DebugUi, environment::Environment};
@@ -244,6 +247,9 @@ pub struct RenderTimings {
     pub gpu_frame_ms: Option<f32>,
     pub gpu_shadow_map_ms: Option<f32>,
     pub gpu_opaque_pass_ms: Option<f32>,
+    pub gpu_transparent_pass_ms: Option<f32>,
+    pub gpu_glass_pass_ms: Option<f32>,
+    pub gpu_postprocess_pass_ms: Option<f32>,
     pub gpu_sample_id: u64,
     pub draw_calls: usize,
     pub triangle_count: usize,
@@ -258,8 +264,14 @@ const GPU_TIMESTAMP_SHADOW_START: u32 = 1;
 const GPU_TIMESTAMP_SHADOW_END: u32 = 2;
 const GPU_TIMESTAMP_OPAQUE_START: u32 = 3;
 const GPU_TIMESTAMP_OPAQUE_END: u32 = 4;
-const GPU_TIMESTAMP_FRAME_END: u32 = 5;
-const GPU_TIMESTAMP_QUERY_COUNT: u32 = 6;
+const GPU_TIMESTAMP_TRANSPARENT_START: u32 = 5;
+const GPU_TIMESTAMP_TRANSPARENT_END: u32 = 6;
+const GPU_TIMESTAMP_GLASS_START: u32 = 7;
+const GPU_TIMESTAMP_GLASS_END: u32 = 8;
+const GPU_TIMESTAMP_POSTPROCESS_START: u32 = 9;
+const GPU_TIMESTAMP_POSTPROCESS_END: u32 = 10;
+const GPU_TIMESTAMP_FRAME_END: u32 = 11;
+const GPU_TIMESTAMP_QUERY_COUNT: u32 = 12;
 const GPU_TIMESTAMP_BUFFER_SIZE: u64 = GPU_TIMESTAMP_QUERY_COUNT as u64 * wgpu::QUERY_SIZE as u64;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -267,6 +279,9 @@ struct GpuTimingSample {
     frame_ms: f32,
     shadow_map_ms: f32,
     opaque_pass_ms: f32,
+    transparent_pass_ms: f32,
+    glass_pass_ms: f32,
+    postprocess_pass_ms: f32,
 }
 
 struct GpuTimestampProfiler {
@@ -315,6 +330,21 @@ fn gpu_timing_sample(
         opaque_pass_ms: timestamp_delta_ms(
             timestamps[GPU_TIMESTAMP_OPAQUE_START as usize],
             timestamps[GPU_TIMESTAMP_OPAQUE_END as usize],
+            timestamp_period_ns,
+        )?,
+        transparent_pass_ms: timestamp_delta_ms(
+            timestamps[GPU_TIMESTAMP_TRANSPARENT_START as usize],
+            timestamps[GPU_TIMESTAMP_TRANSPARENT_END as usize],
+            timestamp_period_ns,
+        )?,
+        glass_pass_ms: timestamp_delta_ms(
+            timestamps[GPU_TIMESTAMP_GLASS_START as usize],
+            timestamps[GPU_TIMESTAMP_GLASS_END as usize],
+            timestamp_period_ns,
+        )?,
+        postprocess_pass_ms: timestamp_delta_ms(
+            timestamps[GPU_TIMESTAMP_POSTPROCESS_START as usize],
+            timestamps[GPU_TIMESTAMP_POSTPROCESS_END as usize],
             timestamp_period_ns,
         )?,
     })
@@ -1411,6 +1441,10 @@ impl Renderer {
         self.settings
     }
 
+    pub fn current_timings(&self) -> RenderTimings {
+        self.timings
+    }
+
     pub fn set_settings(&mut self, settings: RendererSettings) {
         let mut settings = settings;
         settings.render_scale = if settings.render_scale.is_finite() {
@@ -2230,6 +2264,10 @@ impl Renderer {
                     specular_factor: material_data.specular_factor,
                     specular_color_factor: material_data.specular_color_factor,
                     pbr_workflow: u32::from(material_data.specular_glossiness),
+                    texture_flags: (u32::from(material_data.specular_image.is_some())
+                        * MATERIAL_TEXTURE_SPECULAR)
+                        | (u32::from(material_data.specular_color_image.is_some())
+                            * MATERIAL_TEXTURE_SPECULAR_COLOR),
                     emissive_factor: material_data.emissive_factor,
                     emissive_strength: material_data.emissive_strength,
                     occlusion_strength: material_data.occlusion_strength,
@@ -2310,6 +2348,9 @@ impl Renderer {
                 self.timings.gpu_frame_ms = Some(sample.frame_ms);
                 self.timings.gpu_shadow_map_ms = Some(sample.shadow_map_ms);
                 self.timings.gpu_opaque_pass_ms = Some(sample.opaque_pass_ms);
+                self.timings.gpu_transparent_pass_ms = Some(sample.transparent_pass_ms);
+                self.timings.gpu_glass_pass_ms = Some(sample.glass_pass_ms);
+                self.timings.gpu_postprocess_pass_ms = Some(sample.postprocess_pass_ms);
                 self.timings.gpu_sample_id = self.timings.gpu_sample_id.wrapping_add(1);
             }
             Some(Ok(None)) => {}
@@ -2319,11 +2360,17 @@ impl Renderer {
                 self.timings.gpu_frame_ms = None;
                 self.timings.gpu_shadow_map_ms = None;
                 self.timings.gpu_opaque_pass_ms = None;
+                self.timings.gpu_transparent_pass_ms = None;
+                self.timings.gpu_glass_pass_ms = None;
+                self.timings.gpu_postprocess_pass_ms = None;
             }
             None => {
                 self.timings.gpu_frame_ms = None;
                 self.timings.gpu_shadow_map_ms = None;
                 self.timings.gpu_opaque_pass_ms = None;
+                self.timings.gpu_transparent_pass_ms = None;
+                self.timings.gpu_glass_pass_ms = None;
+                self.timings.gpu_postprocess_pass_ms = None;
             }
         }
         let ui_started = Instant::now();
@@ -2862,6 +2909,9 @@ impl Renderer {
             );
         }
 
+        if capture_gpu_frame && let Some(profiler) = self.gpu_timestamp_profiler.as_ref() {
+            profiler.write_timestamp(&mut encoder, GPU_TIMESTAMP_TRANSPARENT_START);
+        }
         {
             let (color_view, resolve_target) = if multisampled {
                 (
@@ -2940,6 +2990,10 @@ impl Renderer {
                     }
                 }
             }
+        }
+        if capture_gpu_frame && let Some(profiler) = self.gpu_timestamp_profiler.as_ref() {
+            profiler.write_timestamp(&mut encoder, GPU_TIMESTAMP_TRANSPARENT_END);
+            profiler.write_timestamp(&mut encoder, GPU_TIMESTAMP_GLASS_START);
         }
 
         let has_glass = self
@@ -3032,6 +3086,10 @@ impl Renderer {
                 pass.draw_indexed(0..mesh.num_indices, 0, range.clone());
             }
         }
+        if capture_gpu_frame && let Some(profiler) = self.gpu_timestamp_profiler.as_ref() {
+            profiler.write_timestamp(&mut encoder, GPU_TIMESTAMP_GLASS_END);
+            profiler.write_timestamp(&mut encoder, GPU_TIMESTAMP_POSTPROCESS_START);
+        }
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3054,6 +3112,9 @@ impl Renderer {
             pass.set_bind_group(2, &self.environment_bind_group, &[]);
             pass.set_bind_group(3, &self.postprocess_bind_group, &[]);
             pass.draw(0..3, 0..1);
+        }
+        if capture_gpu_frame && let Some(profiler) = self.gpu_timestamp_profiler.as_ref() {
+            profiler.write_timestamp(&mut encoder, GPU_TIMESTAMP_POSTPROCESS_END);
         }
 
         let mut command_buffers = debug_ui.render(&self.device, &self.queue, &mut encoder, &view);
@@ -3100,8 +3161,14 @@ mod tests {
     }
 
     #[test]
-    fn gpu_timestamp_sample_separates_shadow_and_opaque_passes() {
-        let sample = gpu_timing_sample([100, 200, 300, 300, 700, 1_100], 1_000.0).unwrap();
+    fn gpu_timestamp_sample_separates_render_passes() {
+        let sample = gpu_timing_sample(
+            [
+                100, 200, 300, 300, 700, 700, 800, 800, 900, 900, 1_000, 1_100,
+            ],
+            1_000.0,
+        )
+        .unwrap();
 
         assert_eq!(
             sample,
@@ -3109,6 +3176,9 @@ mod tests {
                 frame_ms: 1.0,
                 shadow_map_ms: 0.1,
                 opaque_pass_ms: 0.4,
+                transparent_pass_ms: 0.1,
+                glass_pass_ms: 0.1,
+                postprocess_pass_ms: 0.1,
             }
         );
     }

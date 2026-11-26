@@ -3,8 +3,8 @@
   "version": 9,
   "groups": [
     {
-      "name": "Concept Vehicle",
-      "path": "../models/CarConcept/CarConcept.glb",
+      "name": "BoomBox Showcase",
+      "path": "../models/BoomBox/BoomBox.glb",
       "position": [0.0, 0.0, 0.0],
       "rotation": [0.0, 0.0, 0.0, 1.0],
       "scale": [1.5, 1.5, 1.5]
@@ -254,11 +254,11 @@
     {
       "source": {
         "type": "asset",
-        "path": "../models/CarConcept/CarConcept.glb",
+        "path": "../models/BoomBox/BoomBox.glb",
         "instance_index": 0
       },
       "model_group": 0,
-      "name": "Hero Concept Vehicle",
+      "name": "Hero Boom Box",
       "position": [0.0, 0.25, 0.0],
       "rotation": [0.0, 0.0, 0.0, 1.0],
       "scale": [1.0, 1.0, 1.0]

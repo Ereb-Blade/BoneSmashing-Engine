@@ -6,10 +6,11 @@ use std::sync::Arc;
 use std::time::Instant;
 use winit::{
     application::ApplicationHandler,
+    dpi::PhysicalSize,
     event::{DeviceEvent, DeviceId, ElementState, WindowEvent},
     event_loop::ActiveEventLoop,
     keyboard::{KeyCode, PhysicalKey},
-    window::{CursorGrabMode, Window, WindowId},
+    window::{CursorGrabMode, Fullscreen, Window, WindowId},
 };
 
 use crate::camera::{Camera, CameraController};
@@ -28,6 +29,134 @@ use crate::scene::{
     AnimationKeyboardControl, ModelAnimationClip, ModelAnimationPlayback, ModelAnimationTransition,
     ModelGroupId, RenderObject, SceneFile, Transform, World, build_world,
 };
+
+#[derive(Clone, Debug)]
+pub struct BenchmarkConfig {
+    pub scene_path: PathBuf,
+    pub width: u32,
+    pub height: u32,
+    pub render_scale: Option<f32>,
+    pub shadow_pcf_samples: Option<u32>,
+    pub msaa_samples: Option<u32>,
+    pub fullscreen: bool,
+}
+
+impl BenchmarkConfig {
+    pub fn from_args(mut args: impl Iterator<Item = String>) -> Result<Option<Self>, String> {
+        let mut benchmark = false;
+        let mut scene_path = None;
+        let mut width = 1280;
+        let mut height = 720;
+        let mut render_scale = None;
+        let mut shadow_pcf_samples = None;
+        let mut msaa_samples = None;
+        let mut fullscreen = false;
+
+        while let Some(argument) = args.next() {
+            match argument.as_str() {
+                "--benchmark" => benchmark = true,
+                "--benchmark-size" => {
+                    benchmark = true;
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "--benchmark-size requires WIDTHxHEIGHT".to_owned())?;
+                    let (w, h) = value
+                        .split_once('x')
+                        .ok_or_else(|| "--benchmark-size must use WIDTHxHEIGHT".to_owned())?;
+                    width = w.parse().map_err(|_| {
+                        "--benchmark-size width must be a positive integer".to_owned()
+                    })?;
+                    height = h.parse().map_err(|_| {
+                        "--benchmark-size height must be a positive integer".to_owned()
+                    })?;
+                    if width == 0 || height == 0 {
+                        return Err("--benchmark-size dimensions must be positive".to_owned());
+                    }
+                }
+                "--benchmark-scene" => {
+                    benchmark = true;
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "--benchmark-scene requires a scene path".to_owned())?;
+                    scene_path = Some(PathBuf::from(value));
+                }
+                "--benchmark-render-scale" => {
+                    benchmark = true;
+                    let value = args.next().ok_or_else(|| {
+                        "--benchmark-render-scale requires a value from 0.5 to 1.0".to_owned()
+                    })?;
+                    let scale = value.parse::<f32>().map_err(|_| {
+                        "--benchmark-render-scale must be between 0.5 and 1.0".to_owned()
+                    })?;
+                    if !scale.is_finite() || !(0.5..=1.0).contains(&scale) {
+                        return Err(
+                            "--benchmark-render-scale must be between 0.5 and 1.0".to_owned()
+                        );
+                    }
+                    render_scale = Some(scale);
+                }
+                "--benchmark-shadow-pcf-samples" => {
+                    benchmark = true;
+                    let value = args.next().ok_or_else(|| {
+                        "--benchmark-shadow-pcf-samples requires 2, 4, 8, or 16".to_owned()
+                    })?;
+                    let samples = value.parse::<u32>().map_err(|_| {
+                        "--benchmark-shadow-pcf-samples must be 2, 4, 8, or 16".to_owned()
+                    })?;
+                    if ![2, 4, 8, 16].contains(&samples) {
+                        return Err(
+                            "--benchmark-shadow-pcf-samples must be 2, 4, 8, or 16".to_owned()
+                        );
+                    }
+                    shadow_pcf_samples = Some(samples);
+                }
+                "--benchmark-msaa-samples" => {
+                    benchmark = true;
+                    let value = args.next().ok_or_else(|| {
+                        "--benchmark-msaa-samples requires 1, 2, 4, or 8".to_owned()
+                    })?;
+                    let samples = value
+                        .parse::<u32>()
+                        .map_err(|_| "--benchmark-msaa-samples must be 1, 2, 4, or 8".to_owned())?;
+                    if ![1, 2, 4, 8].contains(&samples) {
+                        return Err("--benchmark-msaa-samples must be 1, 2, 4, or 8".to_owned());
+                    }
+                    msaa_samples = Some(samples);
+                }
+                "--benchmark-fullscreen" => {
+                    benchmark = true;
+                    fullscreen = true;
+                }
+                other if !other.starts_with('-') && benchmark && scene_path.is_none() => {
+                    scene_path = Some(PathBuf::from(other));
+                }
+                other if other.starts_with("--") => {
+                    return Err(format!("Unknown benchmark option: {other}"));
+                }
+                _ => {}
+            }
+        }
+
+        if !benchmark {
+            return Ok(None);
+        }
+        let scene_path = scene_path.unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("assets")
+                .join("scenes")
+                .join("benchmark.bse-scene")
+        });
+        Ok(Some(Self {
+            scene_path,
+            width,
+            height,
+            render_scale,
+            shadow_pcf_samples,
+            msaa_samples,
+            fullscreen,
+        }))
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AnimationSampleState {
@@ -208,6 +337,9 @@ fn ensure_gltf_node_groups(
 pub struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    benchmark: Option<BenchmarkConfig>,
+    benchmark_capture_started: bool,
+    benchmark_finished: bool,
     input: Input,
     camera: Camera,
     camera_controller: CameraController,
@@ -236,6 +368,9 @@ impl App {
         Self {
             window: None,
             renderer: None,
+            benchmark: None,
+            benchmark_capture_started: false,
+            benchmark_finished: false,
             input: Input::new(),
             camera: Camera {
                 eye: Vec3::new(0.0, 2.0, 6.0),
@@ -258,6 +393,12 @@ impl App {
             displayed_fps: 0.0,
             displayed_cpu_frame_time: 0.0,
         }
+    }
+
+    pub fn with_benchmark(benchmark: BenchmarkConfig) -> Self {
+        let mut app = Self::new();
+        app.benchmark = Some(benchmark);
+        app
     }
 
     fn import_asset(
@@ -800,9 +941,19 @@ impl App {
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
-            let window = match event_loop
-                .create_window(Window::default_attributes().with_title("BoneSmashing Engine"))
-            {
+            let mut window_attributes =
+                Window::default_attributes().with_title("BoneSmashing Engine");
+            if let Some(benchmark) = &self.benchmark {
+                if benchmark.fullscreen {
+                    window_attributes = window_attributes
+                        .with_decorations(false)
+                        .with_fullscreen(Some(Fullscreen::Borderless(None)));
+                } else {
+                    window_attributes = window_attributes
+                        .with_inner_size(PhysicalSize::new(benchmark.width, benchmark.height));
+                }
+            }
+            let window = match event_loop.create_window(window_attributes) {
                 Ok(window) => Arc::new(window),
                 Err(error) => {
                     eprintln!("Could not create application window: {error}");
@@ -832,41 +983,119 @@ impl ApplicationHandler for App {
                 }
             }
 
-            self.world.add_object(RenderObject::new(
-                Transform::from_translation(Vec3::new(0.0, -1.0, 0.0)),
-                MESH_PLANE,
-                MATERIAL_DEFAULT,
-            ));
+            if let (Some(benchmark), Some(renderer), Some(debug_ui)) = (
+                self.benchmark.clone(),
+                self.renderer.as_mut(),
+                self.debug_ui.as_mut(),
+            ) {
+                match crate::scene::load_scene(&benchmark.scene_path)
+                    .and_then(|loaded| Self::restore_scene(renderer, loaded))
+                {
+                    Ok((world, file, animation_models)) => {
+                        self.world = world;
+                        self.animation_models = animation_models;
+                        self.sampled_animations.clear();
+                        self.keyboard_animation_controller = None;
+                        self.animated_instances.clear();
+                        if let Some(camera) = &file.camera {
+                            camera.apply_to(&mut self.camera);
+                        }
+                        if let Some(settings) = file.renderer_settings {
+                            let mut settings: RendererSettings = settings.into();
+                            if let Some(render_scale) = benchmark.render_scale {
+                                settings.render_scale = render_scale;
+                            }
+                            if let Some(shadow_pcf_samples) = benchmark.shadow_pcf_samples {
+                                settings.shadow_pcf_samples = shadow_pcf_samples;
+                            }
+                            if let Some(msaa_samples) = benchmark.msaa_samples {
+                                settings.msaa_samples = msaa_samples;
+                            }
+                            renderer.set_settings(settings);
+                            if let Some(requested) = benchmark.msaa_samples
+                                && renderer.settings().msaa_samples != requested
+                            {
+                                eprintln!(
+                                    "Requested benchmark MSAA {requested}x is unsupported; using {}x",
+                                    renderer.settings().msaa_samples
+                                );
+                            }
+                        } else if benchmark.render_scale.is_some()
+                            || benchmark.shadow_pcf_samples.is_some()
+                            || benchmark.msaa_samples.is_some()
+                        {
+                            let mut settings = renderer.settings();
+                            if let Some(render_scale) = benchmark.render_scale {
+                                settings.render_scale = render_scale;
+                            }
+                            if let Some(shadow_pcf_samples) = benchmark.shadow_pcf_samples {
+                                settings.shadow_pcf_samples = shadow_pcf_samples;
+                            }
+                            if let Some(msaa_samples) = benchmark.msaa_samples {
+                                settings.msaa_samples = msaa_samples;
+                            }
+                            renderer.set_settings(settings);
+                            if let Some(requested) = benchmark.msaa_samples
+                                && renderer.settings().msaa_samples != requested
+                            {
+                                eprintln!(
+                                    "Requested benchmark MSAA {requested}x is unsupported; using {}x",
+                                    renderer.settings().msaa_samples
+                                );
+                            }
+                        }
+                        debug_ui
+                            .scene_loaded(benchmark.scene_path.clone(), file.environment.clone());
+                        eprintln!("Benchmark scene loaded: {}", benchmark.scene_path.display());
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "Could not load benchmark scene {}: {error}",
+                            benchmark.scene_path.display()
+                        );
+                        event_loop.exit();
+                        return;
+                    }
+                }
+            } else {
+                self.world.add_object(RenderObject::new(
+                    Transform::from_translation(Vec3::new(0.0, -1.0, 0.0)),
+                    MESH_PLANE,
+                    MATERIAL_DEFAULT,
+                ));
 
-            self.world.add_object(RenderObject::new(
-                Transform::new(
-                    Vec3::new(-2.0, -0.32, 0.0),
-                    Quat::IDENTITY,
-                    Vec3::splat(0.68),
-                ),
-                MESH_SPHERE,
-                MATERIAL_GOLD,
-            ));
-            self.world.add_object(RenderObject::new(
-                Transform::new(
-                    Vec3::new(0.0, -0.32, 0.0),
-                    Quat::IDENTITY,
-                    Vec3::splat(0.68),
-                ),
-                MESH_SPHERE,
-                MATERIAL_SILVER,
-            ));
-            self.world.add_object(RenderObject::new(
-                Transform::new(
-                    Vec3::new(2.0, -0.32, 0.0),
-                    Quat::IDENTITY,
-                    Vec3::splat(0.68),
-                ),
-                MESH_SPHERE,
-                MATERIAL_GLASS,
-            ));
+                self.world.add_object(RenderObject::new(
+                    Transform::new(
+                        Vec3::new(-2.0, -0.32, 0.0),
+                        Quat::IDENTITY,
+                        Vec3::splat(0.68),
+                    ),
+                    MESH_SPHERE,
+                    MATERIAL_GOLD,
+                ));
+                self.world.add_object(RenderObject::new(
+                    Transform::new(
+                        Vec3::new(0.0, -0.32, 0.0),
+                        Quat::IDENTITY,
+                        Vec3::splat(0.68),
+                    ),
+                    MESH_SPHERE,
+                    MATERIAL_SILVER,
+                ));
+                self.world.add_object(RenderObject::new(
+                    Transform::new(
+                        Vec3::new(2.0, -0.32, 0.0),
+                        Quat::IDENTITY,
+                        Vec3::splat(0.68),
+                    ),
+                    MESH_SPHERE,
+                    MATERIAL_GLASS,
+                ));
+            }
 
-            if std::env::args().any(|argument| argument == "--sample-assets") {
+            if self.benchmark.is_none()
+                && std::env::args().any(|argument| argument == "--sample-assets")
+            {
                 let rotating_cube_id = self.world.add_object(RenderObject::new(
                     Transform::from_translation(Vec3::new(0.0, 0.0, -2.0)),
                     MESH_CUBE,
@@ -1280,6 +1509,39 @@ impl ApplicationHandler for App {
                         self.displayed_fps,
                         self.displayed_cpu_frame_time,
                     );
+                    if self.benchmark.is_some()
+                        && !self.benchmark_capture_started
+                        && self
+                            .debug_ui
+                            .as_ref()
+                            .is_some_and(|debug_ui| debug_ui.profile_environment_ready(renderer))
+                        && let Some(debug_ui) = self.debug_ui.as_mut()
+                    {
+                        debug_ui.start_profile_capture(
+                            &self.camera,
+                            renderer,
+                            &self.world,
+                            renderer.current_timings(),
+                        );
+                        self.benchmark_capture_started = true;
+                    }
+                    if self.benchmark.is_some()
+                        && self.benchmark_capture_started
+                        && !self
+                            .debug_ui
+                            .as_ref()
+                            .is_some_and(DebugUi::profile_capture_active)
+                        && !self.benchmark_finished
+                        && let Some(debug_ui) = self.debug_ui.as_mut()
+                        && let Some(status) = debug_ui.take_profile_status()
+                    {
+                        match status {
+                            Ok(path) => println!("{path}"),
+                            Err(error) => eprintln!("{error}"),
+                        }
+                        self.benchmark_finished = true;
+                        event_loop.exit();
+                    }
                     self.displayed_cpu_frame_time = render_started.elapsed().as_secs_f32() * 1000.0;
                 }
                 window.request_redraw();
@@ -1292,6 +1554,84 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn benchmark_arguments_accept_scene_and_fixed_window_size() {
+        let config = BenchmarkConfig::from_args(
+            [
+                "--benchmark-scene".to_owned(),
+                "assets/scenes/test.bse-scene".to_owned(),
+                "--benchmark-size".to_owned(),
+                "1920x1080".to_owned(),
+                "--benchmark-render-scale".to_owned(),
+                "0.5".to_owned(),
+                "--benchmark-shadow-pcf-samples".to_owned(),
+                "4".to_owned(),
+                "--benchmark-msaa-samples".to_owned(),
+                "4".to_owned(),
+                "--benchmark-fullscreen".to_owned(),
+            ]
+            .into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            config.scene_path,
+            PathBuf::from("assets/scenes/test.bse-scene")
+        );
+        assert_eq!(config.width, 1920);
+        assert_eq!(config.height, 1080);
+        assert_eq!(config.render_scale, Some(0.5));
+        assert_eq!(config.shadow_pcf_samples, Some(4));
+        assert_eq!(config.msaa_samples, Some(4));
+        assert!(config.fullscreen);
+    }
+
+    #[test]
+    fn benchmark_arguments_accept_default_scene() {
+        let config = BenchmarkConfig::from_args(["--benchmark".to_owned()].into_iter())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(config.width, 1280);
+        assert_eq!(config.height, 720);
+        assert_eq!(config.render_scale, None);
+        assert_eq!(config.shadow_pcf_samples, None);
+        assert_eq!(config.msaa_samples, None);
+        assert!(!config.fullscreen);
+        assert_eq!(
+            config.scene_path.file_name().and_then(|name| name.to_str()),
+            Some("benchmark.bse-scene")
+        );
+    }
+
+    #[test]
+    fn benchmark_arguments_reject_out_of_range_render_scale() {
+        let result = BenchmarkConfig::from_args(
+            ["--benchmark-render-scale".to_owned(), "0.25".to_owned()].into_iter(),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn benchmark_arguments_reject_unsupported_shadow_pcf_samples() {
+        let result = BenchmarkConfig::from_args(
+            ["--benchmark-shadow-pcf-samples".to_owned(), "6".to_owned()].into_iter(),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn benchmark_arguments_reject_unsupported_msaa_samples() {
+        let result = BenchmarkConfig::from_args(
+            ["--benchmark-msaa-samples".to_owned(), "3".to_owned()].into_iter(),
+        );
+
+        assert!(result.is_err());
+    }
 
     #[test]
     fn keyboard_controller_maps_keys_and_release_to_configured_clips() {

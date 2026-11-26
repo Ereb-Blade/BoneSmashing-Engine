@@ -140,10 +140,9 @@ roughness и metallic материалов, назначенных объект�
    сохраните сцену через `Ctrl+S`. Добавление, настройка и удаление источников
    поддерживают `Ctrl+Z` / `Ctrl+Y`.
 
-Для неоновой сцены-шоурума с автомобилем откройте
-`assets/scenes/test.bse-scene`. В ней семь источников света и модель CarConcept;
-атрибуция и лицензия модели находятся в
-`assets/models/CarConcept/ATTRIBUTION.txt`.
+Для неоновой тестовой сцены откройте `assets/scenes/test.bse-scene`. В ней семь
+источников света и Khronos Boom Box с emissive-панелью; модель лицензирована
+CC0-1.0, сведения об источнике находятся в `assets/models/BoomBox/`.
 
 Ночная HDR-карта `Dikhololo Night` взята с [Poly Haven](https://polyhaven.com/a/dikhololo_night)
 и опубликована по лицензии CC0.
@@ -220,10 +219,72 @@ cargo run
 настройки рендера: shadows On, PCF 8 taps, render scale 1.0, MSAA Off и Unlock
 FPS. Не меняйте размер окна между сравниваемыми captures.
 
+Для автоматического benchmark-запуска используйте:
+
+```powershell
+cargo run -- --benchmark
+cargo run -- --benchmark assets\scenes\benchmark.bse-scene
+cargo run -- --benchmark-size 1920x1080
+cargo run -- --benchmark-scene assets\scenes\flight_helmet_test.bse-scene --benchmark-size 1920x1080
+cargo run -- --benchmark-scene assets\scenes\flight_helmet_test.bse-scene --benchmark-size 1280x720 --benchmark-render-scale 0.5
+cargo run -- --benchmark-scene assets\scenes\flight_helmet_test.bse-scene --benchmark-shadow-pcf-samples 4
+```
+
+Автоматический запуск открывает указанную сцену, дожидается завершения фоновой
+загрузки окружения (включая HDR из сцены), затем прогревает 2 секунды, записывает
+10 секунд профиля и сохраняет тот же JSON, что и UI capture. GPU timings
+разделяют shadow map, opaque, transparent, glass и postprocess passes.
+`--benchmark-render-scale` переопределяет масштаб рендера в диапазоне 0.5–1.0,
+не меняя размер окна. `--benchmark-shadow-pcf-samples` позволяет сравнить
+2/4/8/16 taps теневого PCF. `--benchmark-msaa-samples` переопределяет MSAA
+значениями 1/2/4/8; если выбранный режим не поддерживает адаптер, выводится
+предупреждение и профиль записывается с фактически включенным режимом.
+`--benchmark-fullscreen` открывает borderless fullscreen в текущем разрешении
+монитора; при этом `--benchmark-size` не используется, а фактический размер
+записывается в профиль.
+Если загрузки окружения нет, прогрев начинается сразу.
+
 В разделе **Render → Performance** нажмите **Capture current view (10 s)**.
 Захват прогревается 2 секунды, затем 10 секунд записывает CPU/GPU timings и
 сохраняет JSON в `%APPDATA%\MyEngine\profile_logs`. Для корректного A/B
 сравнивайте логи с теми же GPU, размером окна, сценой и настройками.
+
+Для комплексной проверки рендерера откройте
+`assets/scenes/renderer_feature_test.bse-scene`. Она объединяет Flight Helmet,
+анимированного Fox и Khronos Boom Box с emissive-панелью; встроенные материалы
+red shiny/chrome/gold/silver/glass; PBR-текстуры, прозрачное стекло,
+HDR-окружение, directional shadows, point/spot lights и 4x MSAA. Boom Box —
+CC0-1.0; источник и лицензия записаны в `assets/models/BoomBox/`. Для
+повторяемого профиля используйте одинаковый размер и настройки:
+
+```powershell
+cargo run -- --benchmark-scene assets\scenes\renderer_feature_test.bse-scene --benchmark-size 1280x720
+cargo run --release -- --benchmark-scene assets\scenes\renderer_feature_test.bse-scene --benchmark-size 1280x720
+```
+
+Для тяжёлого игрового стресс-сценария откройте
+`assets/scenes/mesa_relay_stress.bse-scene`: индустриальный аванпост включает
+1 167 объектов, 13 модельных групп (12 анимированных персонажей), 16 локальных
+источников света, прозрачные окна, тени и HDR-окружение. В сцене используются
+уже включённые в проект Fox, Rigged Figure и Boom Box; сведения об источниках и
+лицензиях лежат рядом с моделями. Базовые Release-профили и варианты для
+сравнения нагрузки:
+
+```powershell
+cargo run --release -- --benchmark-scene assets\scenes\mesa_relay_stress.bse-scene --benchmark-fullscreen --benchmark-msaa-samples 1 --benchmark-shadow-pcf-samples 8
+cargo run --release -- --benchmark-scene assets\scenes\mesa_relay_stress.bse-scene --benchmark-fullscreen --benchmark-render-scale 0.5 --benchmark-msaa-samples 1 --benchmark-shadow-pcf-samples 8
+cargo run --release -- --benchmark-scene assets\scenes\mesa_relay_stress.bse-scene --benchmark-fullscreen --benchmark-msaa-samples 4 --benchmark-shadow-pcf-samples 8
+cargo run --release -- --benchmark-scene assets\scenes\mesa_relay_stress.bse-scene --benchmark-fullscreen --benchmark-msaa-samples 1 --benchmark-shadow-pcf-samples 4
+cargo run --release -- --benchmark-scene assets\scenes\mesa_relay_stress.bse-scene --benchmark-fullscreen --benchmark-msaa-samples 1 --benchmark-shadow-pcf-samples 16
+```
+
+Сравнивайте за один раз только один изменённый параметр; профили сохраняются
+в `%APPDATA%\MyEngine\profile_logs`. Если GTX 650 не поддерживает запрошенный
+уровень MSAA, benchmark сообщает фактически используемое значение.
+
+Для старых сравнений оставляйте `benchmark.bse-scene` и
+`flight_helmet_test.bse-scene` без изменений: профили комплексной сцены
+сравнивайте только с captures этой же сцены.
 
 Для проверки импортированной PBR-модели откройте
 `assets/scenes/flight_helmet_test.bse-scene`. Flight Helmet из Khronos glTF

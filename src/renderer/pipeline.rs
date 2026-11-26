@@ -95,7 +95,7 @@ struct MaterialParams {
     specular_color_tex_coord: u32,
     transmission_tex_coord: u32,
     pbr_workflow: u32,
-    _pad0: u32,
+    texture_flags: u32,
     thickness_factor: f32,
     attenuation_distance: f32,
     thickness_tex_coord: u32,
@@ -158,6 +158,8 @@ struct SkinMatrices {
 @group(3) @binding(1) var s_scene_color: sampler;
 
 const PI: f32 = 3.14159265359;
+const MATERIAL_TEXTURE_SPECULAR = 1u;
+const MATERIAL_TEXTURE_SPECULAR_COLOR = 2u;
 
 fn safe_normalize(value: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
     let length_squared = dot(value, value);
@@ -165,6 +167,11 @@ fn safe_normalize(value: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
         return value * inverseSqrt(length_squared);
     }
     return fallback;
+}
+
+fn pow5(value: f32) -> f32 {
+    let squared = value * value;
+    return squared * squared * value;
 }
 
 fn transform_skin_normal(skin: mat4x4<f32>, normal: vec3<f32>) -> vec3<f32> {
@@ -184,7 +191,7 @@ fn transform_skin_normal(skin: mat4x4<f32>, normal: vec3<f32>) -> vec3<f32> {
 }
 
 fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
-    return f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - clamp(cos_theta, 0.0, 1.0), 5.0);
+    return f0 + (vec3<f32>(1.0) - f0) * pow5(1.0 - clamp(cos_theta, 0.0, 1.0));
 }
 
 fn distribution_ggx(n_dot_h: f32, roughness: f32) -> f32 {
@@ -790,13 +797,15 @@ fn fs_glass(
     }
     let shadow_offset_normal = normal;
     let geometric_normal = get_face_normal(v.world_pos, normal);
-    normal = apply_normal_map(
-        normal,
-        v.world_tangent,
-        textureSample(t_normal, s_diffuse, normal_uv).xyz * 2.0 - vec3<f32>(1.0),
-        material.normal_scale,
-        material.normal_uv_transform,
-    );
+    if material.normal_scale != 0.0 {
+        normal = apply_normal_map(
+            normal,
+            v.world_tangent,
+            textureSample(t_normal, s_diffuse, normal_uv).xyz * 2.0 - vec3<f32>(1.0),
+            material.normal_scale,
+            material.normal_uv_transform,
+        );
+    }
     var clearcoat_factor = 0.0;
     if material.clearcoat_factor > 0.0 {
         clearcoat_factor = clamp(
@@ -808,14 +817,16 @@ fn fs_glass(
     var clearcoat_normal = normal;
     var clearcoat_roughness = 1.0;
     if clearcoat_factor > 0.0 {
-        clearcoat_normal = apply_normal_map(
-            normal,
-            v.world_tangent,
-            textureSample(t_clearcoat_normal, s_diffuse, clearcoat_normal_uv).xyz
-                * 2.0 - vec3<f32>(1.0),
-            material.clearcoat_normal_scale,
-            material.clearcoat_normal_uv_transform,
-        );
+        if material.clearcoat_normal_scale != 0.0 {
+            clearcoat_normal = apply_normal_map(
+                normal,
+                v.world_tangent,
+                textureSample(t_clearcoat_normal, s_diffuse, clearcoat_normal_uv).xyz
+                    * 2.0 - vec3<f32>(1.0),
+                material.clearcoat_normal_scale,
+                material.clearcoat_normal_uv_transform,
+            );
+        }
         clearcoat_roughness = clamp(
             material.clearcoat_roughness_factor
                 * textureSample(t_clearcoat_roughness, s_diffuse, clearcoat_roughness_uv).g,
@@ -840,7 +851,8 @@ fn fs_glass(
     }
     let specular_texture = textureSample(t_specular, s_diffuse, specular_uv);
     let specular_color_texture = textureSample(t_specular_color, s_diffuse, specular_color_uv);
-    let dielectric_f0 = pow((material.ior - 1.0) / (material.ior + 1.0), 2.0);
+    let dielectric_ratio = (material.ior - 1.0) / (material.ior + 1.0);
+    let dielectric_f0 = dielectric_ratio * dielectric_ratio;
     let f0 = vec3<f32>(dielectric_f0);
     let specular_weight = clamp(
         material.specular_color_factor
@@ -1110,13 +1122,15 @@ fn fs_main(
     }
     let shadow_offset_normal = normal;
     let geometric_normal = get_face_normal(v.world_pos, normal);
-    normal = apply_normal_map(
-        normal,
-        v.world_tangent,
-        textureSample(t_normal, s_diffuse, normal_uv).xyz * 2.0 - vec3<f32>(1.0),
-        material.normal_scale,
-        material.normal_uv_transform,
-    );
+    if material.normal_scale != 0.0 {
+        normal = apply_normal_map(
+            normal,
+            v.world_tangent,
+            textureSample(t_normal, s_diffuse, normal_uv).xyz * 2.0 - vec3<f32>(1.0),
+            material.normal_scale,
+            material.normal_uv_transform,
+        );
+    }
     var clearcoat_factor = 0.0;
     if material.clearcoat_factor > 0.0 {
         clearcoat_factor = clamp(
@@ -1128,14 +1142,16 @@ fn fs_main(
     var clearcoat_normal = normal;
     var clearcoat_roughness = 1.0;
     if clearcoat_factor > 0.0 {
-        clearcoat_normal = apply_normal_map(
-            normal,
-            v.world_tangent,
-            textureSample(t_clearcoat_normal, s_diffuse, clearcoat_normal_uv).xyz
-                * 2.0 - vec3<f32>(1.0),
-            material.clearcoat_normal_scale,
-            material.clearcoat_normal_uv_transform,
-        );
+        if material.clearcoat_normal_scale != 0.0 {
+            clearcoat_normal = apply_normal_map(
+                normal,
+                v.world_tangent,
+                textureSample(t_clearcoat_normal, s_diffuse, clearcoat_normal_uv).xyz
+                    * 2.0 - vec3<f32>(1.0),
+                material.clearcoat_normal_scale,
+                material.clearcoat_normal_uv_transform,
+            );
+        }
         clearcoat_roughness = clamp(
             material.clearcoat_roughness_factor
                 * textureSample(t_clearcoat_roughness, s_diffuse, clearcoat_roughness_uv).g,
@@ -1153,8 +1169,16 @@ fn fs_main(
     let view_dir = safe_normalize(camera.view_pos.xyz - v.world_pos, normal);
     let metallic = clamp(material.metallic * metallic_roughness.b, 0.0, 1.0);
     var roughness = clamp(material.roughness * metallic_roughness.g, 0.045, 1.0);
-    let specular_glossiness = textureSample(t_specular_color, s_diffuse, specular_color_uv);
-    let specular_texture = textureSample(t_specular, s_diffuse, specular_uv);
+    var specular_glossiness = vec4<f32>(1.0);
+    if (material.texture_flags & MATERIAL_TEXTURE_SPECULAR_COLOR) != 0u {
+        specular_glossiness = textureSample(t_specular_color, s_diffuse, specular_color_uv);
+    }
+    var specular_texture = vec4<f32>(1.0);
+    if material.pbr_workflow == 0u
+        && (material.texture_flags & MATERIAL_TEXTURE_SPECULAR) != 0u
+    {
+        specular_texture = textureSample(t_specular, s_diffuse, specular_uv);
+    }
     if material.pbr_workflow == 1u {
         roughness = clamp(
             1.0 - (1.0 - material.roughness) * specular_glossiness.a,
@@ -1171,7 +1195,8 @@ fn fs_main(
     if material.unlit > 0.5 {
         return vec4<f32>(sanitize_hdr_color(surface_color.rgb), surface_color.a);
     }
-    let ior_f0 = pow((material.ior - 1.0) / (material.ior + 1.0), 2.0);
+    let ior_ratio = (material.ior - 1.0) / (material.ior + 1.0);
+    let ior_f0 = ior_ratio * ior_ratio;
     var dielectric_f0 = vec3<f32>(ior_f0);
     var dielectric_specular_weight = clamp(
         material.specular_color_factor
@@ -1279,15 +1304,18 @@ fn fs_main(
     let n_dot_v = clamp(dot(normal, view_dir), 0.0, 1.0);
     let fresnel_roughness = (
         f0 + (max(vec3<f32>(1.0 - roughness), f0) - f0)
-            * pow(1.0 - n_dot_v, 5.0)
+            * pow5(1.0 - n_dot_v)
     ) * specular_weight;
     let diffuse_weight = (vec3<f32>(1.0) - fresnel_roughness) * (1.0 - metallic);
     let env_intensity = light.ambient_top.a;
-    let ambient_occlusion = mix(
-        1.0,
-        textureSample(t_occlusion, s_diffuse, occlusion_uv).r,
-        material.occlusion_strength,
-    );
+    var ambient_occlusion = 1.0;
+    if material.occlusion_strength != 0.0 {
+        ambient_occlusion = mix(
+            1.0,
+            textureSample(t_occlusion, s_diffuse, occlusion_uv).r,
+            material.occlusion_strength,
+        );
+    }
     let diffuse_ambient = diffuse_weight * surface_color.rgb
         * diffuse_irradiance(normal) * env_intensity
         * ambient_occlusion;
@@ -1336,8 +1364,13 @@ fn fs_main(
         return vec4<f32>(sanitize_hdr_color(specular_ambient), surface_color.a);
     }
 
-    let emissive = material.emissive_factor * material.emissive_strength
-        * textureSample(t_emissive, s_diffuse, emissive_uv).rgb;
+    var emissive = vec3<f32>(0.0);
+    if material.emissive_strength != 0.0
+        && any(material.emissive_factor != vec3<f32>(0.0))
+    {
+        emissive = material.emissive_factor * material.emissive_strength
+            * textureSample(t_emissive, s_diffuse, emissive_uv).rgb;
+    }
     let color = (radiance + diffuse_ambient + specular_ambient)
         * (vec3<f32>(1.0) - clearcoat_fresnel)
         + direct_clearcoat

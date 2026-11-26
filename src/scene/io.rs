@@ -1726,7 +1726,99 @@ mod tests {
     }
 
     #[test]
-    fn concept_car_showroom_scene_loads_its_model_and_lights() {
+    fn renderer_feature_test_scene_loads_integrated_rendering_features() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("scenes")
+            .join("renderer_feature_test.bse-scene");
+        let loaded = load_scene(&path).unwrap();
+
+        assert_eq!(loaded.assets.len(), 3);
+        assert_eq!(loaded.file.groups.len(), 3);
+        assert_eq!(loaded.file.lights.len(), 4);
+        assert_eq!(loaded.file.objects.len(), 14);
+        assert!(
+            loaded
+                .file
+                .lights
+                .iter()
+                .any(|light| { light.kind == crate::scene::LocalLightKind::Point })
+        );
+        assert!(
+            loaded
+                .file
+                .lights
+                .iter()
+                .any(|light| { light.kind == crate::scene::LocalLightKind::Spot })
+        );
+
+        let built_in_materials = loaded
+            .file
+            .objects
+            .iter()
+            .filter_map(|object| match &object.source {
+                SceneObjectSource::BuiltIn { material_id, .. } => Some(*material_id),
+                SceneObjectSource::Asset { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        for material_id in 1..=5 {
+            assert!(built_in_materials.contains(&material_id));
+        }
+
+        assert_eq!(
+            loaded.file.groups[1]
+                .animation
+                .as_ref()
+                .map(|animation| animation.clip_index),
+            Some(2)
+        );
+        assert!(
+            loaded.file.groups[1]
+                .animation
+                .as_ref()
+                .is_some_and(|animation| animation.playing && animation.looping)
+        );
+
+        let boombox = loaded
+            .assets
+            .iter()
+            .find_map(|(asset_path, asset)| {
+                asset_path
+                    .ends_with(Path::new("BoomBox").join("BoomBox.glb"))
+                    .then_some(asset)
+            })
+            .unwrap();
+        let ParsedAsset::Gltf(boombox) = boombox else {
+            panic!("Boom Box fixture must load as glTF");
+        };
+        assert!(boombox.instance_count() > 0);
+        assert!(boombox.materials.iter().any(|material| {
+            material.emissive_image.is_some() || material.emissive_factor != [0.0; 3]
+        }));
+
+        let environment_path = loaded
+            .file
+            .environment
+            .as_ref()
+            .and_then(|environment| environment.path.as_deref())
+            .unwrap();
+        assert_eq!(
+            Path::new(environment_path)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("dikhololo_night_2k.hdr")
+        );
+
+        let settings = loaded.file.renderer_settings.unwrap();
+        assert!(settings.shadows_enabled);
+        assert_eq!(settings.shadow_pcf_samples, 8);
+        assert_eq!(settings.render_scale, 1.0);
+        assert_eq!(settings.msaa_samples, 4);
+        assert!(settings.unlocked_fps);
+    }
+
+    #[test]
+    fn test_scene_loads_boom_box_and_lights() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets")
             .join("scenes")
@@ -1741,7 +1833,70 @@ mod tests {
             Path::new(loaded.file.groups[0].path.as_deref().unwrap())
                 .file_name()
                 .and_then(|name| name.to_str()),
-            Some("CarConcept.glb")
+            Some("BoomBox.glb")
+        );
+        let ParsedAsset::Gltf(model) = loaded.assets.values().next().unwrap() else {
+            panic!("Boom Box test scene must load as glTF");
+        };
+        assert!(model.instance_count() > 0);
+        assert!(model.materials.iter().any(|material| {
+            material.emissive_image.is_some() || material.emissive_factor != [0.0; 3]
+        }));
+    }
+
+    #[test]
+    fn mesa_relay_stress_scene_loads_dense_assets_lights_and_environment() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("scenes")
+            .join("mesa_relay_stress.bse-scene");
+        let loaded = load_scene(&path).unwrap();
+
+        assert_eq!(loaded.file.objects.len(), 1167);
+        assert_eq!(loaded.file.groups.len(), 13);
+        assert_eq!(loaded.file.lights.len(), MAX_LOCAL_LIGHTS);
+        assert_eq!(loaded.assets.len(), 3);
+        assert_eq!(
+            loaded
+                .file
+                .groups
+                .iter()
+                .filter(|group| group.animation.is_some())
+                .count(),
+            12
+        );
+        assert!(
+            loaded
+                .file
+                .objects
+                .iter()
+                .filter(|object| {
+                    matches!(
+                        object.source,
+                        SceneObjectSource::BuiltIn { material_id: 5, .. }
+                    )
+                })
+                .count()
+                >= 100
+        );
+
+        let settings = loaded.file.renderer_settings.unwrap();
+        assert_eq!(settings.msaa_samples, 1);
+        assert_eq!(settings.shadow_pcf_samples, 8);
+        assert_eq!(settings.render_scale, 1.0);
+        assert!(settings.shadows_enabled);
+
+        let environment_path = loaded
+            .file
+            .environment
+            .as_ref()
+            .and_then(|environment| environment.path.as_deref())
+            .unwrap();
+        assert_eq!(
+            Path::new(environment_path)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("dikhololo_night_2k.hdr")
         );
     }
 

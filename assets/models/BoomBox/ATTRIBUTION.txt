@@ -1,0 +1,8 @@
+Khronos glTF Sample Asset: Boom Box
+
+Source:
+https://github.com/KhronosGroup/glTF-Sample-Assets/tree/e124e8d8d7330a5372bc2b4d00d39a4a9d7997ea/Models/BoomBox
+
+The model is a portable radio with an emissive front panel.
+Model files are licensed CC0-1.0. Logos and trademarks are excluded.
+The GLB was downloaded from the upstream glTF-Binary directory without modification.

@@ -4,11 +4,46 @@ use crate::renderer::mesh::{UvSetsVertex, Vertex};
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 pub const SHADER: &str = r#"
-const SHADOW_PCF_OFFSETS = array<vec2<f32>, 4>(
-    vec2<f32>(-0.707, -0.707),
-    vec2<f32>(0.707, -0.707),
-    vec2<f32>(-0.707, 0.707),
-    vec2<f32>(0.707, 0.707),
+const SHADOW_PCF_OFFSETS = array<vec2<f32>, 16>(
+    vec2<f32>(-1.5, -1.5),
+    vec2<f32>(-0.5, -1.5),
+    vec2<f32>(0.5, -1.5),
+    vec2<f32>(1.5, -1.5),
+    vec2<f32>(-1.5, -0.5),
+    vec2<f32>(-0.5, -0.5),
+    vec2<f32>(0.5, -0.5),
+    vec2<f32>(1.5, -0.5),
+    vec2<f32>(-1.5, 0.5),
+    vec2<f32>(-0.5, 0.5),
+    vec2<f32>(0.5, 0.5),
+    vec2<f32>(1.5, 0.5),
+    vec2<f32>(-1.5, 1.5),
+    vec2<f32>(-0.5, 1.5),
+    vec2<f32>(0.5, 1.5),
+    vec2<f32>(1.5, 1.5),
+);
+
+const SHADOW_PCF_OFFSETS_8 = array<vec2<f32>, 8>(
+    vec2<f32>(-1.5, -1.5),
+    vec2<f32>(0.5, -1.5),
+    vec2<f32>(-0.5, -0.5),
+    vec2<f32>(1.5, -0.5),
+    vec2<f32>(-1.5, 0.5),
+    vec2<f32>(0.5, 0.5),
+    vec2<f32>(-0.5, 1.5),
+    vec2<f32>(1.5, 1.5),
+);
+
+const SHADOW_PCF_OFFSETS_4 = array<vec2<f32>, 4>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>(1.0, -1.0),
+    vec2<f32>(-1.0, 1.0),
+    vec2<f32>(1.0, 1.0),
+);
+
+const SHADOW_PCF_OFFSETS_2 = array<vec2<f32>, 2>(
+    vec2<f32>(-0.5, -0.5),
+    vec2<f32>(0.5, 0.5),
 );
 
 struct Camera {
@@ -23,7 +58,7 @@ struct Light {
     fill_direction_intensity: vec4<f32>,
     fill_color: vec4<f32>,
     ambient_top: vec4<f32>,
-    ambient_bottom: vec4<f32>,
+    render_options: vec4<f32>,
 };
 
 struct MaterialParams {
@@ -67,6 +102,17 @@ struct MaterialParams {
     specular_uv_transform: array<vec4<f32>, 2>,
     specular_color_uv_transform: array<vec4<f32>, 2>,
     transmission_uv_transform: array<vec4<f32>, 2>,
+    clearcoat_factor: f32,
+    clearcoat_roughness_factor: f32,
+    clearcoat_normal_scale: f32,
+    clearcoat_tex_coord: u32,
+    clearcoat_roughness_tex_coord: u32,
+    clearcoat_normal_tex_coord: u32,
+    _clearcoat_pad0: u32,
+    _clearcoat_pad1: u32,
+    clearcoat_uv_transform: array<vec4<f32>, 2>,
+    clearcoat_roughness_uv_transform: array<vec4<f32>, 2>,
+    clearcoat_normal_uv_transform: array<vec4<f32>, 2>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -91,6 +137,9 @@ struct SkinMatrices {
 @group(1) @binding(9) var t_specular_color: texture_2d<f32>;
 @group(1) @binding(10) var t_transmission: texture_2d<f32>;
 @group(1) @binding(11) var t_thickness: texture_2d<f32>;
+@group(1) @binding(12) var t_clearcoat: texture_2d<f32>;
+@group(1) @binding(13) var t_clearcoat_roughness: texture_2d<f32>;
+@group(1) @binding(14) var t_clearcoat_normal: texture_2d<f32>;
 @group(2) @binding(0) var t_environment: texture_2d<f32>;
 @group(2) @binding(1) var s_environment: sampler;
 @group(2) @binding(2) var t_irradiance: texture_2d<f32>;
@@ -216,10 +265,11 @@ fn transform_uv(uv: vec2<f32>, transform: array<vec4<f32>, 2>) -> vec2<f32> {
 fn apply_normal_map(
     normal: vec3<f32>,
     world_tangent: vec4<f32>,
-    uv: vec2<f32>,
+    sampled: vec3<f32>,
+    normal_scale: f32,
     uv_transform: array<vec4<f32>, 2>,
 ) -> vec3<f32> {
-    if material.normal_scale == 0.0 {
+    if normal_scale == 0.0 {
         return normal;
     }
     let fallback_axis = select(
@@ -249,9 +299,8 @@ fn apply_normal_map(
             * transform_handedness,
         source_bitangent,
     );
-    let sampled = textureSample(t_normal, s_diffuse, uv).xyz * 2.0 - vec3<f32>(1.0);
     let tangent_normal = safe_normalize(
-        vec3<f32>(sampled.xy * material.normal_scale, sampled.z),
+        vec3<f32>(sampled.xy * normal_scale, sampled.z),
         vec3<f32>(0.0, 0.0, 1.0),
     );
     return safe_normalize(
@@ -329,7 +378,7 @@ fn fs_postprocess(input: PostProcessOut) -> @location(0) vec4<f32> {
     if debug_view >= 1u && debug_view <= 3u {
         return vec4<f32>(clamp(hdr, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
     }
-    return vec4<f32>(tonemap_aces(sanitize_hdr_color(hdr * exp2(light.ambient_bottom.a))), 1.0);
+    return vec4<f32>(tonemap_aces(sanitize_hdr_color(hdr * exp2(light.render_options.a))), 1.0);
 }
 
 fn get_local_position(v: VsIn, instance: InstanceInput) -> vec4<f32> {
@@ -369,7 +418,7 @@ fn shadow_visibility(
 ) -> f32 {
     let normal_light = clamp(dot(face_normal, light_dir), 0.0, 1.0);
     let offset_normal_light = clamp(dot(offset_normal, light_dir), 0.0, 1.0);
-    let normal_bias = 0.024 * (1.0 - offset_normal_light);
+    let normal_bias = 0.008 * (1.0 - offset_normal_light);
     let light_clip = shadow_matrix * vec4<f32>(world_pos + offset_normal * normal_bias, 1.0);
     let projected = light_clip.xyz / light_clip.w;
     let uv = projected.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
@@ -379,17 +428,57 @@ fn shadow_visibility(
     }
 
     let texel = 1.0 / vec2<f32>(textureDimensions(t_shadow));
-    let bias = max(0.0003 * (1.0 - normal_light), 0.0001);
+    let bias = max(0.00025 * (1.0 - normal_light), 0.00008);
+    let pcf_samples = u32(light.render_options.x + 0.5);
+    if pcf_samples == 2u {
+        var visibility = 0.0;
+        for (var index = 0u; index < 2u; index += 1u) {
+            visibility += textureSampleCompare(
+                t_shadow,
+                s_shadow,
+                uv + SHADOW_PCF_OFFSETS_2[index] * texel,
+                projected.z - bias,
+            );
+        }
+        return visibility / 2.0;
+    }
+
+    if pcf_samples == 4u {
+        var visibility = 0.0;
+        for (var index = 0u; index < 4u; index += 1u) {
+            visibility += textureSampleCompare(
+                t_shadow,
+                s_shadow,
+                uv + SHADOW_PCF_OFFSETS_4[index] * texel,
+                projected.z - bias,
+            );
+        }
+        return visibility / 4.0;
+    }
+
+    if pcf_samples == 8u {
+        var visibility = 0.0;
+        for (var index = 0u; index < 8u; index += 1u) {
+            visibility += textureSampleCompare(
+                t_shadow,
+                s_shadow,
+                uv + SHADOW_PCF_OFFSETS_8[index] * texel,
+                projected.z - bias,
+            );
+        }
+        return visibility / 8.0;
+    }
+
     var visibility = 0.0;
-    for (var index = 0u; index < 4u; index += 1u) {
+    for (var index = 0u; index < 16u; index += 1u) {
         visibility += textureSampleCompare(
             t_shadow,
             s_shadow,
-            uv + SHADOW_PCF_OFFSETS[index] * texel * 2.5,
+            uv + SHADOW_PCF_OFFSETS[index] * texel,
             projected.z - bias,
         );
     }
-    return visibility / 4.0;
+    return visibility / 16.0;
 }
 
 struct VsIn {
@@ -586,6 +675,27 @@ fn fs_glass(
         v.tex_coords_2,
         v.tex_coords_3,
     ), material.specular_color_uv_transform);
+    let clearcoat_uv = transform_uv(get_uv(
+        material.clearcoat_tex_coord,
+        v.tex_coords,
+        v.tex_coords_1,
+        v.tex_coords_2,
+        v.tex_coords_3,
+    ), material.clearcoat_uv_transform);
+    let clearcoat_roughness_uv = transform_uv(get_uv(
+        material.clearcoat_roughness_tex_coord,
+        v.tex_coords,
+        v.tex_coords_1,
+        v.tex_coords_2,
+        v.tex_coords_3,
+    ), material.clearcoat_roughness_uv_transform);
+    let clearcoat_normal_uv = transform_uv(get_uv(
+        material.clearcoat_normal_tex_coord,
+        v.tex_coords,
+        v.tex_coords_1,
+        v.tex_coords_2,
+        v.tex_coords_3,
+    ), material.clearcoat_normal_uv_transform);
     let emissive_uv = transform_uv(get_uv(
         material.emissive_tex_coord,
         v.tex_coords,
@@ -623,9 +733,36 @@ fn fs_glass(
     normal = apply_normal_map(
         normal,
         v.world_tangent,
-        normal_uv,
+        textureSample(t_normal, s_diffuse, normal_uv).xyz * 2.0 - vec3<f32>(1.0),
+        material.normal_scale,
         material.normal_uv_transform,
     );
+    var clearcoat_factor = 0.0;
+    if material.clearcoat_factor > 0.0 {
+        clearcoat_factor = clamp(
+            material.clearcoat_factor * textureSample(t_clearcoat, s_diffuse, clearcoat_uv).r,
+            0.0,
+            1.0,
+        );
+    }
+    var clearcoat_normal = normal;
+    var clearcoat_roughness = 1.0;
+    if clearcoat_factor > 0.0 {
+        clearcoat_normal = apply_normal_map(
+            normal,
+            v.world_tangent,
+            textureSample(t_clearcoat_normal, s_diffuse, clearcoat_normal_uv).xyz
+                * 2.0 - vec3<f32>(1.0),
+            material.clearcoat_normal_scale,
+            material.clearcoat_normal_uv_transform,
+        );
+        clearcoat_roughness = clamp(
+            material.clearcoat_roughness_factor
+                * textureSample(t_clearcoat_roughness, s_diffuse, clearcoat_roughness_uv).g,
+            0.045,
+            1.0,
+        );
+    }
     let debug_view = u32(light.fill_color.a + 0.5);
     if debug_view == 1u {
         return vec4<f32>(sanitize_hdr_color(normal * 0.5 + 0.5), surface_color.a);
@@ -689,8 +826,55 @@ fn fs_glass(
             f0,
             specular_weight,
         );
+    var clearcoat_fresnel = vec3<f32>(0.0);
+    var direct_clearcoat = vec3<f32>(0.0);
+    if clearcoat_factor > 0.0 {
+        clearcoat_fresnel = fresnel_schlick(
+            max(dot(clearcoat_normal, view_dir), 0.0),
+            vec3<f32>(0.04),
+        ) * clearcoat_factor;
+        direct_clearcoat = clearcoat_factor * (
+            evaluate_direct_light(
+                clearcoat_normal,
+                view_dir,
+                key_dir,
+                key_radiance,
+                vec3<f32>(0.0),
+                1.0,
+                clearcoat_roughness,
+                vec3<f32>(0.04),
+                vec3<f32>(1.0),
+            ) * key_visibility
+            + evaluate_direct_light(
+                clearcoat_normal,
+                view_dir,
+                fill_dir,
+                fill_radiance,
+                vec3<f32>(0.0),
+                1.0,
+                clearcoat_roughness,
+                vec3<f32>(0.04),
+                vec3<f32>(1.0),
+            )
+        );
+    }
     let reflected_environment =
         sample_prefiltered_environment(reflect(-view_dir, normal), roughness) * light.ambient_top.a;
+    var clearcoat_environment = vec3<f32>(0.0);
+    if clearcoat_factor > 0.0 {
+        let clearcoat_n_dot_v = max(dot(clearcoat_normal, view_dir), 0.0);
+        let clearcoat_brdf = textureSampleLevel(
+            t_brdf_lut,
+            s_environment,
+            vec2<f32>(clearcoat_n_dot_v, clearcoat_roughness),
+            0.0,
+        ).rg;
+        clearcoat_environment = sample_prefiltered_environment(
+            reflect(-view_dir, clearcoat_normal),
+            clearcoat_roughness,
+        ) * (vec3<f32>(0.04) * clearcoat_brdf.x + vec3<f32>(clearcoat_brdf.y))
+            * clearcoat_factor * light.ambient_top.a;
+    }
     let refraction_ratio = select(material.ior, 1.0 / material.ior, front_facing);
     let refracted_direction = refract(-view_dir, normal, refraction_ratio);
     let projected_origin = camera.view_proj * vec4<f32>(v.world_pos, 1.0);
@@ -741,9 +925,11 @@ fn fs_glass(
     let body = mix(opaque_surface, transmitted, transmission);
     let emissive = material.emissive_factor * material.emissive_strength
         * textureSample(t_emissive, s_diffuse, emissive_uv).rgb;
-    let color = body * (vec3<f32>(1.0) - glass_fresnel)
+    let color = (body * (vec3<f32>(1.0) - glass_fresnel)
         + reflected_environment * glass_fresnel
-        + direct_reflection
+        + direct_reflection) * (vec3<f32>(1.0) - clearcoat_fresnel)
+        + clearcoat_environment
+        + direct_clearcoat
         + emissive;
     let coverage = select(1.0, surface_color.a, material.alpha_mode == 2u);
     return vec4<f32>(sanitize_hdr_color(mix(background, color, coverage)), 1.0);
@@ -803,6 +989,27 @@ fn fs_main(
         v.tex_coords_2,
         v.tex_coords_3,
     ), material.specular_color_uv_transform);
+    let clearcoat_uv = transform_uv(get_uv(
+        material.clearcoat_tex_coord,
+        v.tex_coords,
+        v.tex_coords_1,
+        v.tex_coords_2,
+        v.tex_coords_3,
+    ), material.clearcoat_uv_transform);
+    let clearcoat_roughness_uv = transform_uv(get_uv(
+        material.clearcoat_roughness_tex_coord,
+        v.tex_coords,
+        v.tex_coords_1,
+        v.tex_coords_2,
+        v.tex_coords_3,
+    ), material.clearcoat_roughness_uv_transform);
+    let clearcoat_normal_uv = transform_uv(get_uv(
+        material.clearcoat_normal_tex_coord,
+        v.tex_coords,
+        v.tex_coords_1,
+        v.tex_coords_2,
+        v.tex_coords_3,
+    ), material.clearcoat_normal_uv_transform);
     let tex_color = textureSample(t_diffuse, s_diffuse, base_uv);
     let surface_color = tex_color * vec4<f32>(v.color, 1.0) * material.base_color;
     let metallic_roughness = textureSample(
@@ -826,9 +1033,36 @@ fn fs_main(
     normal = apply_normal_map(
         normal,
         v.world_tangent,
-        normal_uv,
+        textureSample(t_normal, s_diffuse, normal_uv).xyz * 2.0 - vec3<f32>(1.0),
+        material.normal_scale,
         material.normal_uv_transform,
     );
+    var clearcoat_factor = 0.0;
+    if material.clearcoat_factor > 0.0 {
+        clearcoat_factor = clamp(
+            material.clearcoat_factor * textureSample(t_clearcoat, s_diffuse, clearcoat_uv).r,
+            0.0,
+            1.0,
+        );
+    }
+    var clearcoat_normal = normal;
+    var clearcoat_roughness = 1.0;
+    if clearcoat_factor > 0.0 {
+        clearcoat_normal = apply_normal_map(
+            normal,
+            v.world_tangent,
+            textureSample(t_clearcoat_normal, s_diffuse, clearcoat_normal_uv).xyz
+                * 2.0 - vec3<f32>(1.0),
+            material.clearcoat_normal_scale,
+            material.clearcoat_normal_uv_transform,
+        );
+        clearcoat_roughness = clamp(
+            material.clearcoat_roughness_factor
+                * textureSample(t_clearcoat_roughness, s_diffuse, clearcoat_roughness_uv).g,
+            0.045,
+            1.0,
+        );
+    }
     let debug_view = u32(light.fill_color.a + 0.5);
     if debug_view == 1u {
         return vec4<f32>(sanitize_hdr_color(normal * 0.5 + 0.5), surface_color.a);
@@ -909,6 +1143,38 @@ fn fs_main(
         f0,
         specular_weight,
     );
+    var clearcoat_fresnel = vec3<f32>(0.0);
+    var direct_clearcoat = vec3<f32>(0.0);
+    if clearcoat_factor > 0.0 {
+        clearcoat_fresnel = fresnel_schlick(
+            max(dot(clearcoat_normal, view_dir), 0.0),
+            vec3<f32>(0.04),
+        ) * clearcoat_factor;
+        direct_clearcoat = clearcoat_factor * (
+            evaluate_direct_light(
+                clearcoat_normal,
+                view_dir,
+                key_dir,
+                key_radiance,
+                vec3<f32>(0.0),
+                1.0,
+                clearcoat_roughness,
+                vec3<f32>(0.04),
+                vec3<f32>(1.0),
+            ) * key_visibility
+            + evaluate_direct_light(
+                clearcoat_normal,
+                view_dir,
+                fill_dir,
+                fill_radiance,
+                vec3<f32>(0.0),
+                1.0,
+                clearcoat_roughness,
+                vec3<f32>(0.04),
+                vec3<f32>(1.0),
+            )
+        );
+    }
 
     let n_dot_v = clamp(dot(normal, view_dir), 0.0, 1.0);
     let fresnel_roughness = (
@@ -948,6 +1214,21 @@ fn fs_main(
                 0.0,
                 1.0,
             );
+    var clearcoat_environment = vec3<f32>(0.0);
+    if clearcoat_factor > 0.0 {
+        let clearcoat_n_dot_v = max(dot(clearcoat_normal, view_dir), 0.0);
+        let clearcoat_brdf = textureSampleLevel(
+            t_brdf_lut,
+            s_environment,
+            vec2<f32>(clearcoat_n_dot_v, clearcoat_roughness),
+            0.0,
+        ).rg;
+        clearcoat_environment = sample_prefiltered_environment(
+            reflect(-view_dir, clearcoat_normal),
+            clearcoat_roughness,
+        ) * (vec3<f32>(0.04) * clearcoat_brdf.x + vec3<f32>(clearcoat_brdf.y))
+            * clearcoat_factor * env_intensity;
+    }
     if debug_view == 4u {
         return vec4<f32>(sanitize_hdr_color(diffuse_ambient), surface_color.a);
     }
@@ -957,7 +1238,11 @@ fn fs_main(
 
     let emissive = material.emissive_factor * material.emissive_strength
         * textureSample(t_emissive, s_diffuse, emissive_uv).rgb;
-    let color = radiance + diffuse_ambient + specular_ambient + emissive;
+    let color = (radiance + diffuse_ambient + specular_ambient)
+        * (vec3<f32>(1.0) - clearcoat_fresnel)
+        + direct_clearcoat
+        + clearcoat_environment
+        + emissive;
     return vec4<f32>(sanitize_hdr_color(color), surface_color.a);
 }
 "#;
@@ -1192,6 +1477,36 @@ impl RenderPipelineBundle {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 12,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 13,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 14,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
                 ],
                 label: Some("texture_bind_group_layout"),
             });
@@ -1375,8 +1690,8 @@ impl RenderPipelineBundle {
                 depth_compare: wgpu::CompareFunction::Less,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState {
-                    constant: 2,
-                    slope_scale: 2.0,
+                    constant: 1,
+                    slope_scale: 1.5,
                     clamp: 0.0,
                 },
             }),
@@ -1523,5 +1838,22 @@ impl RenderPipelineBundle {
             glass_pipeline,
             skybox_pipeline,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SHADER;
+
+    #[test]
+    fn wgsl_shader_validates() {
+        let module = wgpu::naga::front::wgsl::parse_str(SHADER)
+            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(SHADER)));
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("WGSL shader should pass Naga validation");
     }
 }

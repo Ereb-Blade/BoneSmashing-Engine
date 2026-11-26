@@ -71,10 +71,10 @@ pub struct LightUniform {
     pub fill_direction_intensity: [f32; 4],
     pub fill_color: [f32; 4],
     pub ambient_top: [f32; 4],
-    pub ambient_bottom: [f32; 4],
+    pub render_options: [f32; 4],
 }
 
-const SHADOW_MAP_SIZE: u32 = 3072;
+const SHADOW_MAP_SIZE: u32 = 4096;
 
 fn scaled_render_dimension(dimension: u32, scale: f32) -> u32 {
     ((dimension as f32 * scale).round() as u32).max(1)
@@ -147,6 +147,7 @@ pub struct RendererSettings {
     pub environment_intensity: f32,
     pub exposure_ev: f32,
     pub shadows_enabled: bool,
+    pub shadow_pcf_samples: u32,
     pub debug_view: u32,
     pub unlocked_fps: bool,
     pub render_scale: f32,
@@ -160,12 +161,193 @@ pub struct RenderTimings {
     pub acquire_cpu_ms: f32,
     pub encode_submit_cpu_ms: f32,
     pub gpu_frame_ms: Option<f32>,
+    pub gpu_shadow_map_ms: Option<f32>,
+    pub gpu_opaque_pass_ms: Option<f32>,
+    pub gpu_sample_id: u64,
     pub draw_calls: usize,
     pub triangle_count: usize,
     pub active_meshes: usize,
     pub active_materials: usize,
     pub render_batches: usize,
     pub active_instances: usize,
+}
+
+const GPU_TIMESTAMP_FRAME_START: u32 = 0;
+const GPU_TIMESTAMP_SHADOW_START: u32 = 1;
+const GPU_TIMESTAMP_SHADOW_END: u32 = 2;
+const GPU_TIMESTAMP_OPAQUE_START: u32 = 3;
+const GPU_TIMESTAMP_OPAQUE_END: u32 = 4;
+const GPU_TIMESTAMP_FRAME_END: u32 = 5;
+const GPU_TIMESTAMP_QUERY_COUNT: u32 = 6;
+const GPU_TIMESTAMP_BUFFER_SIZE: u64 = GPU_TIMESTAMP_QUERY_COUNT as u64 * wgpu::QUERY_SIZE as u64;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GpuTimingSample {
+    frame_ms: f32,
+    shadow_map_ms: f32,
+    opaque_pass_ms: f32,
+}
+
+struct GpuTimestampProfiler {
+    query_set: wgpu::QuerySet,
+    resolve_buffer: wgpu::Buffer,
+    readback_buffer: wgpu::Buffer,
+    pending_readback: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    timestamp_period_ns: f32,
+}
+
+fn gpu_timestamp_features(adapter_features: wgpu::Features) -> wgpu::Features {
+    let required =
+        wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+    if adapter_features.contains(required) {
+        required
+    } else {
+        wgpu::Features::empty()
+    }
+}
+
+fn timestamp_delta_ms(start: u64, end: u64, timestamp_period_ns: f32) -> Option<f32> {
+    let ticks = end.checked_sub(start)?;
+    if !timestamp_period_ns.is_finite() || timestamp_period_ns <= 0.0 {
+        return None;
+    }
+
+    let milliseconds = (ticks as f64 * timestamp_period_ns as f64 / 1_000_000.0) as f32;
+    milliseconds.is_finite().then_some(milliseconds)
+}
+
+fn gpu_timing_sample(
+    timestamps: [u64; GPU_TIMESTAMP_QUERY_COUNT as usize],
+    timestamp_period_ns: f32,
+) -> Option<GpuTimingSample> {
+    Some(GpuTimingSample {
+        frame_ms: timestamp_delta_ms(
+            timestamps[GPU_TIMESTAMP_FRAME_START as usize],
+            timestamps[GPU_TIMESTAMP_FRAME_END as usize],
+            timestamp_period_ns,
+        )?,
+        shadow_map_ms: timestamp_delta_ms(
+            timestamps[GPU_TIMESTAMP_SHADOW_START as usize],
+            timestamps[GPU_TIMESTAMP_SHADOW_END as usize],
+            timestamp_period_ns,
+        )?,
+        opaque_pass_ms: timestamp_delta_ms(
+            timestamps[GPU_TIMESTAMP_OPAQUE_START as usize],
+            timestamps[GPU_TIMESTAMP_OPAQUE_END as usize],
+            timestamp_period_ns,
+        )?,
+    })
+}
+
+impl GpuTimestampProfiler {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Self> {
+        let timestamp_period_ns = queue.get_timestamp_period();
+        if !timestamp_period_ns.is_finite() || timestamp_period_ns <= 0.0 {
+            return None;
+        }
+
+        Some(Self {
+            query_set: device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("GPU frame timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: GPU_TIMESTAMP_QUERY_COUNT,
+            }),
+            resolve_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("GPU timestamp resolve buffer"),
+                size: GPU_TIMESTAMP_BUFFER_SIZE,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            readback_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("GPU timestamp readback buffer"),
+                size: GPU_TIMESTAMP_BUFFER_SIZE,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }),
+            pending_readback: None,
+            timestamp_period_ns,
+        })
+    }
+
+    fn write_start(&self, encoder: &mut wgpu::CommandEncoder) -> bool {
+        if self.pending_readback.is_some() {
+            return false;
+        }
+        encoder.write_timestamp(&self.query_set, GPU_TIMESTAMP_FRAME_START);
+        true
+    }
+
+    fn write_timestamp(&self, encoder: &mut wgpu::CommandEncoder, query_index: u32) {
+        encoder.write_timestamp(&self.query_set, query_index);
+    }
+
+    fn write_end_and_resolve(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.write_timestamp(&self.query_set, GPU_TIMESTAMP_FRAME_END);
+        encoder.resolve_query_set(
+            &self.query_set,
+            0..GPU_TIMESTAMP_QUERY_COUNT,
+            &self.resolve_buffer,
+            0,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.resolve_buffer,
+            0,
+            &self.readback_buffer,
+            0,
+            GPU_TIMESTAMP_BUFFER_SIZE,
+        );
+    }
+
+    fn map_after_submit(&mut self) {
+        let (sender, receiver) = mpsc::channel();
+        self.readback_buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+        self.pending_readback = Some(receiver);
+    }
+
+    fn poll(&mut self, device: &wgpu::Device) -> Result<Option<GpuTimingSample>, String> {
+        device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|error| format!("Could not poll GPU timestamp queries: {error}"))?;
+
+        let Some(receiver) = self.pending_readback.as_ref() else {
+            return Ok(None);
+        };
+        let completion = receiver.try_recv();
+
+        match completion {
+            Ok(Ok(())) => {
+                let timestamps = {
+                    let mapped = self.readback_buffer.slice(..).get_mapped_range();
+                    bytemuck::try_cast_slice::<u8, u64>(&mapped)
+                        .ok()
+                        .filter(|values| values.len() == GPU_TIMESTAMP_QUERY_COUNT as usize)
+                        .and_then(|values| values.try_into().ok())
+                };
+                self.readback_buffer.unmap();
+                self.pending_readback = None;
+
+                let Some(timestamps) = timestamps else {
+                    return Err("GPU timestamp readback had an invalid size".to_owned());
+                };
+                gpu_timing_sample(timestamps, self.timestamp_period_ns)
+                    .map(Some)
+                    .ok_or_else(|| "GPU timestamp values were invalid".to_owned())
+            }
+            Ok(Err(error)) => {
+                self.pending_readback = None;
+                Err(format!("Could not map GPU timestamp results: {error}"))
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.pending_readback = None;
+                Err("GPU timestamp readback channel disconnected".to_owned())
+            }
+        }
+    }
 }
 
 impl Default for RendererSettings {
@@ -178,6 +360,7 @@ impl Default for RendererSettings {
             environment_intensity: 0.85,
             exposure_ev: -0.5,
             shadows_enabled: true,
+            shadow_pcf_samples: 8,
             debug_view: 0,
             unlocked_fps: false,
             render_scale: 0.75,
@@ -548,6 +731,7 @@ pub struct Renderer {
     surface_ready: bool,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    adapter_name: String,
     pipeline: wgpu::RenderPipeline,
     transparent_pipeline: wgpu::RenderPipeline,
     glass_pipeline: wgpu::RenderPipeline,
@@ -608,6 +792,7 @@ pub struct Renderer {
     cached_shadow_matrix: Mat4,
     shadow_cache_valid: bool,
     timings: RenderTimings,
+    gpu_timestamp_profiler: Option<GpuTimestampProfiler>,
     environment_load: Option<mpsc::Receiver<(Option<PathBuf>, Result<Environment, String>)>>,
 }
 
@@ -660,17 +845,35 @@ impl Renderer {
             })
             .await
             .map_err(|error| format!("Could not find a suitable GPU adapter: {error:?}"))?;
+        let adapter_name = adapter.get_info().name;
 
         let mut device_descriptor = wgpu::DeviceDescriptor::default();
+        let required_sampled_textures = 18;
+        if adapter.limits().max_sampled_textures_per_shader_stage < required_sampled_textures {
+            return Err(
+                "GPU does not support the 18 sampled textures per shader stage required by material rendering"
+                    .to_owned(),
+            );
+        }
+        device_descriptor
+            .required_limits
+            .max_sampled_textures_per_shader_stage = required_sampled_textures;
         let adapter_features = adapter.features();
         if adapter_features.contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES) {
             device_descriptor.required_features |=
                 wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
         }
+        let timestamp_features = gpu_timestamp_features(adapter_features);
+        device_descriptor.required_features |= timestamp_features;
         let (device, queue) = adapter
             .request_device(&device_descriptor)
             .await
             .map_err(|error| format!("Could not create GPU device: {error}"))?;
+        let gpu_timestamp_profiler = if timestamp_features.is_empty() {
+            None
+        } else {
+            GpuTimestampProfiler::new(&device, &queue)
+        };
         device.on_uncaptured_error(Box::new(move |error| {
             eprintln!("GPU uncaptured error: {error:?}");
         }));
@@ -740,7 +943,12 @@ impl Renderer {
             fill_direction_intensity: [0.55, -0.3, 0.65, settings.fill_light_intensity],
             fill_color: [0.62, 0.76, 1.0, settings.debug_view as f32],
             ambient_top: [0.0, 0.0, 0.0, settings.environment_intensity],
-            ambient_bottom: [0.0, 0.0, 0.0, settings.exposure_ev],
+            render_options: [
+                settings.shadow_pcf_samples as f32,
+                0.0,
+                0.0,
+                settings.exposure_ev,
+            ],
         };
         let light_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("light buffer"),
@@ -933,6 +1141,7 @@ impl Renderer {
             surface_ready: size.width > 0 && size.height > 0,
             queue,
             config,
+            adapter_name,
             pipeline: pipeline_bundle.pipeline,
             transparent_pipeline: pipeline_bundle.transparent_pipeline,
             glass_pipeline: pipeline_bundle.glass_pipeline,
@@ -993,6 +1202,7 @@ impl Renderer {
             cached_shadow_matrix: Mat4::IDENTITY,
             shadow_cache_valid: false,
             timings: RenderTimings::default(),
+            gpu_timestamp_profiler,
             environment_load: None,
         };
         renderer.start_initial_environment_load();
@@ -1063,6 +1273,21 @@ impl Renderer {
         self.config.format
     }
 
+    pub fn adapter_name(&self) -> &str {
+        &self.adapter_name
+    }
+
+    pub fn render_dimensions(&self) -> (u32, u32) {
+        (
+            scaled_render_dimension(self.config.width, self.settings.render_scale),
+            scaled_render_dimension(self.config.height, self.settings.render_scale),
+        )
+    }
+
+    pub fn surface_dimensions(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
+    }
+
     pub fn settings(&self) -> RendererSettings {
         self.settings
     }
@@ -1076,6 +1301,9 @@ impl Renderer {
         };
         if !self.supported_msaa_samples.contains(&settings.msaa_samples) {
             settings.msaa_samples = self.settings.msaa_samples;
+        }
+        if ![2, 4, 8, 16].contains(&settings.shadow_pcf_samples) {
+            settings.shadow_pcf_samples = self.settings.shadow_pcf_samples;
         }
         let render_scale_changed = self.settings.render_scale != settings.render_scale;
         let msaa_samples_changed = self.settings.msaa_samples != settings.msaa_samples;
@@ -1534,6 +1762,9 @@ impl Renderer {
                 (&white_mips, 1, 1),
                 (&white_mips, 1, 1),
                 (&white_mips, 1, 1),
+                (&white_mips, 1, 1),
+                (&white_mips, 1, 1),
+                (&white_mips, 1, 1),
                 MaterialParams {
                     base_color: [
                         material.diffuse[0].clamp(0.0, 1.0),
@@ -1650,6 +1881,15 @@ impl Renderer {
                     .is_some_and(|image| image >= model.images.len())
                 || material
                     .thickness_image
+                    .is_some_and(|image| image >= model.images.len())
+                || material
+                    .clearcoat_image
+                    .is_some_and(|image| image >= model.images.len())
+                || material
+                    .clearcoat_roughness_image
+                    .is_some_and(|image| image >= model.images.len())
+                || material
+                    .clearcoat_normal_image
                     .is_some_and(|image| image >= model.images.len())
             {
                 return Err(format!(
@@ -1772,6 +2012,48 @@ impl Renderer {
                         image.height,
                     )
                 });
+            let clearcoat = material_data
+                .clearcoat_image
+                .map(|image| &model.images[image]);
+            let (clearcoat_mips, clearcoat_width, clearcoat_height) =
+                clearcoat.map_or((&default_texture_mip_levels[..], 1, 1), |image| {
+                    (
+                        image
+                            .data_mip_levels
+                            .as_deref()
+                            .unwrap_or(&default_texture_mip_levels),
+                        image.width,
+                        image.height,
+                    )
+                });
+            let clearcoat_roughness = material_data
+                .clearcoat_roughness_image
+                .map(|image| &model.images[image]);
+            let (clearcoat_roughness_mips, clearcoat_roughness_width, clearcoat_roughness_height) =
+                clearcoat_roughness.map_or((&default_texture_mip_levels[..], 1, 1), |image| {
+                    (
+                        image
+                            .data_mip_levels
+                            .as_deref()
+                            .unwrap_or(&default_texture_mip_levels),
+                        image.width,
+                        image.height,
+                    )
+                });
+            let clearcoat_normal = material_data
+                .clearcoat_normal_image
+                .map(|image| &model.images[image]);
+            let (clearcoat_normal_mips, clearcoat_normal_width, clearcoat_normal_height) =
+                clearcoat_normal.map_or((&flat_normal_mip_levels[..], 1, 1), |image| {
+                    (
+                        image
+                            .normal_mip_levels
+                            .as_deref()
+                            .unwrap_or(&flat_normal_mip_levels),
+                        image.width,
+                        image.height,
+                    )
+                });
             let label = format!(
                 "{} material {index}",
                 path.file_stem()
@@ -1795,6 +2077,17 @@ impl Renderer {
                 ),
                 (transmission_mips, transmission_width, transmission_height),
                 (thickness_mips, thickness_width, thickness_height),
+                (clearcoat_mips, clearcoat_width, clearcoat_height),
+                (
+                    clearcoat_roughness_mips,
+                    clearcoat_roughness_width,
+                    clearcoat_roughness_height,
+                ),
+                (
+                    clearcoat_normal_mips,
+                    clearcoat_normal_width,
+                    clearcoat_normal_height,
+                ),
                 MaterialParams {
                     base_color: material_data.base_color_factor,
                     roughness: material_data.roughness_factor,
@@ -1804,6 +2097,16 @@ impl Renderer {
                     alpha_cutoff: material_data.alpha_cutoff,
                     double_sided: u32::from(material_data.double_sided),
                     transmission_factor: material_data.transmission_factor,
+                    clearcoat_factor: material_data.clearcoat_factor,
+                    clearcoat_roughness_factor: material_data.clearcoat_roughness_factor,
+                    clearcoat_normal_scale: if material_data.clearcoat_normal_image.is_some() {
+                        material_data.clearcoat_normal_scale
+                    } else {
+                        0.0
+                    },
+                    clearcoat_tex_coord: material_data.clearcoat_tex_coord,
+                    clearcoat_roughness_tex_coord: material_data.clearcoat_roughness_tex_coord,
+                    clearcoat_normal_tex_coord: material_data.clearcoat_normal_tex_coord,
                     ior: material_data.ior,
                     specular_factor: material_data.specular_factor,
                     specular_color_factor: material_data.specular_color_factor,
@@ -1836,6 +2139,9 @@ impl Renderer {
                     specular_uv_transform: material_data.specular_transform,
                     specular_color_uv_transform: material_data.specular_color_transform,
                     transmission_uv_transform: material_data.transmission_transform,
+                    clearcoat_uv_transform: material_data.clearcoat_transform,
+                    clearcoat_roughness_uv_transform: material_data.clearcoat_roughness_transform,
+                    clearcoat_normal_uv_transform: material_data.clearcoat_normal_transform,
                     thickness_uv_transform: material_data.thickness_transform,
                     ..Default::default()
                 },
@@ -1875,6 +2181,31 @@ impl Renderer {
     ) {
         if !self.surface_ready {
             return;
+        }
+        let gpu_timing_result = self
+            .gpu_timestamp_profiler
+            .as_mut()
+            .map(|profiler| profiler.poll(&self.device));
+        match gpu_timing_result {
+            Some(Ok(Some(sample))) => {
+                self.timings.gpu_frame_ms = Some(sample.frame_ms);
+                self.timings.gpu_shadow_map_ms = Some(sample.shadow_map_ms);
+                self.timings.gpu_opaque_pass_ms = Some(sample.opaque_pass_ms);
+                self.timings.gpu_sample_id = self.timings.gpu_sample_id.wrapping_add(1);
+            }
+            Some(Ok(None)) => {}
+            Some(Err(error)) => {
+                eprintln!("GPU timestamp profiling disabled: {error}");
+                self.gpu_timestamp_profiler = None;
+                self.timings.gpu_frame_ms = None;
+                self.timings.gpu_shadow_map_ms = None;
+                self.timings.gpu_opaque_pass_ms = None;
+            }
+            None => {
+                self.timings.gpu_frame_ms = None;
+                self.timings.gpu_shadow_map_ms = None;
+                self.timings.gpu_opaque_pass_ms = None;
+            }
         }
         let ui_started = Instant::now();
         let previous_timings = self.timings;
@@ -1919,7 +2250,12 @@ impl Renderer {
             fill_direction_intensity: [0.55, -0.3, 0.65, self.settings.fill_light_intensity],
             fill_color: [0.62, 0.76, 1.0, self.settings.debug_view as f32],
             ambient_top: [0.0, 0.0, 0.0, self.settings.environment_intensity],
-            ambient_bottom: [0.0, 0.0, 0.0, self.settings.exposure_ev],
+            render_options: [
+                self.settings.shadow_pcf_samples as f32,
+                0.0,
+                0.0,
+                self.settings.exposure_ev,
+            ],
         };
         self.queue
             .write_buffer(&self._light_buffer, 0, bytemuck::bytes_of(&light_uniform));
@@ -2099,7 +2435,6 @@ impl Renderer {
         self.timings.active_materials = self.active_material_ids.len();
         self.timings.render_batches = self.draw_batches.len();
         self.timings.active_instances = visible_instance_count;
-        self.timings.gpu_frame_ms = None;
 
         let skin_buffer_bytes = self.skin_matrices.len() * std::mem::size_of::<Mat4>();
         let max_storage_binding_size =
@@ -2224,7 +2559,16 @@ impl Renderer {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let capture_gpu_frame = self
+            .gpu_timestamp_profiler
+            .as_ref()
+            .is_some_and(|profiler| profiler.write_start(&mut encoder));
 
+        if capture_gpu_frame {
+            if let Some(profiler) = self.gpu_timestamp_profiler.as_ref() {
+                profiler.write_timestamp(&mut encoder, GPU_TIMESTAMP_SHADOW_START);
+            }
+        }
         if render_shadows {
             self.queue.write_buffer(
                 &self.shadow_matrix_buffer,
@@ -2284,6 +2628,12 @@ impl Renderer {
             self.shadow_cache_valid = true;
         }
 
+        if capture_gpu_frame {
+            if let Some(profiler) = self.gpu_timestamp_profiler.as_ref() {
+                profiler.write_timestamp(&mut encoder, GPU_TIMESTAMP_SHADOW_END);
+                profiler.write_timestamp(&mut encoder, GPU_TIMESTAMP_OPAQUE_START);
+            }
+        }
         let multisampled = self.settings.msaa_samples > 1;
         {
             let (color_view, resolve_target) = if multisampled {
@@ -2371,6 +2721,11 @@ impl Renderer {
             }
         }
 
+        if capture_gpu_frame {
+            if let Some(profiler) = self.gpu_timestamp_profiler.as_ref() {
+                profiler.write_timestamp(&mut encoder, GPU_TIMESTAMP_OPAQUE_END);
+            }
+        }
         if !multisampled {
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -2588,8 +2943,18 @@ impl Renderer {
         }
 
         let mut command_buffers = debug_ui.render(&self.device, &self.queue, &mut encoder, &view);
+        if capture_gpu_frame {
+            if let Some(profiler) = self.gpu_timestamp_profiler.as_ref() {
+                profiler.write_end_and_resolve(&mut encoder);
+            }
+        }
         command_buffers.push(encoder.finish());
         self.queue.submit(command_buffers);
+        if capture_gpu_frame {
+            if let Some(profiler) = self.gpu_timestamp_profiler.as_mut() {
+                profiler.map_after_submit();
+            }
+        }
         self.timings.encode_submit_cpu_ms = encode_started.elapsed().as_secs_f32() * 1000.0;
         frame.present();
     }
@@ -2598,6 +2963,40 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_timestamps_require_encoder_timestamp_support() {
+        let timestamp_features =
+            wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+
+        assert_eq!(
+            gpu_timestamp_features(timestamp_features),
+            timestamp_features
+        );
+        assert!(gpu_timestamp_features(wgpu::Features::TIMESTAMP_QUERY).is_empty());
+        assert!(gpu_timestamp_features(wgpu::Features::empty()).is_empty());
+    }
+
+    #[test]
+    fn gpu_timestamp_delta_converts_ticks_to_milliseconds() {
+        assert_eq!(timestamp_delta_ms(100, 1_100, 1_000.0), Some(1.0));
+        assert_eq!(timestamp_delta_ms(1_100, 100, 1_000.0), None);
+        assert_eq!(timestamp_delta_ms(0, 1, 0.0), None);
+    }
+
+    #[test]
+    fn gpu_timestamp_sample_separates_shadow_and_opaque_passes() {
+        let sample = gpu_timing_sample([100, 200, 300, 300, 700, 1_100], 1_000.0).unwrap();
+
+        assert_eq!(
+            sample,
+            GpuTimingSample {
+                frame_ms: 1.0,
+                shadow_map_ms: 0.1,
+                opaque_pass_ms: 0.4,
+            }
+        );
+    }
 
     #[test]
     fn transparent_sort_uses_camera_depth_instead_of_radial_distance() {

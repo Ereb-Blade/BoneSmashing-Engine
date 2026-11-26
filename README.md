@@ -151,14 +151,14 @@ roughness и metallic материалов, назначенных объект�
 
 Поддерживаются основные каналы glTF PBR, включая base color, metallic,
 roughness, normal, occlusion и emissive, а также ряд расширений glTF для
-specular, transmission, volume и specular-glossiness. Поддерживаются
-несколько UV-наборов и `KHR_texture_transform`.
+specular, transmission, volume, clearcoat и specular-glossiness. Поддерживаются
+текстуры clearcoat, несколько UV-наборов и `KHR_texture_transform`.
 
 Стекло использует экранное преломление непрозрачной сцены: объекты за
 поверхностью, не попавшие в экранный буфер, не видны в преломлении. Это
-приближение, а не трассировка лучей. Точечные и прожекторные источники,
-clearcoat и sheen пока не реализованы; параметры sampler из glTF пока не
-применяются. Анимация glTF morph targets поддерживается для position/normal/tangent
+приближение, а не трассировка лучей. Точечные и прожекторные источники и sheen
+пока не реализованы; параметры sampler из glTF пока не применяются. Анимация
+glTF morph targets поддерживается для position/normal/tangent
 displacements и step/linear/cubic sampling весов. В инспекторе доступны фильтр,
 сброс всех весов и редактирование по одному target; названия берутся из
 `mesh.extras.targetNames`, если они заданы, иначе показывается номер target.

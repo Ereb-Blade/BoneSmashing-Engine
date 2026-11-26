@@ -94,10 +94,16 @@ pub struct SceneRendererSettings {
     pub environment_intensity: f32,
     pub exposure_ev: f32,
     pub shadows_enabled: bool,
+    #[serde(default = "default_shadow_pcf_samples")]
+    pub shadow_pcf_samples: u32,
     pub debug_view: u32,
     pub unlocked_fps: bool,
     pub render_scale: f32,
     pub msaa_samples: u32,
+}
+
+fn default_shadow_pcf_samples() -> u32 {
+    RendererSettings::default().shadow_pcf_samples
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -123,6 +129,7 @@ impl From<RendererSettings> for SceneRendererSettings {
             environment_intensity: settings.environment_intensity,
             exposure_ev: settings.exposure_ev,
             shadows_enabled: settings.shadows_enabled,
+            shadow_pcf_samples: settings.shadow_pcf_samples,
             debug_view: settings.debug_view,
             unlocked_fps: settings.unlocked_fps,
             render_scale: settings.render_scale,
@@ -141,6 +148,7 @@ impl From<SceneRendererSettings> for RendererSettings {
             environment_intensity: settings.environment_intensity,
             exposure_ev: settings.exposure_ev,
             shadows_enabled: settings.shadows_enabled,
+            shadow_pcf_samples: settings.shadow_pcf_samples,
             debug_view: settings.debug_view,
             unlocked_fps: settings.unlocked_fps,
             render_scale: settings.render_scale,
@@ -590,6 +598,7 @@ impl SceneRendererSettings {
             && (0.0..=2.0).contains(&self.environment_intensity)
             && (-10.0..=3.0).contains(&self.exposure_ev)
             && (0.5..=1.0).contains(&self.render_scale)
+            && [2, 4, 8, 16].contains(&self.shadow_pcf_samples)
             && self.debug_view <= 5
             && [1, 2, 4, 8].contains(&self.msaa_samples)
     }
@@ -949,6 +958,43 @@ mod tests {
     use crate::scene::{ModelAnimationPlayback, Transform};
 
     #[test]
+    fn older_renderer_settings_default_to_eight_shadow_pcf_taps() {
+        let settings: SceneRendererSettings = serde_json::from_value(serde_json::json!({
+            "key_light_yaw_degrees": -142.0,
+            "key_light_elevation_degrees": -53.0,
+            "key_light_intensity": 2.0,
+            "fill_light_intensity": 0.25,
+            "environment_intensity": 0.85,
+            "exposure_ev": -0.5,
+            "shadows_enabled": true,
+            "debug_view": 0,
+            "unlocked_fps": false,
+            "render_scale": 0.75,
+            "msaa_samples": 1
+        }))
+        .unwrap();
+
+        assert_eq!(settings.shadow_pcf_samples, 8);
+        assert!(settings.is_valid());
+        for sample_count in [2, 4, 8, 16] {
+            assert!(
+                SceneRendererSettings {
+                    shadow_pcf_samples: sample_count,
+                    ..settings
+                }
+                .is_valid()
+            );
+        }
+        assert!(
+            !SceneRendererSettings {
+                shadow_pcf_samples: 3,
+                ..settings
+            }
+            .is_valid()
+        );
+    }
+
+    #[test]
     fn saves_and_validates_model_animation_settings() {
         let scene_directory = std::env::temp_dir().join(format!(
             "bone-smashing-animation-scene-{}-{}",
@@ -1304,6 +1350,7 @@ mod tests {
         let settings = RendererSettings {
             exposure_ev: 1.25,
             render_scale: 0.75,
+            shadow_pcf_samples: 8,
             ..RendererSettings::default()
         };
         let params = MaterialParams {

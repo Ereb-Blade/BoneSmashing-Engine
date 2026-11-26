@@ -43,6 +43,16 @@ pub struct MaterialParams {
     pub specular_uv_transform: [[f32; 4]; 2],
     pub specular_color_uv_transform: [[f32; 4]; 2],
     pub transmission_uv_transform: [[f32; 4]; 2],
+    pub clearcoat_factor: f32,
+    pub clearcoat_roughness_factor: f32,
+    pub clearcoat_normal_scale: f32,
+    pub clearcoat_tex_coord: u32,
+    pub clearcoat_roughness_tex_coord: u32,
+    pub clearcoat_normal_tex_coord: u32,
+    pub _clearcoat_pad: [u32; 2],
+    pub clearcoat_uv_transform: [[f32; 4]; 2],
+    pub clearcoat_roughness_uv_transform: [[f32; 4]; 2],
+    pub clearcoat_normal_uv_transform: [[f32; 4]; 2],
 }
 
 impl Default for MaterialParams {
@@ -88,6 +98,16 @@ impl Default for MaterialParams {
             specular_uv_transform: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
             specular_color_uv_transform: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
             transmission_uv_transform: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+            clearcoat_factor: 0.0,
+            clearcoat_roughness_factor: 0.0,
+            clearcoat_normal_scale: 0.0,
+            clearcoat_tex_coord: 0,
+            clearcoat_roughness_tex_coord: 0,
+            clearcoat_normal_tex_coord: 0,
+            _clearcoat_pad: [0; 2],
+            clearcoat_uv_transform: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+            clearcoat_roughness_uv_transform: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+            clearcoat_normal_uv_transform: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
         }
     }
 }
@@ -243,7 +263,7 @@ mod tests {
 
     #[test]
     fn material_uniform_matches_wgsl_uniform_alignment() {
-        assert_eq!(std::mem::size_of::<MaterialParams>(), 448);
+        assert_eq!(std::mem::size_of::<MaterialParams>(), 576);
         assert_eq!(
             std::mem::offset_of!(MaterialParams, specular_color_factor),
             64
@@ -260,6 +280,14 @@ mod tests {
         assert_eq!(
             std::mem::offset_of!(MaterialParams, transmission_uv_transform),
             416
+        );
+        assert_eq!(
+            std::mem::offset_of!(MaterialParams, clearcoat_uv_transform),
+            480
+        );
+        assert_eq!(
+            std::mem::offset_of!(MaterialParams, clearcoat_normal_uv_transform),
+            544
         );
     }
 
@@ -495,6 +523,39 @@ impl Material {
             false,
             false,
         );
+        let clearcoat_texture = Self::create_rgba_texture(
+            device,
+            queue,
+            &white,
+            1,
+            1,
+            wgpu::TextureFormat::Rgba8Unorm,
+            label,
+            false,
+            false,
+        );
+        let clearcoat_roughness_texture = Self::create_rgba_texture(
+            device,
+            queue,
+            &white,
+            1,
+            1,
+            wgpu::TextureFormat::Rgba8Unorm,
+            label,
+            false,
+            false,
+        );
+        let clearcoat_normal_texture = Self::create_rgba_texture(
+            device,
+            queue,
+            &[128, 128, 255, 255],
+            1,
+            1,
+            wgpu::TextureFormat::Rgba8Unorm,
+            label,
+            true,
+            false,
+        );
         Self::from_textures(
             device,
             layout,
@@ -507,6 +568,9 @@ impl Material {
             specular_color_texture,
             transmission_texture,
             thickness_texture,
+            clearcoat_texture,
+            clearcoat_roughness_texture,
+            clearcoat_normal_texture,
             params,
             label,
         )
@@ -525,6 +589,9 @@ impl Material {
         specular_color: (&[Vec<u8>], u32, u32),
         transmission: (&[Vec<u8>], u32, u32),
         thickness: (&[Vec<u8>], u32, u32),
+        clearcoat: (&[Vec<u8>], u32, u32),
+        clearcoat_roughness: (&[Vec<u8>], u32, u32),
+        clearcoat_normal: (&[Vec<u8>], u32, u32),
         params: MaterialParams,
         label: Option<&str>,
     ) -> Self {
@@ -613,6 +680,37 @@ impl Material {
             wgpu::TextureFormat::Rgba8Unorm,
             label.map(|name| format!("{name}_thickness")).as_deref(),
         );
+        let clearcoat_texture = Self::create_texture_from_mip_levels(
+            device,
+            queue,
+            clearcoat.0,
+            clearcoat.1,
+            clearcoat.2,
+            wgpu::TextureFormat::Rgba8Unorm,
+            label.map(|name| format!("{name}_clearcoat")).as_deref(),
+        );
+        let clearcoat_roughness_texture = Self::create_texture_from_mip_levels(
+            device,
+            queue,
+            clearcoat_roughness.0,
+            clearcoat_roughness.1,
+            clearcoat_roughness.2,
+            wgpu::TextureFormat::Rgba8Unorm,
+            label
+                .map(|name| format!("{name}_clearcoat_roughness"))
+                .as_deref(),
+        );
+        let clearcoat_normal_texture = Self::create_texture_from_mip_levels(
+            device,
+            queue,
+            clearcoat_normal.0,
+            clearcoat_normal.1,
+            clearcoat_normal.2,
+            wgpu::TextureFormat::Rgba8Unorm,
+            label
+                .map(|name| format!("{name}_clearcoat_normal"))
+                .as_deref(),
+        );
         Self::from_textures(
             device,
             layout,
@@ -625,6 +723,9 @@ impl Material {
             specular_color_texture,
             transmission_texture,
             thickness_texture,
+            clearcoat_texture,
+            clearcoat_roughness_texture,
+            clearcoat_normal_texture,
             params,
             label,
         )
@@ -642,6 +743,9 @@ impl Material {
         specular_color_texture: wgpu::Texture,
         transmission_texture: wgpu::Texture,
         thickness_texture: wgpu::Texture,
+        clearcoat_texture: wgpu::Texture,
+        clearcoat_roughness_texture: wgpu::Texture,
+        clearcoat_normal_texture: wgpu::Texture,
         params: MaterialParams,
         label: Option<&str>,
     ) -> Self {
@@ -658,6 +762,11 @@ impl Material {
         let transmission_view =
             transmission_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let thickness_view = thickness_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let clearcoat_view = clearcoat_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let clearcoat_roughness_view =
+            clearcoat_roughness_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let clearcoat_normal_view =
+            clearcoat_normal_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::Repeat,
             address_mode_v: wgpu::AddressMode::Repeat,
@@ -726,6 +835,18 @@ impl Material {
                 wgpu::BindGroupEntry {
                     binding: 11,
                     resource: wgpu::BindingResource::TextureView(&thickness_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::TextureView(&clearcoat_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: wgpu::BindingResource::TextureView(&clearcoat_roughness_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: wgpu::BindingResource::TextureView(&clearcoat_normal_view),
                 },
             ],
             label: label.map(|name| format!("{name}_bind_group")).as_deref(),

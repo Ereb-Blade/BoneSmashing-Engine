@@ -1,6 +1,7 @@
 #![allow(clippy::too_many_arguments, clippy::collapsible_if)]
 
 use crate::camera::Camera;
+use crate::config::Z_NEAR;
 use crate::core::{MATERIAL_DEFAULT, MESH_CUBE};
 use crate::renderer::material::MaterialParams;
 use crate::renderer::state::{ParsedAsset, RenderTimings, Renderer, RendererSettings, parse_asset};
@@ -9,9 +10,11 @@ use crate::scene::{
     load_scene,
 };
 use glam::{EulerRot, Mat4, Quat, Vec3};
-use std::collections::HashMap;
+use serde::Serialize;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use winit::window::Window;
 
 struct PreparedFrame {
@@ -80,6 +83,428 @@ struct SceneSnapshot {
 struct RenderSnapshot {
     settings: RendererSettings,
     materials: Vec<MaterialParams>,
+}
+
+const PROFILE_WARMUP: Duration = Duration::from_secs(2);
+const PROFILE_DURATION: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, Serialize)]
+struct ProfileCamera {
+    position: [f32; 3],
+    yaw_radians: f32,
+    pitch_radians: f32,
+    aspect_ratio: f32,
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct ProfileRenderSettings {
+    surface_width: u32,
+    surface_height: u32,
+    render_width: u32,
+    render_height: u32,
+    render_scale: f32,
+    msaa_samples: u32,
+    shadows_enabled: bool,
+    shadow_pcf_samples: u32,
+    unlocked_fps: bool,
+    key_light_intensity: f32,
+    fill_light_intensity: f32,
+    environment_intensity: f32,
+    exposure_ev: f32,
+    debug_view: u32,
+}
+
+#[derive(Clone, Serialize)]
+struct ProfileSceneSnapshot {
+    draw_calls: usize,
+    triangles: usize,
+    meshes: usize,
+    materials: usize,
+    batches: usize,
+    instances: usize,
+    asset_paths: Vec<String>,
+    estimated_asset_bounds_screen_percent: f32,
+}
+
+#[derive(Clone, Serialize)]
+struct ProfileSample {
+    elapsed_ms: f32,
+    fps: f32,
+    cpu_frame_ms: f32,
+    cpu_ui_ms: f32,
+    cpu_scene_ms: f32,
+    cpu_acquire_ms: f32,
+    cpu_submit_ms: f32,
+    gpu_sample_id: Option<u64>,
+    gpu_render_ms: Option<f32>,
+    gpu_shadow_map_ms: Option<f32>,
+    gpu_opaque_ms: Option<f32>,
+    draw_calls: usize,
+    triangles: usize,
+    meshes: usize,
+    materials: usize,
+    batches: usize,
+    instances: usize,
+}
+
+#[derive(Serialize)]
+struct ProfileMetricSummary {
+    sample_count: usize,
+    median: Option<f32>,
+    p95: Option<f32>,
+}
+
+#[derive(Serialize)]
+struct ProfileSummary {
+    cpu_frame_ms: ProfileMetricSummary,
+    cpu_acquire_ms: ProfileMetricSummary,
+    gpu_render_ms: ProfileMetricSummary,
+    gpu_shadow_map_ms: ProfileMetricSummary,
+    gpu_opaque_ms: ProfileMetricSummary,
+}
+
+#[derive(Serialize)]
+struct ProfileLog {
+    schema_version: u32,
+    app_version: String,
+    written_at_unix_ms: u64,
+    scene_path: String,
+    gpu_adapter: String,
+    warmup_seconds: u64,
+    capture_seconds: u64,
+    camera: ProfileCamera,
+    render: ProfileRenderSettings,
+    scene: ProfileSceneSnapshot,
+    summary: ProfileSummary,
+    samples: Vec<ProfileSample>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProfileCapturePhase {
+    Warmup,
+    Recording,
+}
+
+struct ProfileCapture {
+    phase: ProfileCapturePhase,
+    phase_started_at: Instant,
+    last_gpu_sample_id: u64,
+    scene_path: String,
+    gpu_adapter: String,
+    camera: ProfileCamera,
+    render: ProfileRenderSettings,
+    scene: ProfileSceneSnapshot,
+    samples: Vec<ProfileSample>,
+}
+
+impl ProfileCapture {
+    fn new(
+        camera: &Camera,
+        renderer: &Renderer,
+        world: &World,
+        scene_path: String,
+        timings: RenderTimings,
+    ) -> Self {
+        let settings = renderer.settings();
+        let (surface_width, surface_height) = renderer.surface_dimensions();
+        let (render_width, render_height) = renderer.render_dimensions();
+        Self {
+            phase: ProfileCapturePhase::Warmup,
+            phase_started_at: Instant::now(),
+            last_gpu_sample_id: timings.gpu_sample_id,
+            scene_path,
+            gpu_adapter: renderer.adapter_name().to_owned(),
+            camera: ProfileCamera {
+                position: camera.eye.to_array(),
+                yaw_radians: camera.yaw,
+                pitch_radians: camera.pitch,
+                aspect_ratio: camera.aspect,
+            },
+            render: ProfileRenderSettings {
+                surface_width,
+                surface_height,
+                render_width,
+                render_height,
+                render_scale: settings.render_scale,
+                msaa_samples: settings.msaa_samples,
+                shadows_enabled: settings.shadows_enabled,
+                shadow_pcf_samples: settings.shadow_pcf_samples,
+                unlocked_fps: settings.unlocked_fps,
+                key_light_intensity: settings.key_light_intensity,
+                fill_light_intensity: settings.fill_light_intensity,
+                environment_intensity: settings.environment_intensity,
+                exposure_ev: settings.exposure_ev,
+                debug_view: settings.debug_view,
+            },
+            scene: ProfileSceneSnapshot {
+                draw_calls: timings.draw_calls,
+                triangles: timings.triangle_count,
+                meshes: timings.active_meshes,
+                materials: timings.active_materials,
+                batches: timings.render_batches,
+                instances: timings.active_instances,
+                asset_paths: world
+                    .objects()
+                    .iter()
+                    .filter_map(|object| object.asset_source())
+                    .map(|source| source.path.display().to_string())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+                estimated_asset_bounds_screen_percent: estimated_screen_coverage_percent(
+                    camera, renderer, world,
+                ),
+            },
+            samples: Vec::new(),
+        }
+    }
+
+    fn tick(&mut self, timings: RenderTimings, cpu_frame_ms: f32, fps: f32) -> bool {
+        let now = Instant::now();
+        if self.phase == ProfileCapturePhase::Warmup {
+            if now.duration_since(self.phase_started_at) < PROFILE_WARMUP {
+                return false;
+            }
+            self.phase = ProfileCapturePhase::Recording;
+            self.phase_started_at = now;
+            self.last_gpu_sample_id = timings.gpu_sample_id;
+            return false;
+        }
+
+        let elapsed = now.duration_since(self.phase_started_at);
+        let has_new_gpu_sample = timings.gpu_sample_id != self.last_gpu_sample_id;
+        if has_new_gpu_sample {
+            self.last_gpu_sample_id = timings.gpu_sample_id;
+        }
+        self.samples.push(ProfileSample {
+            elapsed_ms: elapsed.as_secs_f32() * 1000.0,
+            fps,
+            cpu_frame_ms,
+            cpu_ui_ms: timings.ui_cpu_ms,
+            cpu_scene_ms: timings.scene_cpu_ms,
+            cpu_acquire_ms: timings.acquire_cpu_ms,
+            cpu_submit_ms: timings.encode_submit_cpu_ms,
+            gpu_sample_id: has_new_gpu_sample.then_some(timings.gpu_sample_id),
+            gpu_render_ms: has_new_gpu_sample.then_some(timings.gpu_frame_ms).flatten(),
+            gpu_shadow_map_ms: has_new_gpu_sample
+                .then_some(timings.gpu_shadow_map_ms)
+                .flatten(),
+            gpu_opaque_ms: has_new_gpu_sample
+                .then_some(timings.gpu_opaque_pass_ms)
+                .flatten(),
+            draw_calls: timings.draw_calls,
+            triangles: timings.triangle_count,
+            meshes: timings.active_meshes,
+            materials: timings.active_materials,
+            batches: timings.render_batches,
+            instances: timings.active_instances,
+        });
+        elapsed >= PROFILE_DURATION
+    }
+
+    fn progress_text(&self) -> String {
+        let elapsed = self.phase_started_at.elapsed().as_secs_f32();
+        match self.phase {
+            ProfileCapturePhase::Warmup => format!(
+                "Warming up: {:.1} s remaining; camera and animation are frozen",
+                (PROFILE_WARMUP.as_secs_f32() - elapsed).max(0.0)
+            ),
+            ProfileCapturePhase::Recording => format!(
+                "Recording: {:.1}/{:.0} s; {} frame samples",
+                elapsed.min(PROFILE_DURATION.as_secs_f32()),
+                PROFILE_DURATION.as_secs_f32(),
+                self.samples.len()
+            ),
+        }
+    }
+
+    fn write_log(self) -> Result<String, String> {
+        if self.samples.is_empty() {
+            return Err("Profile capture finished without samples".to_owned());
+        }
+        let written_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("Could not read the system clock: {error}"))?
+            .as_millis();
+        let written_at_unix_ms = u64::try_from(written_at_unix_ms)
+            .map_err(|error| format!("Profile timestamp is out of range: {error}"))?;
+        let directory = profile_log_directory()?;
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
+        let path = directory.join(format!("profile-{written_at_unix_ms}.json"));
+        let log = ProfileLog {
+            schema_version: 1,
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            written_at_unix_ms,
+            scene_path: self.scene_path,
+            gpu_adapter: self.gpu_adapter,
+            warmup_seconds: PROFILE_WARMUP.as_secs(),
+            capture_seconds: PROFILE_DURATION.as_secs(),
+            camera: self.camera,
+            render: self.render,
+            scene: self.scene,
+            summary: ProfileSummary::from_samples(&self.samples),
+            samples: self.samples,
+        };
+        let bytes = serde_json::to_vec_pretty(&log)
+            .map_err(|error| format!("Could not serialize profile capture: {error}"))?;
+        std::fs::write(&path, bytes)
+            .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
+        Ok(format!("Profile saved: {}", path.display()))
+    }
+}
+
+impl ProfileSummary {
+    fn from_samples(samples: &[ProfileSample]) -> Self {
+        Self {
+            cpu_frame_ms: summarize_profile_metric(
+                samples.iter().map(|sample| sample.cpu_frame_ms),
+            ),
+            cpu_acquire_ms: summarize_profile_metric(
+                samples.iter().map(|sample| sample.cpu_acquire_ms),
+            ),
+            gpu_render_ms: summarize_profile_metric(
+                samples.iter().filter_map(|sample| sample.gpu_render_ms),
+            ),
+            gpu_shadow_map_ms: summarize_profile_metric(
+                samples.iter().filter_map(|sample| sample.gpu_shadow_map_ms),
+            ),
+            gpu_opaque_ms: summarize_profile_metric(
+                samples.iter().filter_map(|sample| sample.gpu_opaque_ms),
+            ),
+        }
+    }
+}
+
+fn summarize_profile_metric(values: impl Iterator<Item = f32>) -> ProfileMetricSummary {
+    let mut values: Vec<_> = values.filter(|value| value.is_finite()).collect();
+    values.sort_by(f32::total_cmp);
+    if values.is_empty() {
+        return ProfileMetricSummary {
+            sample_count: 0,
+            median: None,
+            p95: None,
+        };
+    }
+    let middle = values.len() / 2;
+    let median = if values.len().is_multiple_of(2) {
+        (values[middle - 1] + values[middle]) * 0.5
+    } else {
+        values[middle]
+    };
+    let p95_index = ((values.len() as f32 * 0.95).ceil() as usize).saturating_sub(1);
+    ProfileMetricSummary {
+        sample_count: values.len(),
+        median: Some(median),
+        p95: Some(values[p95_index]),
+    }
+}
+
+fn profile_log_directory() -> Result<PathBuf, String> {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .map(|path| path.join("MyEngine").join("profile_logs"))
+        .ok_or_else(|| {
+            "APPDATA is unavailable; could not choose a profile log directory".to_owned()
+        })
+}
+
+fn estimated_screen_coverage_percent(camera: &Camera, renderer: &Renderer, world: &World) -> f32 {
+    let tan_half_fov = (45.0_f32.to_radians() * 0.5).tan();
+    if !camera.aspect.is_finite() || camera.aspect <= 0.0 || tan_half_fov <= 0.0 {
+        return 0.0;
+    }
+    let forward = Vec3::new(
+        camera.yaw.cos() * camera.pitch.cos(),
+        camera.pitch.sin(),
+        camera.yaw.sin() * camera.pitch.cos(),
+    )
+    .normalize_or_zero();
+    let view_projection = camera.build_view_projection_matrix();
+    let mut rectangles = Vec::new();
+    for object in world.objects() {
+        if object.asset_source().is_none() {
+            continue;
+        }
+        let Some(mesh) = renderer.meshes.get(object.mesh_id.0) else {
+            continue;
+        };
+        let model_matrix = world.group_model_matrix(object);
+        let center = model_matrix.transform_point3(mesh.bounds_center);
+        let scale = model_matrix
+            .x_axis
+            .truncate()
+            .length()
+            .max(model_matrix.y_axis.truncate().length())
+            .max(model_matrix.z_axis.truncate().length());
+        let radius = mesh.bounds_radius * scale;
+        let depth = (center - camera.eye).dot(forward);
+        if !radius.is_finite() || !depth.is_finite() || depth + radius < Z_NEAR {
+            continue;
+        }
+        if depth - radius <= Z_NEAR {
+            return 100.0;
+        }
+
+        let clip = view_projection * center.extend(1.0);
+        if !clip.w.is_finite() || clip.w <= 0.0 {
+            continue;
+        }
+        let center_x = (clip.x / clip.w + 1.0) * 0.5;
+        let center_y = (1.0 - clip.y / clip.w) * 0.5;
+        let radius_x = radius / (2.0 * depth * tan_half_fov * camera.aspect);
+        let radius_y = radius / (2.0 * depth * tan_half_fov);
+        let rect = (
+            (center_x - radius_x).clamp(0.0, 1.0),
+            (center_y - radius_y).clamp(0.0, 1.0),
+            (center_x + radius_x).clamp(0.0, 1.0),
+            (center_y + radius_y).clamp(0.0, 1.0),
+        );
+        if rect.2 > rect.0 && rect.3 > rect.1 {
+            rectangles.push(rect);
+        }
+    }
+    (rectangle_union_area(&rectangles) * 100.0).clamp(0.0, 100.0)
+}
+
+fn rectangle_union_area(rectangles: &[(f32, f32, f32, f32)]) -> f32 {
+    let mut x_edges: Vec<_> = rectangles
+        .iter()
+        .flat_map(|rect| [rect.0, rect.2])
+        .collect();
+    x_edges.sort_by(f32::total_cmp);
+    x_edges.dedup_by(|left, right| (*left - *right).abs() <= f32::EPSILON);
+
+    let mut area = 0.0;
+    for edge_pair in x_edges.windows(2) {
+        let (left, right) = (edge_pair[0], edge_pair[1]);
+        if right <= left {
+            continue;
+        }
+        let mut y_intervals: Vec<_> = rectangles
+            .iter()
+            .filter(|rect| rect.0 < right && rect.2 > left)
+            .map(|rect| (rect.1, rect.3))
+            .collect();
+        y_intervals.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut covered_height = 0.0;
+        let mut current = None;
+        for (top, bottom) in y_intervals {
+            match current {
+                Some((start, end)) if top <= end => current = Some((start, end.max(bottom))),
+                Some((start, end)) => {
+                    covered_height += end - start;
+                    current = Some((top, bottom));
+                }
+                None => current = Some((top, bottom)),
+            }
+        }
+        if let Some((start, end)) = current {
+            covered_height += end - start;
+        }
+        area += (right - left) * covered_height;
+    }
+    area.clamp(0.0, 1.0)
 }
 
 impl RenderSnapshot {
@@ -263,6 +688,8 @@ pub struct DebugUi {
     scene_path: String,
     scene_dirty: bool,
     scene_status: Option<Result<String, String>>,
+    profile_capture: Option<ProfileCapture>,
+    profile_status: Option<Result<String, String>>,
     scene_save_dialog: Option<mpsc::Receiver<Option<PathBuf>>>,
     scene_load_dialog: Option<mpsc::Receiver<Option<PathBuf>>>,
     scene_loading: Option<(PathBuf, mpsc::Receiver<Result<LoadedScene, String>>)>,
@@ -419,6 +846,14 @@ fn axis_vector(axis: usize) -> Vec3 {
         0 => Vec3::X,
         1 => Vec3::Y,
         _ => Vec3::Z,
+    }
+}
+
+fn rotation_ring_basis(axis: usize) -> (Vec3, Vec3) {
+    match axis {
+        0 => (Vec3::Y, Vec3::Z),
+        1 => (Vec3::Z, Vec3::X),
+        _ => (Vec3::X, Vec3::Y),
     }
 }
 
@@ -585,11 +1020,7 @@ fn rotation_ring_points(
     view_projection: Mat4,
     screen_rect: egui::Rect,
 ) -> Option<Vec<egui::Pos2>> {
-    let (u, v) = match axis {
-        0 => (Vec3::Y, Vec3::Z),
-        1 => (Vec3::X, Vec3::Z),
-        _ => (Vec3::X, Vec3::Y),
-    };
+    let (u, v) = rotation_ring_basis(axis);
     (0..=96)
         .map(|step| {
             let angle = std::f32::consts::TAU * step as f32 / 96.0;
@@ -882,6 +1313,8 @@ impl DebugUi {
             scene_path: String::new(),
             scene_dirty: false,
             scene_status: None,
+            profile_capture: None,
+            profile_status: None,
             scene_save_dialog: None,
             scene_load_dialog: None,
             scene_loading: None,
@@ -970,6 +1403,20 @@ impl DebugUi {
         self.camera_look_button
     }
 
+    pub fn profile_capture_active(&self) -> bool {
+        self.profile_capture.is_some()
+    }
+
+    fn update_profile_capture(&mut self, timings: RenderTimings, cpu_frame_ms: f32, fps: f32) {
+        let finished = self
+            .profile_capture
+            .as_mut()
+            .is_some_and(|capture| capture.tick(timings, cpu_frame_ms, fps));
+        if finished && let Some(capture) = self.profile_capture.take() {
+            self.profile_status = Some(capture.write_log());
+        }
+    }
+
     pub fn take_asset_request(&mut self) -> Option<(PathBuf, Result<ParsedAsset, String>)> {
         self.asset_request.take()
     }
@@ -1037,6 +1484,7 @@ impl DebugUi {
         renderer: &mut Renderer,
         world: &mut World,
     ) {
+        self.update_profile_capture(timings, cpu_frame_time, fps);
         if let Some(result) = renderer.poll_environment_load() {
             match result {
                 Ok(Some(_)) => {
@@ -2079,9 +2527,22 @@ impl DebugUi {
                                             .map_or("unavailable".to_owned(), |time| {
                                                 format!("{time:.2} ms")
                                             });
+                                        let shadow_text = timings
+                                            .gpu_shadow_map_ms
+                                            .map_or("unavailable".to_owned(), |time| {
+                                                format!("{time:.2} ms")
+                                            });
+                                        let opaque_text = timings
+                                            .gpu_opaque_pass_ms
+                                            .map_or("unavailable".to_owned(), |time| {
+                                                format!("{time:.2} ms")
+                                            });
                                         ui.small(format!(
-                                            "GPU: {gpu_text} | Draw calls: {}",
+                                            "GPU render: {gpu_text} | Draw calls: {}",
                                             timings.draw_calls
+                                        ));
+                                        ui.small(format!(
+                                            "GPU passes: shadow map {shadow_text} | opaque {opaque_text}"
                                         ));
                                         ui.small(format!(
                                             "Triangles: {} | Meshes: {} | Materials: {}",
@@ -2094,6 +2555,39 @@ impl DebugUi {
                                             timings.render_batches,
                                             timings.active_instances
                                         ));
+                                        if let Some(progress) = self
+                                            .profile_capture
+                                            .as_ref()
+                                            .map(ProfileCapture::progress_text)
+                                        {
+                                            ui.small(progress);
+                                            if ui.button("Cancel profile capture").clicked() {
+                                                self.profile_capture = None;
+                                                self.profile_status =
+                                                    Some(Ok("Profile capture cancelled".to_owned()));
+                                            }
+                                        } else if ui.button("Capture current view (10 s)").clicked()
+                                        {
+                                            self.profile_capture = Some(ProfileCapture::new(
+                                                camera,
+                                                renderer,
+                                                world,
+                                                self.scene_path.clone(),
+                                                timings,
+                                            ));
+                                            self.profile_status =
+                                                Some(Ok("Profile capture started".to_owned()));
+                                        }
+                                        if let Some(status) = &self.profile_status {
+                                            match status {
+                                                Ok(message) => {
+                                                    ui.small(message);
+                                                }
+                                                Err(error) => {
+                                                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                                                }
+                                            }
+                                        }
                                     });
                                 ui.collapsing("Render settings", |ui| {
                                     ui.add(
@@ -2139,6 +2633,35 @@ impl DebugUi {
                                         &mut settings.shadows_enabled,
                                         "Directional shadows",
                                     );
+                                    egui::ComboBox::from_label("Shadow filtering")
+                                        .selected_text(match settings.shadow_pcf_samples {
+                                            2 => "2 taps (fastest)",
+                                            4 => "4 taps (faster)",
+                                            8 => "8 taps (balanced)",
+                                            _ => "16 taps (smoothest)",
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut settings.shadow_pcf_samples,
+                                                2,
+                                                "2 taps (fastest)",
+                                            );
+                                            ui.selectable_value(
+                                                &mut settings.shadow_pcf_samples,
+                                                4,
+                                                "4 taps (faster)",
+                                            );
+                                            ui.selectable_value(
+                                                &mut settings.shadow_pcf_samples,
+                                                8,
+                                                "8 taps (balanced)",
+                                            );
+                                            ui.selectable_value(
+                                                &mut settings.shadow_pcf_samples,
+                                                16,
+                                                "16 taps (smoothest)",
+                                            );
+                                        });
                                     ui.checkbox(
                                         &mut settings.unlocked_fps,
                                         "Unlock FPS (disable VSync)",
@@ -2182,6 +2705,8 @@ impl DebugUi {
                                             defaults.environment_intensity;
                                         settings.exposure_ev = defaults.exposure_ev;
                                         settings.shadows_enabled = defaults.shadows_enabled;
+                                        settings.shadow_pcf_samples =
+                                            defaults.shadow_pcf_samples;
                                         settings.debug_view = defaults.debug_view;
                                         settings.render_scale = defaults.render_scale;
                                         if renderer
@@ -2893,6 +3418,14 @@ mod tests {
     }
 
     #[test]
+    fn rotation_ring_orientation_matches_its_axis() {
+        for axis in 0..3 {
+            let (u, v) = rotation_ring_basis(axis);
+            assert!(u.cross(v).dot(axis_vector(axis)) > 0.999);
+        }
+    }
+
+    #[test]
     fn viewport_picking_prefers_the_object_under_the_pointer_to_the_floor() {
         let camera = Camera {
             eye: Vec3::new(0.0, 2.0, 6.0),
@@ -3143,5 +3676,21 @@ mod tests {
         assert_eq!(playback.speed, 1.5);
         assert!(!playback.looping);
         assert!(playback.playing);
+    }
+
+    #[test]
+    fn profile_summary_uses_median_and_p95_and_ignores_non_finite_samples() {
+        let summary = summarize_profile_metric([1.0, 2.0, 3.0, 100.0, f32::NAN].into_iter());
+
+        assert_eq!(summary.sample_count, 4);
+        assert_eq!(summary.median, Some(2.5));
+        assert_eq!(summary.p95, Some(100.0));
+    }
+
+    #[test]
+    fn screen_coverage_unions_overlapping_mesh_bounds() {
+        let area = rectangle_union_area(&[(0.0, 0.0, 0.5, 1.0), (0.25, 0.0, 0.75, 1.0)]);
+
+        assert!((area - 0.75).abs() < f32::EPSILON);
     }
 }

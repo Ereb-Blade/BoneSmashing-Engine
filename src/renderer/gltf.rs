@@ -78,6 +78,18 @@ pub struct GltfMaterialData {
     pub ior: f32,
     pub specular_factor: f32,
     pub specular_color_factor: [f32; 3],
+    pub clearcoat_factor: f32,
+    pub clearcoat_roughness_factor: f32,
+    pub clearcoat_image: Option<usize>,
+    pub clearcoat_tex_coord: u32,
+    pub clearcoat_transform: [[f32; 4]; 2],
+    pub clearcoat_roughness_image: Option<usize>,
+    pub clearcoat_roughness_tex_coord: u32,
+    pub clearcoat_roughness_transform: [[f32; 4]; 2],
+    pub clearcoat_normal_image: Option<usize>,
+    pub clearcoat_normal_tex_coord: u32,
+    pub clearcoat_normal_scale: f32,
+    pub clearcoat_normal_transform: [[f32; 4]; 2],
     pub emissive_factor: [f32; 3],
     pub emissive_strength: f32,
     pub occlusion_strength: f32,
@@ -207,6 +219,60 @@ fn texture_info_transform(
     Ok((transform, tex_coord))
 }
 
+fn parse_clearcoat_factor(
+    extension: Option<&gltf::json::Value>,
+    field: &str,
+    default: f32,
+) -> Result<f32, String> {
+    let Some(value) = extension.and_then(|extension| extension.get(field)) else {
+        return Ok(default);
+    };
+    value
+        .as_f64()
+        .map(|value| value as f32)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| format!("KHR_materials_clearcoat {field} must be finite"))
+}
+
+type ClearcoatTextureInfo = (Option<usize>, u32, [[f32; 4]; 2]);
+
+fn clearcoat_texture_info(
+    document: &gltf::Document,
+    extension: Option<&gltf::json::Value>,
+    field: &str,
+) -> Result<ClearcoatTextureInfo, String> {
+    let Some(info) = extension.and_then(|extension| extension.get(field)) else {
+        return Ok((None, 0, IDENTITY_UV_TRANSFORM));
+    };
+    let texture_index = info
+        .get("index")
+        .and_then(gltf::json::Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or_else(|| format!("KHR_materials_clearcoat {field} has an invalid texture index"))?;
+    let texture = document
+        .textures()
+        .find(|texture| texture.index() == texture_index)
+        .ok_or_else(|| format!("KHR_materials_clearcoat {field} references a missing texture"))?;
+    let tex_coord = info
+        .get("texCoord")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| {
+                    format!("KHR_materials_clearcoat {field} texCoord must be an unsigned integer")
+                })
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let (transform, transform_tex_coord) = texture_transform(info.get("extensions"))?;
+    Ok((
+        Some(texture.source().index()),
+        transform_tex_coord.unwrap_or(tex_coord),
+        transform,
+    ))
+}
+
 fn adjust_named_material_roughness(name: Option<&str>, roughness: f32) -> f32 {
     if name == Some("detail_glass_clear") {
         roughness.max(0.35)
@@ -225,6 +291,7 @@ fn is_supported_material_extension(name: &str) -> bool {
             | "KHR_materials_volume"
             | "KHR_materials_specular"
             | "KHR_materials_emissive_strength"
+            | "KHR_materials_clearcoat"
     )
 }
 
@@ -780,8 +847,20 @@ impl GltfModelData {
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
-        let (document, buffers, images) =
-            gltf::import(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let source = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let gltf = gltf::Gltf::from_slice_without_validation(&source)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let mut document_json = gltf.document.into_json();
+        document_json
+            .extensions_required
+            .retain(|extension| extension != "KHR_materials_clearcoat");
+        let document = gltf::Document::from_json(document_json)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let base_path = path.parent();
+        let buffers = gltf::import_buffers(&document, base_path, gltf.blob)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let images = gltf::import_images(&document, base_path, &buffers)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
 
         let mut converted_images = Vec::with_capacity(images.len());
         for image in images {
@@ -818,6 +897,7 @@ impl GltfModelData {
                 let occlusion_texture = material.occlusion_texture();
                 let emissive_texture = material.emissive_texture();
                 let transmission = material.transmission();
+                let clearcoat = material.extension_value("KHR_materials_clearcoat");
                 let ior = material.ior().unwrap_or(1.5);
                 let specular = material.specular();
                 let transmission_texture = transmission
@@ -827,6 +907,18 @@ impl GltfModelData {
                 let thickness_texture = volume
                     .as_ref()
                     .and_then(|extension| extension.thickness_texture());
+                let (clearcoat_image, clearcoat_tex_coord, clearcoat_transform) =
+                    clearcoat_texture_info(&document, clearcoat, "clearcoatTexture")?;
+                let (
+                    clearcoat_roughness_image,
+                    clearcoat_roughness_tex_coord,
+                    clearcoat_roughness_transform,
+                ) = clearcoat_texture_info(&document, clearcoat, "clearcoatRoughnessTexture")?;
+                let (
+                    clearcoat_normal_image,
+                    clearcoat_normal_tex_coord,
+                    clearcoat_normal_transform,
+                ) = clearcoat_texture_info(&document, clearcoat, "clearcoatNormalTexture")?;
                 let specular_texture =
                     specular.as_ref().and_then(|extension| extension.specular_texture());
                 let specular_color_texture = specular
@@ -899,6 +991,9 @@ impl GltfModelData {
                     thickness_transform_uv.unwrap_or_else(|| {
                         thickness_texture.as_ref().map_or(0, |info| info.tex_coord())
                     }),
+                    clearcoat_tex_coord,
+                    clearcoat_roughness_tex_coord,
+                    clearcoat_normal_tex_coord,
                 ];
                 if texture_coords.iter().any(|&tex_coord| tex_coord > 3) {
                     return Err(format!(
@@ -956,6 +1051,24 @@ impl GltfModelData {
                 let attenuation_color = volume
                     .as_ref()
                     .map_or([1.0; 3], |extension| extension.attenuation_color());
+                let clearcoat_factor = parse_clearcoat_factor(clearcoat, "clearcoatFactor", 0.0)?;
+                let clearcoat_roughness_factor =
+                    parse_clearcoat_factor(clearcoat, "clearcoatRoughnessFactor", 0.0)?;
+                let clearcoat_normal_scale = clearcoat
+                    .and_then(|extension| extension.get("clearcoatNormalTexture"))
+                    .and_then(|info| info.get("scale"))
+                    .map(|value| {
+                        value
+                            .as_f64()
+                            .map(|value| value as f32)
+                            .filter(|value| value.is_finite())
+                            .ok_or_else(|| {
+                                "KHR_materials_clearcoat clearcoatNormalTexture scale must be finite"
+                                    .to_owned()
+                            })
+                    })
+                    .transpose()?
+                    .unwrap_or(1.0);
                 let alpha_mode = match material.alpha_mode() {
                     gltf::material::AlphaMode::Opaque => 0,
                     gltf::material::AlphaMode::Mask => 1,
@@ -975,6 +1088,9 @@ impl GltfModelData {
                     || !transmission_factor.is_finite()
                     || !ior.is_finite()
                     || !specular_factor.is_finite()
+                    || !clearcoat_factor.is_finite()
+                    || !clearcoat_roughness_factor.is_finite()
+                    || !clearcoat_normal_scale.is_finite()
                     || !emissive_strength.is_finite()
                     || !occlusion_strength.is_finite()
                     || !thickness_factor.is_finite()
@@ -999,6 +1115,8 @@ impl GltfModelData {
                     || !(0.0..=1.0).contains(&transmission_factor)
                     || ior < 1.0
                     || !(0.0..=1.0).contains(&specular_factor)
+                    || !(0.0..=1.0).contains(&clearcoat_factor)
+                    || !(0.0..=1.0).contains(&clearcoat_roughness_factor)
                     || !(0.0..=1.0).contains(&occlusion_strength)
                     || emissive_strength < 0.0
                     || thickness_factor < 0.0
@@ -1031,6 +1149,18 @@ impl GltfModelData {
                     ior,
                     specular_factor,
                     specular_color_factor,
+                    clearcoat_factor,
+                    clearcoat_roughness_factor,
+                    clearcoat_image,
+                    clearcoat_tex_coord,
+                    clearcoat_transform,
+                    clearcoat_roughness_image,
+                    clearcoat_roughness_tex_coord,
+                    clearcoat_roughness_transform,
+                    clearcoat_normal_image,
+                    clearcoat_normal_tex_coord,
+                    clearcoat_normal_scale,
+                    clearcoat_normal_transform,
                     emissive_factor,
                     emissive_strength,
                     occlusion_strength,
@@ -1106,6 +1236,18 @@ impl GltfModelData {
             ior: 1.5,
             specular_factor: 1.0,
             specular_color_factor: [1.0; 3],
+            clearcoat_factor: 0.0,
+            clearcoat_roughness_factor: 0.0,
+            clearcoat_image: None,
+            clearcoat_tex_coord: 0,
+            clearcoat_transform: IDENTITY_UV_TRANSFORM,
+            clearcoat_roughness_image: None,
+            clearcoat_roughness_tex_coord: 0,
+            clearcoat_roughness_transform: IDENTITY_UV_TRANSFORM,
+            clearcoat_normal_image: None,
+            clearcoat_normal_tex_coord: 0,
+            clearcoat_normal_scale: 1.0,
+            clearcoat_normal_transform: IDENTITY_UV_TRANSFORM,
             emissive_factor: [0.0; 3],
             emissive_strength: 1.0,
             occlusion_strength: 1.0,
@@ -1145,6 +1287,15 @@ impl GltfModelData {
             material
                 .base_color_image
                 .is_some_and(|image| image >= images.len())
+                || material
+                    .clearcoat_image
+                    .is_some_and(|image| image >= images.len())
+                || material
+                    .clearcoat_roughness_image
+                    .is_some_and(|image| image >= images.len())
+                || material
+                    .clearcoat_normal_image
+                    .is_some_and(|image| image >= images.len())
                 || material
                     .metallic_roughness_image
                     .is_some_and(|image| image >= images.len())
@@ -1809,10 +1960,13 @@ fn mipmap_request_counts(
             (material.base_color_image, 0_u8),
             (material.metallic_roughness_image, 1),
             (material.normal_image, 2),
+            (material.clearcoat_normal_image, 2),
             (material.occlusion_image, 3),
             (material.specular_image, 3),
             (material.transmission_image, 3),
             (material.thickness_image, 3),
+            (material.clearcoat_image, 3),
+            (material.clearcoat_roughness_image, 3),
             (material.emissive_image, 4),
             (material.specular_color_image, 4),
         ] {
@@ -1945,7 +2099,10 @@ fn prepare_image_mip_levels(
                     ));
             }
         }
-        if let Some(index) = material.normal_image {
+        for index in [material.normal_image, material.clearcoat_normal_image]
+            .into_iter()
+            .flatten()
+        {
             let image = images
                 .get_mut(index)
                 .ok_or_else(|| format!("normal map references missing image {index}"))?;
@@ -1966,6 +2123,8 @@ fn prepare_image_mip_levels(
             material.specular_image,
             material.transmission_image,
             material.thickness_image,
+            material.clearcoat_image,
+            material.clearcoat_roughness_image,
         ]
         .into_iter()
         .flatten()
@@ -2756,7 +2915,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_clearcoat_as_partial_fallback() {
+    fn imports_clearcoat_factors_and_textures() {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let sample_path = manifest_dir
             .join("assets")
@@ -2771,8 +2930,12 @@ mod tests {
                 "\"extensionsUsed\": [\"KHR_materials_unlit\", \"KHR_materials_clearcoat\"]",
             )
             .replace(
+                "\"extensionsUsed\": [\"KHR_materials_unlit\", \"KHR_materials_clearcoat\"]",
+                "\"extensionsUsed\": [\"KHR_materials_unlit\", \"KHR_materials_clearcoat\"],\n  \"extensionsRequired\": [\"KHR_materials_clearcoat\"]",
+            )
+            .replace(
                 "\"name\": \"cool\",\n      \"alphaMode\": \"BLEND\",",
-                "\"name\": \"cool\",\n      \"alphaMode\": \"BLEND\",\n      \"extensions\": {\n        \"KHR_materials_clearcoat\": {\"clearcoatFactor\": 0.7, \"clearcoatRoughnessFactor\": 0.3}\n      },",
+                "\"name\": \"cool\",\n      \"alphaMode\": \"BLEND\",\n      \"extensions\": {\n        \"KHR_materials_clearcoat\": {\n          \"clearcoatFactor\": 0.7,\n          \"clearcoatRoughnessFactor\": 0.3,\n          \"clearcoatTexture\": {\"index\": 0, \"texCoord\": 2, \"extensions\": {\"KHR_texture_transform\": {\"offset\": [0.25, 0.5], \"scale\": [2.0, 3.0], \"rotation\": 0.0, \"texCoord\": 1}}},\n          \"clearcoatRoughnessTexture\": {\"index\": 0},\n          \"clearcoatNormalTexture\": {\"index\": 0, \"scale\": 0.5}\n        }\n      },",
             );
         assert_ne!(with_clearcoat, sample);
 
@@ -2796,7 +2959,19 @@ mod tests {
 
         let loaded = GltfModelData::load(&fixture_path);
         std::fs::remove_dir_all(&fixture_dir).unwrap();
-        assert!(loaded.is_ok());
+        let model = loaded.unwrap();
+        let material = &model.materials[1];
+        assert_eq!(material.clearcoat_factor, 0.7);
+        assert_eq!(material.clearcoat_roughness_factor, 0.3);
+        assert_eq!(material.clearcoat_image, Some(0));
+        assert_eq!(material.clearcoat_tex_coord, 1);
+        assert_eq!(
+            material.clearcoat_transform,
+            [[2.0, 0.0, 0.25, 0.0], [0.0, 3.0, 0.5, 0.0]]
+        );
+        assert_eq!(material.clearcoat_roughness_image, Some(0));
+        assert_eq!(material.clearcoat_normal_image, Some(0));
+        assert_eq!(material.clearcoat_normal_scale, 0.5);
     }
 
     #[test]
@@ -3176,6 +3351,18 @@ mod tests {
             ior: 1.5,
             specular_factor: 1.0,
             specular_color_factor: [1.0; 3],
+            clearcoat_factor: 0.7,
+            clearcoat_roughness_factor: 0.3,
+            clearcoat_image: Some(1),
+            clearcoat_tex_coord: 0,
+            clearcoat_transform: IDENTITY_UV_TRANSFORM,
+            clearcoat_roughness_image: Some(1),
+            clearcoat_roughness_tex_coord: 0,
+            clearcoat_roughness_transform: IDENTITY_UV_TRANSFORM,
+            clearcoat_normal_image: Some(1),
+            clearcoat_normal_tex_coord: 0,
+            clearcoat_normal_scale: 0.5,
+            clearcoat_normal_transform: IDENTITY_UV_TRANSFORM,
             emissive_factor: [0.0; 3],
             emissive_strength: 1.0,
             occlusion_strength: 1.0,
@@ -3221,6 +3408,7 @@ mod tests {
         assert!(images[0].emissive_mip_levels.is_none());
         assert_eq!(images[1].data_mip_levels.as_ref().unwrap().len(), 2);
         assert_eq!(images[1].emissive_mip_levels.as_ref().unwrap().len(), 2);
+        assert_eq!(images[1].normal_mip_levels.as_ref().unwrap().len(), 2);
         assert!(images[1].base_color_mip_levels.is_none());
     }
 

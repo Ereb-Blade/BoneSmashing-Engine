@@ -909,9 +909,15 @@ impl ApplicationHandler for App {
                     self.fps_elapsed = 0.0;
                 }
 
+                let profile_capture_active = self
+                    .debug_ui
+                    .as_ref()
+                    .is_some_and(DebugUi::profile_capture_active);
                 let camera_before = (self.camera.eye, self.camera.yaw, self.camera.pitch);
-                self.camera_controller
-                    .update_camera(&mut self.camera, &self.input, dt);
+                if !profile_capture_active {
+                    self.camera_controller
+                        .update_camera(&mut self.camera, &self.input, dt);
+                }
                 if camera_before != (self.camera.eye, self.camera.yaw, self.camera.pitch)
                     && let Some(debug_ui) = self.debug_ui.as_mut()
                 {
@@ -919,15 +925,17 @@ impl ApplicationHandler for App {
                 }
                 self.input.reset_mouse_delta();
 
-                self.world.update(dt);
-                App::update_animations(
-                    &mut self.world,
-                    &mut self.animation_models,
-                    &mut self.sampled_animations,
-                    &mut self.animated_instances,
-                    &mut self.animated_node_transforms,
-                    dt,
-                );
+                if !profile_capture_active {
+                    self.world.update(dt);
+                    App::update_animations(
+                        &mut self.world,
+                        &mut self.animation_models,
+                        &mut self.sampled_animations,
+                        &mut self.animated_instances,
+                        &mut self.animated_node_transforms,
+                        dt,
+                    );
+                }
 
                 if let Some(debug_ui) = self.debug_ui.as_mut() {
                     if let Some(path) = debug_ui.take_scene_save_request() {

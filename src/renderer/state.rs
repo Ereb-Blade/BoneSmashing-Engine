@@ -21,7 +21,7 @@ use crate::renderer::material::{Material, MaterialParams, generate_mip_levels_wi
 use crate::renderer::mesh::{Mesh, MeshData, ObjModelData};
 use crate::renderer::pipeline::{HDR_FORMAT, RenderPipelineBundle};
 use crate::renderer::{debug_ui::DebugUi, environment::Environment};
-use crate::scene::{LocalLight, LocalLightKind, MAX_LOCAL_LIGHTS, RenderObject, World};
+use crate::scene::{LocalLightKind, MAX_LOCAL_LIGHTS, RenderObject, World};
 
 #[derive(Debug)]
 pub enum ParsedAsset {
@@ -3077,6 +3077,7 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scene::LocalLight;
 
     #[test]
     fn gpu_timestamps_require_encoder_timestamp_support() {

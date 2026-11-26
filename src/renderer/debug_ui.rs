@@ -813,6 +813,18 @@ impl UndoHistory {
         self.record_snapshot(world.clone(), selection, render_state.clone());
     }
 
+    fn record_gizmo_start(
+        &mut self,
+        world: &World,
+        selection: Option<SceneSelection>,
+        render_state: &RenderSnapshot,
+    ) {
+        self.record(world, selection, render_state);
+        if let Some(SceneSelection::Light(index)) = selection {
+            self.active_local_light = Some(index);
+        }
+    }
+
     fn record_snapshot(
         &mut self,
         world: World,
@@ -1139,10 +1151,13 @@ fn project_to_screen(
     screen_rect: egui::Rect,
 ) -> Option<egui::Pos2> {
     let clip = view_projection * position.extend(1.0);
-    if clip.w <= 0.0 {
+    if !clip.is_finite() || clip.w <= 0.0 || clip.z < 0.0 || clip.z > clip.w {
         return None;
     }
     let ndc = clip.truncate().truncate() / clip.w;
+    if !ndc.is_finite() {
+        return None;
+    }
     Some(egui::pos2(
         screen_rect.left() + (ndc.x + 1.0) * 0.5 * screen_rect.width(),
         screen_rect.top() + (1.0 - ndc.y) * 0.5 * screen_rect.height(),
@@ -1303,6 +1318,177 @@ fn selected_world_position(world: &World, selected: Option<SceneSelection>) -> O
     }
 }
 
+const LOCAL_LIGHT_ICON_PICK_RADIUS: f32 = 12.0;
+
+fn pick_local_light_icon(
+    pointer: egui::Pos2,
+    viewport_rect: egui::Rect,
+    screen_rect: egui::Rect,
+    camera: &Camera,
+    world: &World,
+) -> Option<usize> {
+    let view_projection = camera.build_view_projection_matrix();
+    world
+        .local_lights()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, _)| {
+            let position = world.local_light_world_position(index)?;
+            let center = project_to_screen(position, view_projection, screen_rect)?;
+            if !viewport_rect.contains(center) {
+                return None;
+            }
+            let distance_squared = pointer.distance_sq(center);
+            (distance_squared <= LOCAL_LIGHT_ICON_PICK_RADIUS.powi(2)).then_some((
+                index,
+                distance_squared,
+                camera.eye.distance_squared(position),
+            ))
+        })
+        .min_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.2.total_cmp(&right.2))
+        })
+        .map(|(index, _, _)| index)
+}
+
+fn paint_local_light_icons(
+    ui: &egui::Ui,
+    viewport_rect: egui::Rect,
+    screen_rect: egui::Rect,
+    camera: &Camera,
+    world: &World,
+    selected: Option<SceneSelection>,
+    pointer: Option<egui::Pos2>,
+) {
+    let view_projection = camera.build_view_projection_matrix();
+    let painter = ui.painter().with_clip_rect(viewport_rect);
+    for (index, light) in world.local_lights().iter().enumerate() {
+        let Some(position) = world.local_light_world_position(index) else {
+            continue;
+        };
+        let Some(center) = project_to_screen(position, view_projection, screen_rect) else {
+            continue;
+        };
+        if !viewport_rect.contains(center) {
+            continue;
+        }
+
+        let selected_light = selected == Some(SceneSelection::Light(index));
+        let hovered = pointer.is_some_and(|pointer| {
+            viewport_rect.contains(pointer)
+                && pointer.distance_sq(center) <= (LOCAL_LIGHT_ICON_PICK_RADIUS + 2.0).powi(2)
+        });
+        let icon_rgb = if light.enabled {
+            [
+                (light.color[0] * 255.0).round() as u8,
+                (light.color[1] * 255.0).round() as u8,
+                (light.color[2] * 255.0).round() as u8,
+            ]
+        } else {
+            [130, 130, 130]
+        };
+        let color = egui::Color32::from_rgba_unmultiplied(
+            icon_rgb[0],
+            icon_rgb[1],
+            icon_rgb[2],
+            if light.enabled { 190 } else { 125 },
+        );
+
+        if light.kind == LocalLightKind::Spot
+            && let Some(direction) = world.local_light_world_direction(index)
+        {
+            let world_length = camera.eye.distance(position).max(0.1) * 0.828_427 * 42.0
+                / screen_rect.height().max(1.0);
+            if let Some(direction_end) = project_to_screen(
+                position + direction * world_length,
+                view_projection,
+                screen_rect,
+            ) {
+                let projected_direction = direction_end - center;
+                if projected_direction.length_sq() > 1.0 {
+                    let axis = projected_direction.normalized();
+                    let side = egui::vec2(-axis.y, axis.x);
+                    let base_center = center + axis * 6.0;
+                    let tip = center + axis * 30.0;
+                    let base_width = side * 4.0;
+                    let tip_width = side * 9.0;
+                    let fill = egui::Color32::from_rgba_unmultiplied(
+                        icon_rgb[0],
+                        icon_rgb[1],
+                        icon_rgb[2],
+                        if light.enabled { 36 } else { 22 },
+                    );
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![
+                            base_center - base_width,
+                            tip - tip_width,
+                            tip + tip_width,
+                            base_center + base_width,
+                        ],
+                        fill,
+                        egui::Stroke::new(
+                            1.0_f32,
+                            egui::Color32::from_rgba_unmultiplied(
+                                icon_rgb[0],
+                                icon_rgb[1],
+                                icon_rgb[2],
+                                if light.enabled { 150 } else { 80 },
+                            ),
+                        ),
+                    ));
+                }
+            }
+        }
+
+        if light.kind == LocalLightKind::Point {
+            for ray in 0..8 {
+                let angle = ray as f32 * std::f32::consts::TAU / 8.0;
+                let direction = egui::Vec2::angled(angle);
+                painter.line_segment(
+                    [center + direction * 8.0, center + direction * 11.0],
+                    egui::Stroke::new(1.5_f32, color),
+                );
+            }
+        }
+        painter.circle_filled(center, 5.5, color);
+        painter.circle_stroke(
+            center,
+            6.5,
+            egui::Stroke::new(
+                if selected_light { 2.0_f32 } else { 1.0_f32 },
+                if selected_light {
+                    egui::Color32::YELLOW
+                } else {
+                    egui::Color32::from_white_alpha(220)
+                },
+            ),
+        );
+        if hovered && !selected_light {
+            painter.circle_stroke(
+                center,
+                10.0,
+                egui::Stroke::new(1.5_f32, egui::Color32::from_white_alpha(180)),
+            );
+        }
+        if selected_light || hovered {
+            let label_color = if light.enabled {
+                egui::Color32::WHITE
+            } else {
+                egui::Color32::LIGHT_GRAY
+            };
+            painter.text(
+                center + egui::vec2(13.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                &light.name,
+                egui::FontId::proportional(12.0),
+                label_color,
+            );
+        }
+    }
+}
+
 fn selected_parent_world_matrix(world: &World, selected: Option<SceneSelection>) -> Mat4 {
     let parent = match selected {
         Some(SceneSelection::Model(id)) => world.model_group_parent(id),
@@ -1460,86 +1646,98 @@ fn paint_scene_gizmo(
 
     if primary_pressed && pointer_is_in_viewport {
         if let Some(pointer_position) = pointer {
-            let selected_center = selected_world_position(world, *selected)
-                .and_then(|position| project_to_screen(position, view_projection, screen_rect));
-            let mut hit_axis = None;
-            if let Some(center) = selected_center {
-                if mode == GizmoMode::Rotate {
-                    if let Some(position) = selected_world_position(world, *selected) {
-                        let ring_radius = camera.eye.distance(position).max(0.1) * 0.828_427 * 72.0
-                            / screen_rect.height().max(1.0);
+            if let Some(index) =
+                pick_local_light_icon(pointer_position, viewport_rect, screen_rect, camera, world)
+            {
+                *selected = Some(SceneSelection::Light(index));
+                *drag_state = None;
+            } else {
+                let selected_center = selected_world_position(world, *selected)
+                    .and_then(|position| project_to_screen(position, view_projection, screen_rect));
+                let mut hit_axis = None;
+                if let Some(center) = selected_center {
+                    if mode == GizmoMode::Rotate {
+                        if let Some(position) = selected_world_position(world, *selected) {
+                            let ring_radius =
+                                camera.eye.distance(position).max(0.1) * 0.828_427 * 72.0
+                                    / screen_rect.height().max(1.0);
+                            for axis in 0..3 {
+                                let Some(points) = rotation_ring_points(
+                                    position,
+                                    axis,
+                                    ring_radius,
+                                    view_projection,
+                                    screen_rect,
+                                ) else {
+                                    continue;
+                                };
+                                for segment in points.windows(2) {
+                                    let tangent = segment[1] - segment[0];
+                                    let distance = distance_to_segment(
+                                        pointer_position,
+                                        segment[0],
+                                        segment[1],
+                                    );
+                                    if distance <= 8.0 {
+                                        hit_axis = Some((
+                                            axis,
+                                            tangent.normalized(),
+                                            1.0 / pointer_position.distance(center).max(10.0),
+                                        ));
+                                        break;
+                                    }
+                                }
+                                if hit_axis.is_some() {
+                                    break;
+                                }
+                            }
+                        }
+                    } else if let Some(position) = selected_world_position(world, *selected) {
+                        let world_length =
+                            camera.eye.distance(position).max(0.1) * 0.828_427 * 72.0
+                                / screen_rect.height().max(1.0);
                         for axis in 0..3 {
-                            let Some(points) = rotation_ring_points(
-                                position,
-                                axis,
-                                ring_radius,
+                            let direction = axis_vector(axis);
+                            let Some(end) = project_to_screen(
+                                position + direction * world_length,
                                 view_projection,
                                 screen_rect,
                             ) else {
                                 continue;
                             };
-                            for segment in points.windows(2) {
-                                let tangent = segment[1] - segment[0];
-                                let distance =
-                                    distance_to_segment(pointer_position, segment[0], segment[1]);
-                                if distance <= 8.0 {
-                                    hit_axis = Some((
-                                        axis,
-                                        tangent.normalized(),
-                                        1.0 / pointer_position.distance(center).max(10.0),
-                                    ));
-                                    break;
-                                }
+                            let projected_axis = end - center;
+                            let projected_length = projected_axis.length();
+                            if projected_length < 1.0 {
+                                continue;
                             }
-                            if hit_axis.is_some() {
+                            if pointer_position.distance(center) >= 14.0
+                                && distance_to_segment(pointer_position, center, end) <= 10.0
+                            {
+                                hit_axis = Some((
+                                    axis,
+                                    projected_axis / projected_length,
+                                    world_length / projected_length,
+                                ));
                                 break;
                             }
                         }
                     }
-                } else if let Some(position) = selected_world_position(world, *selected) {
-                    let world_length = camera.eye.distance(position).max(0.1) * 0.828_427 * 72.0
-                        / screen_rect.height().max(1.0);
-                    for axis in 0..3 {
-                        let direction = axis_vector(axis);
-                        let Some(end) = project_to_screen(
-                            position + direction * world_length,
-                            view_projection,
-                            screen_rect,
-                        ) else {
-                            continue;
-                        };
-                        let projected_axis = end - center;
-                        let projected_length = projected_axis.length();
-                        if projected_length < 1.0 {
-                            continue;
-                        }
-                        if pointer_position.distance(center) >= 14.0
-                            && distance_to_segment(pointer_position, center, end) <= 10.0
-                        {
-                            hit_axis = Some((
-                                axis,
-                                projected_axis / projected_length,
-                                world_length / projected_length,
-                            ));
-                            break;
-                        }
-                    }
                 }
-            }
 
-            if let Some((axis, screen_direction, world_per_pixel)) = hit_axis {
-                *drag_state = Some(GizmoDrag {
-                    mode,
-                    axis,
-                    screen_direction,
-                    world_per_pixel,
-                    last_pointer: pointer_position,
-                });
-            } else if let Some(selection) =
-                pick_scene_object(pointer_position, screen_rect, camera, world)
-            {
-                *selected = Some(selection);
-                *drag_state = None;
+                if let Some((axis, screen_direction, world_per_pixel)) = hit_axis {
+                    *drag_state = Some(GizmoDrag {
+                        mode,
+                        axis,
+                        screen_direction,
+                        world_per_pixel,
+                        last_pointer: pointer_position,
+                    });
+                } else if let Some(selection) =
+                    pick_scene_object(pointer_position, screen_rect, camera, world)
+                {
+                    *selected = Some(selection);
+                    *drag_state = None;
+                }
             }
         }
     }
@@ -1589,6 +1787,16 @@ fn paint_scene_gizmo(
     if primary_released || !primary_down {
         *drag_state = None;
     }
+
+    paint_local_light_icons(
+        ui,
+        viewport_rect,
+        screen_rect,
+        camera,
+        world,
+        *selected,
+        pointer,
+    );
 
     let Some(position) = selected_world_position(world, *selected) else {
         return changed;
@@ -3354,7 +3562,7 @@ impl DebugUi {
                     );
                     scene_modified |= gizmo_changed;
                     if !had_gizmo_drag && self.gizmo_drag.is_some() {
-                        self.history.record(
+                        self.history.record_gizmo_start(
                             world,
                             selected_scene_item,
                             &RenderSnapshot::capture(renderer),
@@ -3981,6 +4189,31 @@ mod tests {
     }
 
     #[test]
+    fn local_light_gizmo_drag_adds_only_one_undo_step() {
+        let mut world = World::new();
+        world
+            .add_local_light(LocalLight::point("Key", [0.0, 1.0, 0.0]))
+            .unwrap();
+        let mut history = UndoHistory::default();
+        let render_state = test_render_state();
+        let selection = Some(SceneSelection::Light(0));
+        history.record_gizmo_start(&world, selection, &render_state);
+
+        world.local_light_mut(0).unwrap().position[0] = 1.0;
+        history.record_local_light(&world, selection, 0, true, &render_state);
+        world.local_light_mut(0).unwrap().position[0] = 2.0;
+        history.record_local_light(&world, selection, 0, true, &render_state);
+
+        let mut selected = selection;
+        let mut render_state = test_render_state();
+        assert!(history.undo(&mut world, &mut selected, &mut render_state));
+        assert_eq!(world.local_lights()[0].position, [0.0, 1.0, 0.0]);
+        assert!(!history.can_undo());
+        assert!(history.redo(&mut world, &mut selected, &mut render_state));
+        assert_eq!(world.local_lights()[0].position, [2.0, 1.0, 0.0]);
+    }
+
+    #[test]
     fn world_space_gizmo_move_respects_mirrored_parent_transforms() {
         let mut world = World::new();
         let parent = world.add_empty_node(
@@ -4047,6 +4280,61 @@ mod tests {
             pick_scene_object(sphere_center, screen_rect, &camera, &world),
             Some(SceneSelection::Part(id)) if id == sphere_id
         ));
+    }
+
+    #[test]
+    fn light_icon_can_be_picked_over_a_scene_object() {
+        let camera = Camera {
+            eye: Vec3::new(0.0, 2.0, 6.0),
+            yaw: -90.0_f32.to_radians(),
+            pitch: -15.0_f32.to_radians(),
+            up: Vec3::Y,
+            aspect: 16.0 / 9.0,
+        };
+        let mut world = World::new();
+        world.add_object(RenderObject::new(
+            Transform::default(),
+            MeshId(0),
+            MaterialId(0),
+        ));
+        world
+            .add_local_light(LocalLight::point("Key", [0.0, 0.0, 0.0]))
+            .unwrap();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+        let center = project_to_screen(
+            Vec3::ZERO,
+            camera.build_view_projection_matrix(),
+            screen_rect,
+        )
+        .unwrap();
+
+        assert!(pick_scene_object(center, screen_rect, &camera, &world).is_some());
+        assert_eq!(
+            pick_local_light_icon(center, screen_rect, screen_rect, &camera, &world),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn viewport_projection_rejects_points_behind_the_camera() {
+        let camera = Camera {
+            eye: Vec3::new(0.0, 2.0, 6.0),
+            yaw: -90.0_f32.to_radians(),
+            pitch: -15.0_f32.to_radians(),
+            up: Vec3::Y,
+            aspect: 16.0 / 9.0,
+        };
+        let point_behind_camera = camera.eye + Vec3::Z;
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+
+        assert!(
+            project_to_screen(
+                point_behind_camera,
+                camera.build_view_projection_matrix(),
+                screen_rect
+            )
+            .is_none()
+        );
     }
 
     #[test]

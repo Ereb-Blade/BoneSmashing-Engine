@@ -2,7 +2,7 @@
 
 **Первичный аудит:** 2026-11-24
 
-**Актуализировано:** 2026-11-27 по состоянию коммита `91a9bde`
+**Актуализировано:** 2026-11-27 по состоянию коммита `fe2b597`
 
 ## 1. Общая информация о проекте
 
@@ -21,19 +21,18 @@
 
 Проект уже значительно превратился в рабочее демонстрационное ядро. Реализованы сцена, редакторский UI, загрузка моделей, PBR, IBL, HDR, тени, скелетная анимация, стекло и локальные point/spot lights с редакторским gizmo.
 
-Текущая общая оценка: **рабочая прототипная и демонстрационная база, но пока не production-ready для больших или сложных сцен**.
+Текущая общая оценка: **рабочая прототипная и демонстрационная база, но пока не production-ready для больших или сложных сцен**. Добавлены воспроизводимый CLI benchmark, fullscreen-режим замера и stress fixture; это даёт реальные данные на GTX 650, но пока не покрывает CI regression testing или сцены на десятки тысяч объектов.
 
-Ниже выводы сверены с текущим исходным кодом, включая локальное освещение, сценовую иерархию и viewport-иконки.
+Ниже выводы сверены с текущим исходным кодом по состоянию `fe2b597`, включая benchmark pipeline, fullscreen запуск, новые тестовые сцены и замену CarConcept в `test.bse-scene`.
 
 ### Результаты проверки
 
-- `cargo test`: пройдена, **144 теста**, 0 ошибок.
-- Покрытие тестами включает scene hierarchy и parented lights, их сериализацию и загрузку тестовых сцен, viewport picking, one-step undo для перетаскивания света, animation sampling, импорт OBJ/glTF, mipmaps, IBL/environment, frustum culling, MSAA, shader validation и shadow queue.
-- `cargo check --release`: проходит без предупреждений.
-- `cargo clippy --all-targets --all-features -- -D warnings`: проходит.
-- `cargo fmt --all -- --check` и `git diff --check`: проходят.
+- `cargo test`: **151 passed, 0 failed**.
+- Покрытие включает scene hierarchy и parented lights, viewport picking, animation sampling, importer, mipmaps, IBL/environment, frustum culling, MSAA, shader validation, benchmark CLI и загрузку stress scene.
+- Release benchmark успешно запускался на NVIDIA GeForce GTX 650; borderless fullscreen-профиль подтвердил фактический размер **1680×1050**.
+- `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` и `git diff --check`: проходят.
 - Strict lint-проверка включена в GitHub Actions CI.
-- Автоматические тесты проверяют поведение и компиляцию, но live-визуальная проверка значков в запущенном окне не проводилась; FPS и реальную GPU-производительность аудит не подтверждает.
+- Автоматические benchmark-профили снимают CPU/GPU timings, но benchmark не запускается в CI. Пользовательский скриншот stress scene показывает, что текущая локация — функциональный low-poly greybox, а не визуально законченный игровой уровень.
 
 ## 2. Полная структура проекта
 
@@ -68,8 +67,9 @@
 
 ### Ресурсы и документация
 
-- `assets/models/` содержит тестовые модели Fox, RiggedFigure, FlightHelmet и CarConcept.
-- `assets/scenes/` содержит animation, local-light, showroom, benchmark и другие тестовые сцены.
+- `assets/models/` содержит Fox, RiggedFigure, FlightHelmet и Khronos Boom Box; CarConcept остаётся legacy-ассетом, но удалён из пользовательской `test.bse-scene`.
+- `assets/scenes/` включает `renderer_feature_test.bse-scene` для интеграционных проверок и `mesa_relay_stress.bse-scene` для высокой нагрузки.
+- Stress scene содержит 1 167 исходных объектов, 13 model groups (12 анимированных), 16 локальных источников света, HDR и прозрачные окна.
 - `assets/environments/dikhololo_night_2k.hdr` — ночное окружение CC0 для сцены локального освещения.
 - `Dark grey.jpg` и `texture.png` — встроенные и тестовые текстуры.
 - `README.md` — пользовательская документация; `AUDIT.md` — техническая оценка и ограничения.
@@ -815,14 +815,18 @@ Directional shadow camera теперь автоматически подбира
 - нет occlusion culling;
 - одна directional shadow map фиксированного разрешения 4096×4096, без cascades;
 - environment preprocessing занимает CPU worker;
-- GPU timestamps cover frame/shadow/opaque, но нет устойчивого benchmark baseline
-  и профилей для каждой стадии.
+- GPU timestamps cover frame, shadow, opaque, transparent, glass и postprocess;
+  есть CLI capture с фиксированным warmup/capture, medians и p95.
+- Нет автоматического benchmark CI, regression thresholds или тестовых наборов
+  на 10k/100k объектов.
 
 ## 7. Анализ производительности
 
 ### CPU узкие места
 
-Наиболее вероятные:
+Профиль записывает CPU frame/acquire timings и scene counters. Он не разделяет
+время на отдельные CPU subsystems, поэтому следующие пункты остаются
+гипотезами для дальнейшего профилирования:
 
 - scene object traversal;
 - world matrix cache propagation;
@@ -833,33 +837,48 @@ Directional shadow camera теперь автоматически подбира
 - stable object ID lookup;
 - model hierarchy validation.
 
-Для scenes >10k-100k объектов потребуется явный dirty transform pass и spatial acceleration.
+Для сцен >10k объектов потребуются отдельные масштабируемые benchmarks,
+явный dirty transform pass и spatial acceleration.
 
 ### GPU узкие места
 
-- draw call count;
-- triangle count;
-- MSAA;
-- Rgba16Float frame copies;
-- PCF с настраиваемым числом taps (default 8);
-- glass extra passes/copies;
-- skinning vertex shader;
-- many material bind groups;
-- full pass per transparent object;
-- repeated instance buffer writes.
+- На stress scene opaque pass доминирует: около 91.7 ms из 93.5 ms GPU frame.
+- MSAA и render scale заметно влияют на время; PCF tap count на этой сцене
+  влияет слабо.
+- Прозрачность/glass, draw calls, triangle count, skinning, material bind groups
+  и повторные instance-buffer writes остаются потенциальными издержками.
 
-Нет данных для гарантированной оценки FPS.
+Снятые Release-профили на NVIDIA GeForce GTX 650, при фактическом размере
+1680×1050:
+
+| Render scale | MSAA | PCF | GPU median |
+|---:|---:|---:|---:|
+| 1.0 | 1× | 8 | 93.5 ms |
+| 1.0 | 4× | 8 | 118.7 ms |
+| 0.5 | 1× | 8 | 38.8 ms |
+| 1.0 | 1× | 4 | 93.0 ms |
+| 1.0 | 1× | 16 | 94.7 ms |
+
+Полноэкранный запуск подтвердил реальный surface/render size 1680×1050.
+Stress capture показывает 129 draw calls, около 3.2 млн triangles и примерно
+950 видимых instances; точные counters немного меняются из-за анимации и
+frustum culling. Это намеренно тяжёлый тестовый greybox, не прогноз FPS для
+типичной игровой сцены и не оценка абсолютного предела GPU.
 
 ### Инструментирование и неизмеренные параметры
 
-В editor Performance panel доступны CPU UI/scene/acquire/submit timings,
-GPU frame/shadow/opaque timings при поддержке adapter timestamps, draw calls,
-triangles и scene counters. Это базовое live-инструментирование, не benchmark.
+CLI benchmark и editor Performance panel сохраняют CPU timings, GPU frame и
+отдельные shadow/opaque/transparent/glass/postprocess timings, draw calls,
+triangles и scene counters. CLI ждёт завершения environment/HDR загрузки,
+прогревает сцену 2 секунды и записывает 10-секундный JSON-профиль; fullscreen
+режим использует текущее разрешение монитора. GPU timings доступны только при
+поддержке timestamp queries адаптером.
 
-Не измерены воспроизводимые performance baselines, peak VRAM/RAM, стоимость
-импорта и подготовки environment, а также масштабирование на фиксированных
-наборах 10k/100k объектов. Без таких прогонов нельзя указывать конкретные FPS
-или обещанные лимиты сцен.
+Для Flight Helmet и integrated renderer scene также есть повторяемые профили,
+но это небольшая выборка одного GPU и нескольких fixtures, а не универсальный
+performance baseline. Не измерены peak VRAM/RAM, стоимость импорта и
+environment preprocessing, динамическое обновление shadow map и масштабирование
+на фиксированных наборах 10k/100k объектов. Benchmarks пока не входят в CI.
 
 ## 8. Оценка готовности подсистем
 
@@ -893,7 +912,7 @@ triangles и scene counters. Это базовое live-инструментир
 | LOD | Не реализована |
 | Occlusion culling | Не реализована |
 | GPU culling | Не реализована |
-| Automated benchmarks | Не реализована |
+| Automated benchmarks | CLI и UI capture реализованы; нет benchmark CI и regression thresholds |
 
 ## 9. Отсутствующие важные компоненты
 
@@ -910,7 +929,8 @@ triangles и scene counters. Это базовое live-инструментир
 11. Animation state machine and layered blending; базовые cross-fades уже есть.
 12. Physics/collision.
 13. Central logger and diagnostic report.
-14. Reproducible benchmark suite and performance baselines.
+14. Benchmark CI, regression thresholds и baseline на нескольких адаптерах;
+    ручные CLI captures и stress fixture уже реализованы.
 15. Asset hot reload.
 16. Public engine API policy.
 
@@ -984,6 +1004,10 @@ triangles и scene counters. Это базовое live-инструментир
 
 ### Этап 5 — Производительность
 
+- fixed-scene Release benchmark, GPU pass timestamps, render-scale/PCF/MSAA overrides
+  и borderless fullscreen capture реализованы;
+- stress fixture на 1 167 исходных объектов добавлена и проверена на GTX 650;
+- сравнение baseline и настроек проведено на фактическом разрешении 1680×1050;
 - benchmark 10k/100k scenes;
 - persistent instance buffers;
 - dedicated batch structures;
@@ -992,33 +1016,42 @@ triangles и scene counters. Это базовое live-инструментир
 - spatial hierarchy;
 - LOD;
 - occlusion culling;
-- benchmark-ами измерять GPU timestamps и результаты оптимизаций.
+- измерять dynamic shadow-map rebuild отдельно от cached static shadow map;
+- повторять профили на других adapters и не менять качество без измеренного выигрыша.
 
 ### Этап 6 — Инструменты разработчика
 
-- расширение существующих CPU/GPU timings и scene counters;
+- CPU/GPU timings, pass summaries, scene counters и JSON benchmark capture
+  реализованы;
+- benchmark CI и performance regression thresholds остаются незавершёнными;
 - asset inspector;
 - дополнительные draw call/triangle diagnostics;
 - shader debug views;
 - scene validation UI;
 - crash/log diagnostics;
 - screenshots and visual regression tests;
-- benchmark CI.
 
 ## 12. Приоритетный список следующих задач
 
-1. Создать воспроизводимый benchmark baseline для CPU/GPU и больших сцен.
-2. Использовать текущие GPU timestamps для измерения отдельных render passes.
-3. Проверить bounds-based directional shadow framing на сценах разных масштабов; затем оценить cascades.
-4. Определить план локальных теней и clustered/forward+ lighting сверх лимита 16.
-5. Разделить `Renderer::render` на named render passes.
-6. Выделить resource/material descriptors и handle-based AssetManager.
-7. Разделить `DebugUi` на editor components и панели.
-8. Добавить persistent instance buffers и dedicated batching.
-9. Реализовать GPU/occlusion/LOD culling только после измерения bottlenecks.
-10. Расширить анимационную систему поверх существующих cross-fades.
-11. После стабилизации runtime рассмотреть ECS.
-12. Physics и collision реализовать в отдельной подсистеме.
+1. Довести stress scene от procedural greybox до читаемой игровой локации, не
+   меняя отдельный benchmark fixture; использовать проверенные модели и лицензии.
+2. Добавить воспроизводимые workload-наборы на 10k/100k объектов и определить,
+   где ограничение: CPU preparation, GPU geometry или fragment shading.
+3. Оптимизировать opaque pass по измерениям, отдельно проверяя влияние числа
+   локальных lights; не менять PCF default без визуального A/B.
+4. Профилировать dynamic shadow-map rebuild: текущая статическая сцена в основном
+   использует кэш, поэтому timestamp shadow pass близок к нулю.
+5. Проверить bounds-based directional shadow framing на больших/движущихся
+   сценах, затем оценить cascades и shadows для локальных lights.
+6. Повторить benchmark на дополнительных GPU и добавить автоматические
+   regression thresholds только после получения стабильных baseline.
+7. Выделить persistent instance buffers, dedicated batching и spatial hierarchy;
+   добавить GPU/occlusion/LOD culling после подтверждения bottleneck.
+8. Поэтапно разделить `Renderer::render`, `App` и `DebugUi`, сохраняя проверяемые
+   scene/import/render boundaries.
+9. Выделить handle-based AssetManager и resource/material descriptors.
+10. Расширять animation state machine поверх существующих cross-fades.
+11. После стабилизации runtime рассмотреть ECS, затем отдельные physics/collision.
 
 ## 13. Общая оценка текущего состояния
 
@@ -1036,7 +1069,9 @@ triangles и scene counters. Это базовое live-инструментир
 - point/spot lighting с scene hierarchy, parent transforms и clickable editor icons;
 - undo/redo;
 - scene JSON format;
-- базовые CPU/GPU profiler timings и draw/scene counters;
+- CPU/GPU profiler, per-pass summaries и JSON benchmark capture;
+- полноэкранный benchmark в текущем разрешении монитора;
+- интеграционную renderer-сцену и большую стресс-сцену;
 - glass/transmission approximation.
 
 Ключевые слабости:
@@ -1045,11 +1080,15 @@ triangles и scene counters. Это базовое live-инструментир
 - одна directional shadow map без cascades и локальных теней;
 - отсутствуют LOD, occlusion, GPU culling и indirect drawing;
 - неполная support policy для glTF extensions;
-- нет воспроизводимого benchmark/performance baseline;
+- нет benchmark CI, межадаптерных baselines и stress workload на 10k/100k объектов;
+- большая стресс-сцена пока визуально выглядит как greybox и не является game-ready;
 - отсутствуют physics/ECS/asset manager.
 
 **Итог:** фундамент движка рабочий и его можно развивать итеративно. Startup,
-scene loading и текущие проверки проходят. Ближайшие инженерные задачи —
-измеримый benchmark baseline, дальнейшее разделение renderer/editor modules и
-планирование теней/масштабирования локального света; конкретные FPS без
-воспроизводимых профилей утверждать нельзя.
+scene loading и тесты проходят. На GTX 650 stress fixture замерена в fullscreen
+1680×1050: около 93.5 ms GPU frame при 1× MSAA, PCF 8; render scale 0.5
+снижает результат примерно до 38.8 ms, а 4× MSAA увеличивает до 118.7 ms.
+Эти цифры относятся только к конкретной синтетической сцене и адаптеру; они не
+обобщаются на обычный игровой workload. Следующие практические задачи —
+визуально улучшить greybox и расширить performance tests на разные размеры
+сцен/адаптеры, затем оптимизировать доминирующий opaque pass по данным профилей.

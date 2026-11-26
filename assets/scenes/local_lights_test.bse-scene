@@ -1,0 +1,202 @@
+{
+  "version": 9,
+  "groups": [
+    {
+      "name": "Night flight helmet",
+      "path": "../models/FlightHelmet/FlightHelmet.gltf",
+      "position": [0.0, 0.3, -0.15],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.55, 1.55, 1.55]
+    }
+  ],
+  "lights": [
+    {
+      "name": "Amber point",
+      "kind": "point",
+      "enabled": true,
+      "position": [-2.4, 1.9, 1.2],
+      "direction": [0.0, -1.0, 0.0],
+      "color": [1.0, 0.18, 0.035],
+      "intensity": 48.0,
+      "range": 7.0,
+      "inner_cone_degrees": 20.0,
+      "outer_cone_degrees": 30.0
+    },
+    {
+      "name": "Cyan spotlight",
+      "kind": "spot",
+      "enabled": true,
+      "position": [2.4, 3.2, 2.2],
+      "direction": [-0.5, -0.72, -0.48],
+      "color": [0.08, 0.36, 1.0],
+      "intensity": 66.0,
+      "range": 9.0,
+      "inner_cone_degrees": 12.0,
+      "outer_cone_degrees": 28.0
+    },
+    {
+      "name": "Magenta rim",
+      "kind": "spot",
+      "enabled": true,
+      "position": [0.4, 2.8, -3.1],
+      "direction": [-0.08, -0.65, 0.52],
+      "color": [1.0, 0.045, 0.3],
+      "intensity": 54.0,
+      "range": 7.0,
+      "inner_cone_degrees": 16.0,
+      "outer_cone_degrees": 36.0
+    }
+  ],
+  "objects": [
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 1,
+        "material_id": 0
+      },
+      "name": "Night stage floor",
+      "position": [0.0, -0.12, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [4.8, 1.0, 4.8]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 0,
+        "material_id": 0
+      },
+      "name": "Helmet display plinth",
+      "position": [0.0, 0.08, -0.2],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [2.1, 0.12, 1.8]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 0,
+        "material_id": 0
+      },
+      "name": "Amber light target",
+      "position": [-2.25, 0.45, -0.25],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [0.45, 0.45, 0.45]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 2,
+        "material_id": 0
+      },
+      "name": "Cyan light target",
+      "position": [2.25, 0.55, -0.25],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [0.55, 0.55, 0.55]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 2,
+        "material_id": 0
+      },
+      "name": "Rim light target",
+      "position": [0.0, 0.45, -2.35],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [0.42, 0.42, 0.42]
+    },
+    {
+      "source": {
+        "type": "asset",
+        "path": "../models/FlightHelmet/FlightHelmet.gltf",
+        "instance_index": 0
+      },
+      "model_group": 0,
+      "name": "Helmet hose",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "source": {
+        "type": "asset",
+        "path": "../models/FlightHelmet/FlightHelmet.gltf",
+        "instance_index": 1
+      },
+      "model_group": 0,
+      "name": "Helmet rubber wood",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "source": {
+        "type": "asset",
+        "path": "../models/FlightHelmet/FlightHelmet.gltf",
+        "instance_index": 2
+      },
+      "model_group": 0,
+      "name": "Helmet glass plastic",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "source": {
+        "type": "asset",
+        "path": "../models/FlightHelmet/FlightHelmet.gltf",
+        "instance_index": 3
+      },
+      "model_group": 0,
+      "name": "Helmet metal parts",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "source": {
+        "type": "asset",
+        "path": "../models/FlightHelmet/FlightHelmet.gltf",
+        "instance_index": 4
+      },
+      "model_group": 0,
+      "name": "Helmet leather parts",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "source": {
+        "type": "asset",
+        "path": "../models/FlightHelmet/FlightHelmet.gltf",
+        "instance_index": 5
+      },
+      "model_group": 0,
+      "name": "Helmet lenses",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.0, 1.0, 1.0]
+    }
+  ],
+  "camera": {
+    "position": [0.0, 2.7, 8.0],
+    "yaw": -1.5707964,
+    "pitch": -0.16,
+    "up": [0.0, 1.0, 0.0]
+  },
+  "renderer_settings": {
+    "key_light_yaw_degrees": -142.0,
+    "key_light_elevation_degrees": -53.0,
+    "key_light_intensity": 0.35,
+    "fill_light_intensity": 0.06,
+    "environment_intensity": 0.85,
+    "exposure_ev": 0.25,
+    "shadows_enabled": true,
+    "shadow_pcf_samples": 8,
+    "debug_view": 0,
+    "unlocked_fps": true,
+    "render_scale": 1.0,
+    "msaa_samples": 1
+  },
+  "environment": {
+    "path": "../environments/dikhololo_night_2k.hdr"
+  }
+}

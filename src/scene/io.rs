@@ -3,8 +3,9 @@ use crate::core::{MaterialId, MeshId};
 use crate::renderer::material::MaterialParams;
 use crate::renderer::state::{ParsedAsset, RendererSettings, parse_asset};
 use crate::scene::{
-    AnimationKeyboardControl, DEFAULT_ANIMATION_CROSSFADE_SECONDS, MAX_ANIMATION_CROSSFADE_SECONDS,
-    ModelGroupId, RenderObject, Transform, World,
+    AnimationKeyboardControl, DEFAULT_ANIMATION_CROSSFADE_SECONDS, LocalLight, LocalLightKind,
+    MAX_ANIMATION_CROSSFADE_SECONDS, MAX_LOCAL_LIGHTS, ModelGroupId, RenderObject, Transform,
+    World,
 };
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,8 @@ pub struct SceneFile {
     pub version: u32,
     #[serde(default)]
     pub groups: Vec<SceneGroup>,
+    #[serde(default)]
+    pub lights: Vec<SceneLight>,
     pub objects: Vec<SceneObject>,
     #[serde(default)]
     pub camera: Option<SceneCamera>,
@@ -48,6 +51,57 @@ pub struct SceneGroup {
     pub scale: [f32; 3],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub animation: Option<SceneAnimationSettings>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SceneLight {
+    pub name: String,
+    pub kind: LocalLightKind,
+    pub enabled: bool,
+    pub position: [f32; 3],
+    pub direction: [f32; 3],
+    pub color: [f32; 3],
+    pub intensity: f32,
+    pub range: f32,
+    pub inner_cone_degrees: f32,
+    pub outer_cone_degrees: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_group: Option<usize>,
+}
+
+impl SceneLight {
+    fn from_local_light(light: &LocalLight, parent_group: Option<usize>) -> Self {
+        Self {
+            name: light.name.clone(),
+            kind: light.kind,
+            enabled: light.enabled,
+            position: light.position,
+            direction: light.direction,
+            color: light.color,
+            intensity: light.intensity,
+            range: light.range,
+            inner_cone_degrees: light.inner_cone_degrees,
+            outer_cone_degrees: light.outer_cone_degrees,
+            parent_group,
+        }
+    }
+
+    fn to_local_light(&self) -> LocalLight {
+        let mut light = match self.kind {
+            LocalLightKind::Point => LocalLight::point(self.name.clone(), self.position),
+            LocalLightKind::Spot => {
+                LocalLight::spot(self.name.clone(), self.position, self.direction)
+            }
+        };
+        light.enabled = self.enabled;
+        light.color = self.color;
+        light.intensity = self.intensity;
+        light.range = self.range;
+        light.inner_cone_degrees = self.inner_cone_degrees;
+        light.outer_cone_degrees = self.outer_cone_degrees;
+        light
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -337,9 +391,26 @@ impl SceneFile {
                 morph_weights: object.morph_weights().to_vec(),
             });
         }
+        let lights = world
+            .local_lights()
+            .iter()
+            .enumerate()
+            .map(|(index, light)| {
+                let parent_group = world
+                    .local_light_parent(index)
+                    .map(|parent| {
+                        group_indices.get(&parent).copied().ok_or_else(|| {
+                            format!("Light '{}' references a missing parent group", light.name)
+                        })
+                    })
+                    .transpose()?;
+                Ok(SceneLight::from_local_light(light, parent_group))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let file = Self {
             version: SCENE_FORMAT_VERSION,
             groups,
+            lights,
             objects,
             camera: None,
             renderer_settings: None,
@@ -426,6 +497,24 @@ impl SceneFile {
             return Err(format!(
                 "Scene contains too many model groups (maximum: {MAX_SCENE_GROUPS})"
             ));
+        }
+        if self.lights.len() > MAX_LOCAL_LIGHTS {
+            return Err(format!(
+                "Scene contains too many local lights (maximum: {MAX_LOCAL_LIGHTS})"
+            ));
+        }
+        for (index, light) in self.lights.iter().enumerate() {
+            if !light.to_local_light().is_valid() {
+                return Err(format!("Local light {index} has invalid settings"));
+            }
+            if light
+                .parent_group
+                .is_some_and(|parent| parent >= self.groups.len())
+            {
+                return Err(format!(
+                    "Local light {index} references an unknown parent group"
+                ));
+            }
         }
         if let Some(camera) = &self.camera {
             let position = Vec3::from_array(camera.position);
@@ -900,6 +989,12 @@ pub fn build_world(
                 .map_err(|error| format!("Invalid parent for model group {index}: {error}"))?;
         }
     }
+    for (index, light) in file.lights.iter().enumerate() {
+        let parent = light.parent_group.map(|group_index| group_ids[group_index]);
+        world
+            .add_local_light_with_parent(light.to_local_light(), parent)
+            .map_err(|error| format!("Invalid settings for local light {index}: {error}"))?;
+    }
     for (index, object) in file.objects.iter().enumerate() {
         let render_object = match &object.source {
             SceneObjectSource::BuiltIn {
@@ -1008,6 +1103,60 @@ mod tests {
                 ..settings
             }
             .is_valid()
+        );
+    }
+
+    #[test]
+    fn saves_loads_and_validates_local_lights() {
+        let mut world = World::new();
+        let point = LocalLight::point("Key", [1.0, 2.0, 3.0]);
+        let spot = LocalLight::spot("Rim", [-1.0, 2.0, 0.0], [0.0, -1.0, 0.0]);
+        let parent = world.add_empty_node(
+            "Lamp stand",
+            Transform::from_translation(Vec3::new(1.0, 0.0, 0.0)),
+        );
+        world.add_local_light(point.clone()).unwrap();
+        let spot_index = world.add_local_light(spot).unwrap();
+        world
+            .set_local_light_parent(spot_index, Some(parent))
+            .unwrap();
+
+        let scene_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("local_lights_test.bse-scene");
+        let file = SceneFile::from_world(&world, &scene_path).unwrap();
+        let encoded = serde_json::to_vec(&file).unwrap();
+        let decoded: SceneFile = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.lights[0].name, "Key");
+        assert_eq!(decoded.lights[0].parent_group, None);
+        assert_eq!(decoded.lights[1].name, "Rim");
+        assert_eq!(decoded.lights[1].parent_group, Some(0));
+
+        let restored = build_world(&decoded, 0, 0, HashMap::new()).unwrap();
+        assert_eq!(restored.local_lights(), world.local_lights());
+        assert_eq!(restored.local_light_parent(1), Some(ModelGroupId(0)));
+
+        let older_scene: SceneFile = serde_json::from_value(serde_json::json!({
+            "version": SCENE_FORMAT_VERSION,
+            "objects": []
+        }))
+        .unwrap();
+        assert!(older_scene.lights.is_empty());
+
+        let mut invalid = decoded.clone();
+        invalid.lights[0].range = 0.0;
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .contains("Local light 0 has invalid settings")
+        );
+
+        let mut invalid_parent = decoded;
+        invalid_parent.lights[1].parent_group = Some(2);
+        assert!(
+            invalid_parent
+                .validate()
+                .unwrap_err()
+                .contains("references an unknown parent group")
         );
     }
 
@@ -1505,6 +1654,7 @@ mod tests {
         let file = SceneFile {
             version: SCENE_FORMAT_VERSION,
             groups: Vec::new(),
+            lights: Vec::new(),
             objects: vec![SceneObject {
                 source: SceneObjectSource::BuiltIn {
                     mesh_id: 2,
@@ -1531,6 +1681,67 @@ mod tests {
         assert_eq!(
             world.objects()[0].transform.position,
             Vec3::new(1.0, 2.0, 3.0)
+        );
+    }
+
+    #[test]
+    fn local_lights_test_scene_loads_model_lights_and_night_environment() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("scenes")
+            .join("local_lights_test.bse-scene");
+        let loaded = load_scene(&path).unwrap();
+
+        assert_eq!(loaded.assets.len(), 1);
+        assert_eq!(loaded.file.groups.len(), 1);
+        assert_eq!(loaded.file.lights.len(), 3);
+        assert_eq!(
+            loaded.file.lights[0].kind,
+            crate::scene::LocalLightKind::Point
+        );
+        assert_eq!(
+            loaded.file.lights[1].kind,
+            crate::scene::LocalLightKind::Spot
+        );
+        let environment_path = loaded
+            .file
+            .environment
+            .as_ref()
+            .and_then(|environment| environment.path.as_deref())
+            .unwrap();
+        assert_eq!(
+            Path::new(environment_path)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("dikhololo_night_2k.hdr")
+        );
+        assert_eq!(loaded.file.objects.len(), 11);
+
+        let hdr = image::ImageReader::open(Path::new(environment_path))
+            .unwrap()
+            .decode()
+            .unwrap()
+            .into_rgb32f();
+        assert_eq!(hdr.width(), hdr.height() * 2);
+    }
+
+    #[test]
+    fn concept_car_showroom_scene_loads_its_model_and_lights() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("scenes")
+            .join("test.bse-scene");
+        let loaded = load_scene(&path).unwrap();
+
+        assert_eq!(loaded.assets.len(), 1);
+        assert_eq!(loaded.file.groups.len(), 1);
+        assert_eq!(loaded.file.lights.len(), 7);
+        assert_eq!(loaded.file.objects.len(), 15);
+        assert_eq!(
+            Path::new(loaded.file.groups[0].path.as_deref().unwrap())
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("CarConcept.glb")
         );
     }
 
@@ -1686,6 +1897,7 @@ mod tests {
         let mut file = SceneFile {
             version: SCENE_FORMAT_VERSION + 1,
             groups: Vec::new(),
+            lights: Vec::new(),
             objects: Vec::new(),
             camera: None,
             renderer_settings: None,
@@ -1720,6 +1932,7 @@ mod tests {
         let file = SceneFile {
             version: SCENE_FORMAT_VERSION,
             groups: Vec::new(),
+            lights: Vec::new(),
             objects: vec![SceneObject {
                 source: SceneObjectSource::BuiltIn {
                     mesh_id: 0,
@@ -1909,6 +2122,7 @@ mod tests {
         let file = SceneFile {
             version: SCENE_FORMAT_VERSION,
             groups: Vec::new(),
+            lights: Vec::new(),
             objects: vec![SceneObject {
                 source: SceneObjectSource::Asset {
                     path: "model.glb".to_owned(),

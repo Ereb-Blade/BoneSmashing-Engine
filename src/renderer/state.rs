@@ -21,7 +21,7 @@ use crate::renderer::material::{Material, MaterialParams, generate_mip_levels_wi
 use crate::renderer::mesh::{Mesh, MeshData, ObjModelData};
 use crate::renderer::pipeline::{HDR_FORMAT, RenderPipelineBundle};
 use crate::renderer::{debug_ui::DebugUi, environment::Environment};
-use crate::scene::{RenderObject, World};
+use crate::scene::{LocalLight, LocalLightKind, MAX_LOCAL_LIGHTS, RenderObject, World};
 
 #[derive(Debug)]
 pub enum ParsedAsset {
@@ -64,6 +64,15 @@ pub fn parse_asset(path: &Path) -> Result<ParsedAsset, String> {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LocalLightUniform {
+    pub position_range: [f32; 4],
+    pub color_intensity: [f32; 4],
+    pub direction_type: [f32; 4],
+    pub spot_angles: [f32; 4],
+}
+
+#[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct LightUniform {
     pub direction_intensity: [f32; 4],
@@ -72,9 +81,81 @@ pub struct LightUniform {
     pub fill_color: [f32; 4],
     pub ambient_top: [f32; 4],
     pub render_options: [f32; 4],
+    pub local_light_info: [u32; 4],
+    pub local_lights: [LocalLightUniform; MAX_LOCAL_LIGHTS],
 }
 
 const SHADOW_MAP_SIZE: u32 = 4096;
+
+fn build_light_uniform(settings: RendererSettings, world: &World) -> LightUniform {
+    let key_direction = settings.key_light_direction();
+    let mut lights = [LocalLightUniform::default(); MAX_LOCAL_LIGHTS];
+    let mut light_count = 0_u32;
+    for (index, light) in world.local_lights().iter().enumerate() {
+        if !light.enabled {
+            continue;
+        }
+        debug_assert!((light_count as usize) < MAX_LOCAL_LIGHTS);
+        let position = world
+            .local_light_world_position(index)
+            .expect("light index comes from the same world");
+        let direction = world
+            .local_light_world_direction(index)
+            .expect("light index comes from the same world");
+        lights[light_count as usize] = LocalLightUniform {
+            position_range: [position.x, position.y, position.z, light.range],
+            color_intensity: [
+                light.color[0],
+                light.color[1],
+                light.color[2],
+                light.intensity,
+            ],
+            direction_type: [
+                direction.x,
+                direction.y,
+                direction.z,
+                if light.kind == LocalLightKind::Spot {
+                    1.0
+                } else {
+                    0.0
+                },
+            ],
+            spot_angles: [
+                light.inner_cone_degrees.to_radians().cos(),
+                light.outer_cone_degrees.to_radians().cos(),
+                0.0,
+                0.0,
+            ],
+        };
+        light_count += 1;
+    }
+
+    LightUniform {
+        direction_intensity: [
+            key_direction.x,
+            key_direction.y,
+            key_direction.z,
+            settings.key_light_intensity,
+        ],
+        color: [
+            1.0,
+            0.92,
+            0.78,
+            if settings.shadows_enabled { 1.0 } else { 0.0 },
+        ],
+        fill_direction_intensity: [0.55, -0.3, 0.65, settings.fill_light_intensity],
+        fill_color: [0.62, 0.76, 1.0, settings.debug_view as f32],
+        ambient_top: [0.0, 0.0, 0.0, settings.environment_intensity],
+        render_options: [
+            settings.shadow_pcf_samples as f32,
+            0.0,
+            0.0,
+            settings.exposure_ev,
+        ],
+        local_light_info: [light_count, 0, 0, 0],
+        local_lights: lights,
+    }
+}
 
 fn scaled_render_dimension(dimension: u32, scale: f32) -> u32 {
     ((dimension as f32 * scale).round() as u32).max(1)
@@ -986,25 +1067,7 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let key_direction = settings.key_light_direction();
-        let light_uniform = LightUniform {
-            direction_intensity: [
-                key_direction.x,
-                key_direction.y,
-                key_direction.z,
-                settings.key_light_intensity,
-            ],
-            color: [1.0, 0.92, 0.78, 1.0],
-            fill_direction_intensity: [0.55, -0.3, 0.65, settings.fill_light_intensity],
-            fill_color: [0.62, 0.76, 1.0, settings.debug_view as f32],
-            ambient_top: [0.0, 0.0, 0.0, settings.environment_intensity],
-            render_options: [
-                settings.shadow_pcf_samples as f32,
-                0.0,
-                0.0,
-                settings.exposure_ev,
-            ],
-        };
+        let light_uniform = build_light_uniform(settings, &World::new());
         let light_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("light buffer"),
             contents: bytemuck::bytes_of(&light_uniform),
@@ -1036,7 +1099,7 @@ impl Renderer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let shadow_matrix = directional_shadow_matrix(key_direction);
+        let shadow_matrix = directional_shadow_matrix(settings.key_light_direction());
         let shadow_matrix_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("shadow matrix buffer"),
             contents: bytemuck::bytes_of(&shadow_matrix.to_cols_array_2d()),
@@ -2285,34 +2348,7 @@ impl Renderer {
             }
         }
         let scene_started = Instant::now();
-        let key_direction = self.settings.key_light_direction();
-        let light_uniform = LightUniform {
-            direction_intensity: [
-                key_direction.x,
-                key_direction.y,
-                key_direction.z,
-                self.settings.key_light_intensity,
-            ],
-            color: [
-                1.0,
-                0.92,
-                0.78,
-                if self.settings.shadows_enabled {
-                    1.0
-                } else {
-                    0.0
-                },
-            ],
-            fill_direction_intensity: [0.55, -0.3, 0.65, self.settings.fill_light_intensity],
-            fill_color: [0.62, 0.76, 1.0, self.settings.debug_view as f32],
-            ambient_top: [0.0, 0.0, 0.0, self.settings.environment_intensity],
-            render_options: [
-                self.settings.shadow_pcf_samples as f32,
-                0.0,
-                0.0,
-                self.settings.exposure_ev,
-            ],
-        };
+        let light_uniform = build_light_uniform(self.settings, world);
         self.queue
             .write_buffer(&self._light_buffer, 0, bytemuck::bytes_of(&light_uniform));
         let mut camera_uniform = CameraUniform::new();
@@ -2577,6 +2613,7 @@ impl Renderer {
             );
         }
 
+        let key_direction = self.settings.key_light_direction();
         let shadow_matrix = if has_skinned_shadow_object {
             directional_shadow_matrix(key_direction)
         } else {
@@ -3124,7 +3161,31 @@ mod tests {
 
     #[test]
     fn light_uniform_matches_wgsl_layout() {
-        assert_eq!(std::mem::size_of::<LightUniform>(), 96);
+        assert_eq!(std::mem::size_of::<LocalLightUniform>(), 64);
+        assert_eq!(std::mem::size_of::<LightUniform>(), 1136);
+    }
+
+    #[test]
+    fn light_uniform_packs_enabled_point_and_spot_lights() {
+        let point = LocalLight::point("Point", [1.0, 2.0, 3.0]);
+        let spot = LocalLight::spot("Spot", [4.0, 5.0, 6.0], [0.0, -2.0, 0.0]);
+        let mut disabled = LocalLight::point("Disabled", [0.0; 3]);
+        disabled.enabled = false;
+        let mut world = World::new();
+        world.add_local_light(point).unwrap();
+        world.add_local_light(spot).unwrap();
+        world.add_local_light(disabled).unwrap();
+        let uniform = build_light_uniform(RendererSettings::default(), &world);
+
+        assert_eq!(uniform.local_light_info[0], 2);
+        assert_eq!(uniform.local_lights[0].position_range, [1.0, 2.0, 3.0, 8.0]);
+        assert_eq!(uniform.local_lights[0].direction_type[3], 0.0);
+        assert_eq!(uniform.local_lights[1].position_range[..3], [4.0, 5.0, 6.0]);
+        assert_eq!(
+            uniform.local_lights[1].direction_type,
+            [0.0, -1.0, 0.0, 1.0]
+        );
+        assert!(uniform.local_lights[1].spot_angles[0] > uniform.local_lights[1].spot_angles[1]);
     }
 
     #[test]

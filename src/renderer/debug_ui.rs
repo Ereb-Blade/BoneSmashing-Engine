@@ -6,9 +6,9 @@ use crate::core::{MATERIAL_DEFAULT, MESH_CUBE};
 use crate::renderer::material::MaterialParams;
 use crate::renderer::state::{ParsedAsset, RenderTimings, Renderer, RendererSettings, parse_asset};
 use crate::scene::{
-    LoadedScene, MAX_ANIMATION_CROSSFADE_SECONDS, ModelAnimationClip, ModelAnimationPlayback,
-    ModelAnimationTransition, ModelGroupId, ObjectId, RenderObject, SceneEnvironment, Transform,
-    World, load_scene,
+    LoadedScene, LocalLight, LocalLightKind, MAX_ANIMATION_CROSSFADE_SECONDS, MAX_LOCAL_LIGHTS,
+    ModelAnimationClip, ModelAnimationPlayback, ModelAnimationTransition, ModelGroupId, ObjectId,
+    RenderObject, SceneEnvironment, Transform, World, load_scene,
 };
 use glam::{EulerRot, Mat4, Quat, Vec3};
 use serde::Serialize;
@@ -50,11 +50,13 @@ enum SceneSelection {
     Model(ModelGroupId),
     Part(ObjectId),
     Object(ObjectId),
+    Light(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EditorTab {
     Scene,
+    Lights,
     Animation,
     Render,
 }
@@ -94,6 +96,7 @@ fn draw_animation_panel(
         Some(SceneSelection::Part(object_id) | SceneSelection::Object(object_id)) => world
             .get_object(object_id)
             .and_then(RenderObject::model_group),
+        Some(SceneSelection::Light(_)) => None,
         None => None,
     };
 
@@ -795,6 +798,7 @@ struct UndoHistory {
     undo: Vec<SceneSnapshot>,
     redo: Vec<SceneSnapshot>,
     active_transform_selection: Option<SceneSelection>,
+    active_local_light: Option<usize>,
 }
 
 impl UndoHistory {
@@ -825,6 +829,29 @@ impl UndoHistory {
         );
         self.redo.clear();
         self.active_transform_selection = None;
+        self.active_local_light = None;
+    }
+
+    fn record_local_light(
+        &mut self,
+        world: &World,
+        selection: Option<SceneSelection>,
+        light_index: usize,
+        pointer_down: bool,
+        render_state: &RenderSnapshot,
+    ) {
+        if self.active_local_light != Some(light_index) {
+            Self::push_snapshot(
+                &mut self.undo,
+                SceneSnapshot {
+                    world: world.clone(),
+                    selection,
+                    render_state: render_state.clone(),
+                },
+            );
+            self.redo.clear();
+        }
+        self.active_local_light = pointer_down.then_some(light_index);
     }
 
     fn record_transform(
@@ -874,6 +901,7 @@ impl UndoHistory {
             .filter(|selected| selection_is_valid(world, *selected));
         *render_state = snapshot.render_state;
         self.active_transform_selection = None;
+        self.active_local_light = None;
         true
     }
 
@@ -902,6 +930,7 @@ impl UndoHistory {
             .filter(|selected| selection_is_valid(world, *selected));
         *render_state = snapshot.render_state;
         self.active_transform_selection = None;
+        self.active_local_light = None;
         true
     }
 
@@ -909,6 +938,7 @@ impl UndoHistory {
         self.undo.clear();
         self.redo.clear();
         self.active_transform_selection = None;
+        self.active_local_light = None;
     }
 
     fn can_undo(&self) -> bool {
@@ -1085,6 +1115,24 @@ fn edit_transform(ui: &mut egui::Ui, transform: &mut Transform) -> bool {
     changed
 }
 
+fn edit_vec3_fields(ui: &mut egui::Ui, label: &str, values: &mut [f32; 3]) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        for (axis, value) in ["X", "Y", "Z"].into_iter().zip(values) {
+            ui.weak(axis);
+            changed |= ui
+                .add(
+                    egui::DragValue::new(value)
+                        .speed(0.05)
+                        .range(-1000.0..=1000.0),
+                )
+                .changed();
+        }
+    });
+    changed
+}
+
 fn project_to_screen(
     position: Vec3,
     view_projection: Mat4,
@@ -1128,7 +1176,7 @@ fn selected_transform_mut(
         Some(SceneSelection::Part(id) | SceneSelection::Object(id)) => {
             world.get_object_mut(id).map(|object| &mut object.transform)
         }
-        None => None,
+        Some(SceneSelection::Light(_)) | None => None,
     }
 }
 
@@ -1138,6 +1186,7 @@ fn selected_name_mut(world: &mut World, selected: SceneSelection) -> Option<&mut
         SceneSelection::Part(id) | SceneSelection::Object(id) => {
             world.get_object_mut(id).map(|object| &mut object.name)
         }
+        SceneSelection::Light(index) => world.local_light_mut(index).map(|light| &mut light.name),
     }
 }
 
@@ -1145,6 +1194,33 @@ fn selection_is_valid(world: &World, selected: SceneSelection) -> bool {
     match selected {
         SceneSelection::Model(id) => world.model_group(id).is_some(),
         SceneSelection::Part(id) | SceneSelection::Object(id) => world.get_object(id).is_some(),
+        SceneSelection::Light(index) => index < world.local_lights().len(),
+    }
+}
+
+fn show_local_light_tree(
+    ui: &mut egui::Ui,
+    world: &World,
+    parent: Option<ModelGroupId>,
+    selected: &mut Option<SceneSelection>,
+) {
+    for (index, light) in world.local_lights().iter().enumerate() {
+        if world.local_light_parent(index) != parent {
+            continue;
+        }
+        let kind = match light.kind {
+            LocalLightKind::Point => "Point",
+            LocalLightKind::Spot => "Spot",
+        };
+        if ui
+            .selectable_label(
+                *selected == Some(SceneSelection::Light(index)),
+                format!("{kind} light · {}", light.name),
+            )
+            .clicked()
+        {
+            *selected = Some(SceneSelection::Light(index));
+        }
     }
 }
 
@@ -1169,6 +1245,7 @@ fn show_model_group_tree(
                     object.model_group() == Some(group_id) || object.parent_node() == Some(group_id)
                 })
             }
+            Some(SceneSelection::Light(index)) => world.local_light_parent(index) == Some(group_id),
             None => false,
         };
         let label = if group.source_path.is_some() {
@@ -1178,10 +1255,15 @@ fn show_model_group_tree(
         } else {
             format!("{} (empty node)", group.name)
         };
-        if children
+        let has_children = children
             .get(&Some(group_id))
             .is_some_and(|group_children| !group_children.is_empty())
-        {
+            || world
+                .local_lights()
+                .iter()
+                .enumerate()
+                .any(|(index, _)| world.local_light_parent(index) == Some(group_id));
+        if has_children {
             let id = ui.make_persistent_id(("model-group-tree", group_id.0));
             let (_, header, _) = egui::collapsing_header::CollapsingState::load_with_default_open(
                 ui.ctx(),
@@ -1191,6 +1273,7 @@ fn show_model_group_tree(
             .show_header(ui, |ui| ui.selectable_label(is_selected, label))
             .body(|ui| {
                 show_model_group_tree(ui, world, children, Some(group_id), selected);
+                show_local_light_tree(ui, world, Some(group_id), selected);
             });
             if header.inner.clicked() {
                 *selected = Some(SceneSelection::Model(group_id));
@@ -1215,6 +1298,7 @@ fn selected_world_position(world: &World, selected: Option<SceneSelection>) -> O
                     .transform_point3(Vec3::ZERO)
             })
         }
+        Some(SceneSelection::Light(index)) => world.local_light_world_position(index),
         None => None,
     }
 }
@@ -1225,6 +1309,7 @@ fn selected_parent_world_matrix(world: &World, selected: Option<SceneSelection>)
         Some(SceneSelection::Part(id) | SceneSelection::Object(id)) => world
             .get_object(id)
             .and_then(|object| object.parent_node().or_else(|| object.model_group())),
+        Some(SceneSelection::Light(index)) => world.local_light_parent(index),
         None => None,
     };
     parent.map_or(Mat4::IDENTITY, |id| world.model_group_world_matrix(id))
@@ -1288,6 +1373,67 @@ fn rotation_ring_points(
             project_to_screen(point, view_projection, screen_rect)
         })
         .collect()
+}
+
+fn drag_local_light(
+    world: &mut World,
+    index: usize,
+    mode: GizmoMode,
+    axis: usize,
+    amount: f32,
+) -> bool {
+    if amount == 0.0 || index >= world.local_lights().len() {
+        return false;
+    }
+    let parent_matrix = selected_parent_world_matrix(world, Some(SceneSelection::Light(index)));
+    let determinant = parent_matrix.determinant();
+    if !determinant.is_finite() || determinant.abs() <= f32::EPSILON {
+        return false;
+    }
+    let inverse_parent = parent_matrix.inverse();
+    match mode {
+        GizmoMode::Move => {
+            let local_delta = inverse_parent.transform_vector3(axis_vector(axis) * amount);
+            if !local_delta.is_finite() {
+                return false;
+            }
+            let Some(light) = world.local_light_mut(index) else {
+                return false;
+            };
+            let position = Vec3::from_array(light.position) + local_delta;
+            if !position.is_finite() {
+                return false;
+            }
+            light.position = position.to_array();
+            true
+        }
+        GizmoMode::Rotate => {
+            let Some(direction) = world.local_light_world_direction(index) else {
+                return false;
+            };
+            let rotated = Quat::from_axis_angle(axis_vector(axis), amount) * direction;
+            let local_direction = inverse_parent
+                .transform_vector3(rotated)
+                .normalize_or_zero();
+            if !local_direction.is_finite() || local_direction.length_squared() <= f32::EPSILON {
+                return false;
+            }
+            if let Some(light) = world.local_light_mut(index) {
+                light.direction = local_direction.to_array();
+                true
+            } else {
+                false
+            }
+        }
+        GizmoMode::Scale => {
+            if let Some(light) = world.local_light_mut(index) {
+                light.range = (light.range + amount).clamp(0.1, 1000.0);
+                true
+            } else {
+                false
+            }
+        }
+    }
 }
 
 fn paint_scene_gizmo(
@@ -1404,7 +1550,9 @@ fn paint_scene_gizmo(
             let amount = pointer_delta.dot(drag.screen_direction) * drag.world_per_pixel;
             let parent_matrix = (drag.mode == GizmoMode::Move)
                 .then(|| selected_parent_world_matrix(world, *selected));
-            if let Some(transform) = selected_transform_mut(world, *selected) {
+            if let Some(SceneSelection::Light(index)) = *selected {
+                changed |= drag_local_light(world, index, drag.mode, drag.axis, amount);
+            } else if let Some(transform) = selected_transform_mut(world, *selected) {
                 match drag.mode {
                     GizmoMode::Move => {
                         let parent_matrix = parent_matrix.unwrap_or(Mat4::IDENTITY);
@@ -1676,6 +1824,7 @@ impl DebugUi {
             Some(SceneSelection::Part(object_id) | SceneSelection::Object(object_id)) => world
                 .get_object(object_id)
                 .and_then(RenderObject::model_group),
+            Some(SceneSelection::Light(_)) => None,
             None => None,
         }
     }
@@ -1815,6 +1964,7 @@ impl DebugUi {
         let mut save_requested = false;
         let mut save_current = false;
         let mut scene_modified = false;
+        let mut add_local_light = None;
         let mut transform_change = None;
         let mut name_change = None;
         let mut animation_change = None;
@@ -1829,6 +1979,7 @@ impl DebugUi {
         } else {
             None
         };
+        let local_lights_before = world.local_lights().to_vec();
         if let Some(import) = &self.asset_import {
             match import.try_recv() {
                 Ok(request) => {
@@ -2118,6 +2269,12 @@ impl DebugUi {
                             self.active_tab = EditorTab::Scene;
                         }
                         if ui
+                            .selectable_label(self.active_tab == EditorTab::Lights, "Lights")
+                            .clicked()
+                        {
+                            self.active_tab = EditorTab::Lights;
+                        }
+                        if ui
                             .selectable_label(
                                 self.active_tab == EditorTab::Animation,
                                 "Animation",
@@ -2237,13 +2394,14 @@ impl DebugUi {
 
                                         if world.objects().is_empty()
                                             && world.model_groups().is_empty()
+                                            && world.local_lights().is_empty()
                                         {
                                             ui.label("The scene is empty");
                                         } else {
                                             let row_height =
                                                 ui.text_style_height(&egui::TextStyle::Button);
                                             ui.label(
-                                                egui::RichText::new("MODEL HIERARCHY")
+                                                egui::RichText::new("HIERARCHY")
                                                     .small()
                                                     .strong(),
                                             );
@@ -2265,6 +2423,12 @@ impl DebugUi {
                                                         None,
                                                         &mut selected_scene_item,
                                                     );
+                                                    show_local_light_tree(
+                                                        ui,
+                                                        world,
+                                                        None,
+                                                        &mut selected_scene_item,
+                                                    );
                                                 });
 
                                             let active_group = match selected_scene_item {
@@ -2274,6 +2438,7 @@ impl DebugUi {
                                                 Some(SceneSelection::Part(object_id)) => world
                                                     .get_object(object_id)
                                                     .and_then(|object| object.model_group()),
+                                                Some(SceneSelection::Light(_)) => None,
                                                 _ => None,
                                             };
                                             if let Some(group_id) = active_group {
@@ -2532,6 +2697,11 @@ impl DebugUi {
                                                             }
                                                         }
                                                     }
+                                                    Some(SceneSelection::Light(_)) => {
+                                                        ui.weak(
+                                                            "Edit this source in the Lights tab.",
+                                                        );
+                                                    }
                                                     None => {
                                                         ui.weak("Select an object to inspect it.");
                                                     }
@@ -2542,6 +2712,268 @@ impl DebugUi {
                                             self.selected_scene_item = selected_scene_item;
                                         }
                                     });
+                            } else if self.active_tab == EditorTab::Lights {
+                                ui.heading("Light sources");
+                                if let Some(Err(message)) = &self.scene_status {
+                                    ui.colored_label(egui::Color32::LIGHT_RED, message);
+                                }
+                                ui.label(format!(
+                                    "{}/{} in scene",
+                                    world.local_lights().len(),
+                                    MAX_LOCAL_LIGHTS
+                                ));
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(
+                                            world.local_lights().len() < MAX_LOCAL_LIGHTS,
+                                            egui::Button::new("Add point"),
+                                        )
+                                        .clicked()
+                                    {
+                                        add_local_light = Some(LocalLightKind::Point);
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            world.local_lights().len() < MAX_LOCAL_LIGHTS,
+                                            egui::Button::new("Add spot"),
+                                        )
+                                        .clicked()
+                                    {
+                                        add_local_light = Some(LocalLightKind::Spot);
+                                    }
+                                });
+                                ui.small(
+                                    "Select a light here or in the Scene hierarchy. Move it with the viewport gizmo.",
+                                );
+                                ui.separator();
+                                if world.local_lights().is_empty() {
+                                    ui.weak("No lights yet. Add a point light or a spotlight.");
+                                }
+                                for index in 0..world.local_lights().len() {
+                                    let (name, kind) = {
+                                        let light = &world.local_lights()[index];
+                                        (light.name.clone(), light.kind)
+                                    };
+                                    ui.horizontal(|ui| {
+                                        let kind = match kind {
+                                            LocalLightKind::Point => "Point",
+                                            LocalLightKind::Spot => "Spot",
+                                        };
+                                        if ui
+                                            .selectable_label(
+                                                selected_scene_item
+                                                    == Some(SceneSelection::Light(index)),
+                                                format!("{kind}: {name}"),
+                                            )
+                                            .clicked()
+                                        {
+                                            selected_scene_item =
+                                                Some(SceneSelection::Light(index));
+                                        }
+                                        if let Some(light) = world.local_light_mut(index) {
+                                            ui.checkbox(&mut light.enabled, "Enabled");
+                                        }
+                                    });
+                                }
+
+                                if let Some(SceneSelection::Light(index)) = selected_scene_item {
+                                    if index < world.local_lights().len() {
+                                        ui.separator();
+                                        let parent_before = world.local_light_parent(index);
+                                        let mut selected_parent = parent_before;
+                                        let parent_options: Vec<_> = world
+                                            .model_group_ids()
+                                            .iter()
+                                            .filter_map(|&id| {
+                                                world.model_group(id).map(|group| {
+                                                    let kind = if group.source_path.is_some() {
+                                                        "Model"
+                                                    } else if world.gltf_node_index(id).is_some() {
+                                                        "glTF node"
+                                                    } else {
+                                                        "Empty node"
+                                                    };
+                                                    (id, format!("{kind}: {}", group.name))
+                                                })
+                                            })
+                                            .collect();
+                                        let parent_label = parent_before
+                                            .and_then(|id| {
+                                                parent_options
+                                                    .iter()
+                                                    .find(|(candidate, _)| *candidate == id)
+                                                    .map(|(_, label)| label.as_str())
+                                            })
+                                            .unwrap_or("World (unparented)");
+                                        ui.label("Attach to");
+                                        egui::ComboBox::from_id_salt(("light-parent", index))
+                                            .selected_text(parent_label)
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut selected_parent,
+                                                    None,
+                                                    "World (unparented)",
+                                                );
+                                                for (id, label) in &parent_options {
+                                                    ui.selectable_value(
+                                                        &mut selected_parent,
+                                                        Some(*id),
+                                                        label,
+                                                    );
+                                                }
+                                            });
+                                        if selected_parent != parent_before {
+                                            if let Err(error) = world
+                                                .set_local_light_parent(index, selected_parent)
+                                            {
+                                                selected_parent = parent_before;
+                                                self.scene_status = Some(Err(error));
+                                            }
+                                        }
+
+                                        let mut aim_at_origin = false;
+                                        {
+                                            let light = world
+                                                .local_light_mut(index)
+                                                .expect("selected local light must exist");
+                                            ui.horizontal(|ui| {
+                                                ui.checkbox(&mut light.enabled, "Enabled");
+                                                if ui.button("Delete").clicked() {
+                                                    delete_selection = true;
+                                                }
+                                            });
+                                            ui.label("Name");
+                                            ui.text_edit_singleline(&mut light.name);
+                                            egui::ComboBox::from_id_salt(("light-kind", index))
+                                                .selected_text(match light.kind {
+                                                    LocalLightKind::Point => "Point light",
+                                                    LocalLightKind::Spot => "Spotlight",
+                                                })
+                                                .show_ui(ui, |ui| {
+                                                    ui.selectable_value(
+                                                        &mut light.kind,
+                                                        LocalLightKind::Point,
+                                                        "Point light",
+                                                    );
+                                                    ui.selectable_value(
+                                                        &mut light.kind,
+                                                        LocalLightKind::Spot,
+                                                        "Spotlight",
+                                                    );
+                                                });
+                                            let position_label = if selected_parent.is_some() {
+                                                "Local position"
+                                            } else {
+                                                "World position"
+                                            };
+                                            if edit_vec3_fields(
+                                                ui,
+                                                position_label,
+                                                &mut light.position,
+                                            ) {
+                                                scene_modified = true;
+                                            }
+                                            ui.horizontal(|ui| {
+                                                ui.label("Color");
+                                                if ui
+                                                    .color_edit_button_rgb(&mut light.color)
+                                                    .changed()
+                                                {
+                                                    scene_modified = true;
+                                                }
+                                            });
+                                            if ui
+                                                .add(
+                                                    egui::Slider::new(
+                                                        &mut light.intensity,
+                                                        0.0..=1000.0,
+                                                    )
+                                                    .text("Intensity"),
+                                                )
+                                                .changed()
+                                            {
+                                                scene_modified = true;
+                                            }
+                                            if ui
+                                                .add(
+                                                    egui::Slider::new(
+                                                        &mut light.range,
+                                                        0.1..=1000.0,
+                                                    )
+                                                    .text("Range"),
+                                                )
+                                                .changed()
+                                            {
+                                                scene_modified = true;
+                                            }
+                                            if light.kind == LocalLightKind::Spot {
+                                                if edit_vec3_fields(
+                                                    ui,
+                                                    "Direction",
+                                                    &mut light.direction,
+                                                ) {
+                                                    scene_modified = true;
+                                                }
+                                                let direction = Vec3::from_array(light.direction);
+                                                if !direction.is_finite()
+                                                    || direction.length_squared() <= f32::EPSILON
+                                                {
+                                                    light.direction = [0.0, -1.0, 0.0];
+                                                    ui.colored_label(
+                                                        egui::Color32::LIGHT_RED,
+                                                        "Zero direction reset downward.",
+                                                    );
+                                                }
+                                                if ui.button("Aim at scene origin").clicked() {
+                                                    aim_at_origin = true;
+                                                }
+                                                let outer_angle = light.outer_cone_degrees;
+                                                if ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut light.inner_cone_degrees,
+                                                            0.0..=outer_angle,
+                                                        )
+                                                        .text("Inner cone"),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    scene_modified = true;
+                                                }
+                                                let inner_angle = light.inner_cone_degrees;
+                                                if ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut light.outer_cone_degrees,
+                                                            inner_angle..=89.0,
+                                                        )
+                                                        .text("Outer cone"),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    scene_modified = true;
+                                                }
+                                            }
+                                            if !light.is_valid() {
+                                                ui.colored_label(
+                                                    egui::Color32::LIGHT_RED,
+                                                    "Invalid light settings. Check the name and direction.",
+                                                );
+                                            }
+                                        }
+                                        if aim_at_origin {
+                                            match world.aim_local_light_at(index, Vec3::ZERO) {
+                                                Ok(()) => scene_modified = true,
+                                                Err(error) => self.scene_status = Some(Err(error)),
+                                            }
+                                        }
+                                        ui.small(
+                                            "Move gizmo: position | Rotate gizmo: spotlight direction | Scale gizmo: range",
+                                        );
+                                    }
+                                } else {
+                                    ui.weak("Choose a light from the list or Scene hierarchy to edit it.");
+                                }
                             } else if self.active_tab == EditorTab::Animation {
                                 draw_animation_panel(
                                     ui,
@@ -2910,7 +3342,7 @@ impl DebugUi {
                     let viewport_rect = ui.max_rect();
                     self.viewport_rect = Some(viewport_rect);
                     let had_gizmo_drag = self.gizmo_drag.is_some();
-                    scene_modified |= paint_scene_gizmo(
+                    let gizmo_changed = paint_scene_gizmo(
                         ui,
                         viewport_rect,
                         context.screen_rect(),
@@ -2920,6 +3352,7 @@ impl DebugUi {
                         self.gizmo_mode,
                         &mut self.gizmo_drag,
                     );
+                    scene_modified |= gizmo_changed;
                     if !had_gizmo_drag && self.gizmo_drag.is_some() {
                         self.history.record(
                             world,
@@ -2989,6 +3422,34 @@ impl DebugUi {
                     });
             }
         });
+        let local_light_collection_change_requested = add_local_light.is_some();
+        if let Some(kind) = add_local_light {
+            let forward = Vec3::new(
+                camera.yaw.cos() * camera.pitch.cos(),
+                camera.pitch.sin(),
+                camera.yaw.sin() * camera.pitch.cos(),
+            )
+            .normalize();
+            let position = (camera.eye + forward * 3.0).to_array();
+            let name = match kind {
+                LocalLightKind::Point => format!("Point Light {}", world.local_lights().len() + 1),
+                LocalLightKind::Spot => format!("Spot Light {}", world.local_lights().len() + 1),
+            };
+            let light = match kind {
+                LocalLightKind::Point => LocalLight::point(name, position),
+                LocalLightKind::Spot => LocalLight::spot(name, position, forward.to_array()),
+            };
+            match world.add_local_light(light) {
+                Ok(index) => selected_scene_item = Some(SceneSelection::Light(index)),
+                Err(error) => self.scene_status = Some(Err(error)),
+            }
+        }
+        let local_lights_after = world.local_lights().to_vec();
+        let local_lights_changed = local_lights_after != local_lights_before;
+        if local_lights_changed {
+            world.set_local_lights(local_lights_before.clone());
+        }
+        self.selected_scene_item = selected_scene_item;
         if let Some(group_id) = pause_morph_animation
             && let Some(group) = world.model_group_mut(group_id)
             && let Some(playback) = group.animation.as_mut()
@@ -3047,17 +3508,40 @@ impl DebugUi {
                 changed_morph_weights = Some((object_id, after));
             }
         }
-        if render_state_modified
+        let other_undoable_change = render_state_modified
             || changed_name.is_some()
             || changed_animation.is_some()
             || changed_parent.is_some()
-            || changed_morph_weights.is_some()
-        {
+            || changed_morph_weights.is_some();
+        if other_undoable_change {
             self.history.record(
                 world,
                 selected_scene_item,
                 &RenderSnapshot::capture(renderer),
             );
+        } else if local_lights_changed {
+            if local_light_collection_change_requested {
+                self.history.record(
+                    world,
+                    selected_scene_item,
+                    &RenderSnapshot::capture(renderer),
+                );
+            } else if let Some(SceneSelection::Light(index)) = selected_scene_item {
+                let pointer_down = self.context.input(|input| input.pointer.any_down());
+                self.history.record_local_light(
+                    world,
+                    selected_scene_item,
+                    index,
+                    pointer_down,
+                    &RenderSnapshot::capture(renderer),
+                );
+            } else {
+                self.history.record(
+                    world,
+                    selected_scene_item,
+                    &RenderSnapshot::capture(renderer),
+                );
+            }
         }
         if let Some((selection, after)) = changed_name
             && let Some(name) = selected_name_mut(world, selection)
@@ -3082,6 +3566,10 @@ impl DebugUi {
                 .model_group_mut(group_id)
                 .expect("reparented model group must remain available")
                 .transform = after_transform;
+        }
+        if local_lights_changed {
+            world.set_local_lights(local_lights_after);
+            scene_modified = true;
         }
         scene_modified |= render_state_modified;
         if render_state_modified {
@@ -3116,6 +3604,7 @@ impl DebugUi {
         }
         if !self.context.input(|input| input.pointer.any_down()) {
             self.history.active_transform_selection = None;
+            self.history.active_local_light = None;
         }
         if undo_requested {
             let mut render_state = RenderSnapshot::capture(renderer);
@@ -3205,6 +3694,9 @@ impl DebugUi {
                     Some(SceneSelection::Object(id)) => {
                         world.duplicate_object(id).map(SceneSelection::Object)
                     }
+                    Some(SceneSelection::Light(index)) => world
+                        .duplicate_local_light(index)
+                        .map(SceneSelection::Light),
                     None => None,
                 };
                 scene_modified |= duplicate.is_some();
@@ -3224,6 +3716,9 @@ impl DebugUi {
                     }
                     Some(SceneSelection::Part(id) | SceneSelection::Object(id)) => {
                         world.remove_object(id);
+                    }
+                    Some(SceneSelection::Light(index)) => {
+                        world.remove_local_light(index);
                     }
                     None => {}
                 }
@@ -3442,6 +3937,47 @@ mod tests {
             settings: RendererSettings::default(),
             materials: vec![MaterialParams::default()],
         }
+    }
+
+    #[test]
+    fn undo_redo_restores_local_light_edits() {
+        let mut world = World::new();
+        world
+            .add_local_light(LocalLight::point("Key", [0.0, 1.0, 0.0]))
+            .unwrap();
+        let mut history = UndoHistory::default();
+        history.record(&world, None, &test_render_state());
+
+        world.local_light_mut(0).unwrap().intensity = 24.0;
+        let mut selection = None;
+        let mut render_state = test_render_state();
+        assert!(history.undo(&mut world, &mut selection, &mut render_state));
+        assert_eq!(world.local_lights()[0].intensity, 12.0);
+        assert!(history.redo(&mut world, &mut selection, &mut render_state));
+        assert_eq!(world.local_lights()[0].intensity, 24.0);
+    }
+
+    #[test]
+    fn local_light_drag_is_one_undoable_change() {
+        let mut world = World::new();
+        world
+            .add_local_light(LocalLight::point("Key", [0.0, 1.0, 0.0]))
+            .unwrap();
+        let mut history = UndoHistory::default();
+        let render_state = test_render_state();
+        let selection = Some(SceneSelection::Light(0));
+
+        history.record_local_light(&world, selection, 0, true, &render_state);
+        world.local_light_mut(0).unwrap().position[0] = 1.0;
+        history.record_local_light(&world, selection, 0, true, &render_state);
+        world.local_light_mut(0).unwrap().position[0] = 2.0;
+
+        let mut selected = selection;
+        let mut render_state = test_render_state();
+        assert!(history.undo(&mut world, &mut selected, &mut render_state));
+        assert_eq!(world.local_lights()[0].position, [0.0, 1.0, 0.0]);
+        assert!(history.redo(&mut world, &mut selected, &mut render_state));
+        assert_eq!(world.local_lights()[0].position, [2.0, 1.0, 0.0]);
     }
 
     #[test]

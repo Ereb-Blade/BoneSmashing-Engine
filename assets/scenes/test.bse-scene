@@ -1,0 +1,287 @@
+
+{
+  "version": 9,
+  "groups": [
+    {
+      "name": "Concept Vehicle",
+      "path": "../models/CarConcept/CarConcept.glb",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.5, 1.5, 1.5]
+    }
+  ],
+  "lights": [
+    {
+      "name": "Main showroom light",
+      "kind": "spot",
+      "enabled": true,
+      "position": [0.0, 6.0, 2.0],
+      "direction": [0.0, -0.9, -0.35],
+      "color": [0.75, 0.85, 1.0],
+      "intensity": 100.0,
+      "range": 15.0,
+      "inner_cone_degrees": 25.0,
+      "outer_cone_degrees": 55.0
+    },
+    {
+      "name": "Left cyan rim",
+      "kind": "spot",
+      "enabled": true,
+      "position": [-4.5, 3.5, -3.0],
+      "direction": [0.65, -0.45, 0.6],
+      "color": [0.0, 0.65, 1.0],
+      "intensity": 95.0,
+      "range": 12.0,
+      "inner_cone_degrees": 20.0,
+      "outer_cone_degrees": 50.0
+    },
+    {
+      "name": "Right orange rim",
+      "kind": "spot",
+      "enabled": true,
+      "position": [4.5, 3.5, -3.0],
+      "direction": [-0.65, -0.45, 0.6],
+      "color": [1.0, 0.24, 0.055],
+      "intensity": 95.0,
+      "range": 12.0,
+      "inner_cone_degrees": 20.0,
+      "outer_cone_degrees": 50.0
+    },
+    {
+      "name": "Front softbox",
+      "kind": "point",
+      "enabled": true,
+      "position": [0.0, 3.0, 5.0],
+      "direction": [0.0, -1.0, 0.0],
+      "color": [0.8, 0.9, 1.0],
+      "intensity": 65.0,
+      "range": 12.0,
+      "inner_cone_degrees": 20.0,
+      "outer_cone_degrees": 30.0
+    },
+    {
+      "name": "Rear magenta accent",
+      "kind": "point",
+      "enabled": true,
+      "position": [0.0, 2.5, -5.0],
+      "direction": [0.0, -1.0, 0.0],
+      "color": [1.0, 0.035, 0.35],
+      "intensity": 55.0,
+      "range": 10.0,
+      "inner_cone_degrees": 20.0,
+      "outer_cone_degrees": 30.0
+    },
+    {
+      "name": "Left floor accent",
+      "kind": "point",
+      "enabled": true,
+      "position": [-5.0, 1.5, 0.0],
+      "direction": [0.0, -1.0, 0.0],
+      "color": [0.0, 0.55, 1.0],
+      "intensity": 35.0,
+      "range": 8.0,
+      "inner_cone_degrees": 20.0,
+      "outer_cone_degrees": 30.0
+    },
+    {
+      "name": "Right floor accent",
+      "kind": "point",
+      "enabled": true,
+      "position": [5.0, 1.5, 0.0],
+      "direction": [0.0, -1.0, 0.0],
+      "color": [1.0, 0.25, 0.06],
+      "intensity": 35.0,
+      "range": 8.0,
+      "inner_cone_degrees": 20.0,
+      "outer_cone_degrees": 30.0
+    }
+  ],
+  "objects": [
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 0,
+        "material_id": 0
+      },
+      "name": "Showroom ground",
+      "position": [0.0, -0.15, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [8.0, 0.15, 8.0]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 0,
+        "material_id": 0
+      },
+      "name": "Main vehicle platform",
+      "position": [0.0, 0.10, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [2.8, 0.10, 3.5]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 0,
+        "material_id": 0
+      },
+      "name": "Platform lower trim",
+      "position": [0.0, -0.02, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [3.0, 0.06, 3.7]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 0,
+        "material_id": 0
+      },
+      "name": "Platform cyan front strip",
+      "position": [0.0, 0.215, 3.2],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [2.4, 0.025, 0.035]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 0,
+        "material_id": 0
+      },
+      "name": "Platform cyan left strip",
+      "position": [-2.65, 0.215, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [0.035, 0.025, 2.8]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 0,
+        "material_id": 0
+      },
+      "name": "Platform orange right strip",
+      "position": [2.65, 0.215, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [0.035, 0.025, 2.8]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 0,
+        "material_id": 0
+      },
+      "name": "Platform rear strip",
+      "position": [0.0, 0.215, -3.2],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [2.4, 0.025, 0.035]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 0,
+        "material_id": 0
+      },
+      "name": "Left architectural pillar",
+      "position": [-6.5, 2.5, -4.5],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [0.25, 2.5, 0.25]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 0,
+        "material_id": 0
+      },
+      "name": "Right architectural pillar",
+      "position": [6.5, 2.5, -4.5],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [0.25, 2.5, 0.25]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 0,
+        "material_id": 0
+      },
+      "name": "Left front pillar",
+      "position": [-6.5, 2.5, 4.5],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [0.25, 2.5, 0.25]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 0,
+        "material_id": 0
+      },
+      "name": "Right front pillar",
+      "position": [6.5, 2.5, 4.5],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [0.25, 2.5, 0.25]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 0,
+        "material_id": 0
+      },
+      "name": "Rear decorative beam",
+      "position": [0.0, 4.8, -5.5],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [6.0, 0.12, 0.12]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 0,
+        "material_id": 0
+      },
+      "name": "Left neon tower",
+      "position": [-5.8, 1.8, -1.5],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [0.12, 1.8, 0.12]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 0,
+        "material_id": 0
+      },
+      "name": "Right neon tower",
+      "position": [5.8, 1.8, -1.5],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [0.12, 1.8, 0.12]
+    },
+    {
+      "source": {
+        "type": "asset",
+        "path": "../models/CarConcept/CarConcept.glb",
+        "instance_index": 0
+      },
+      "model_group": 0,
+      "name": "Hero Concept Vehicle",
+      "position": [0.0, 0.25, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.0, 1.0, 1.0]
+    }
+  ],
+  "camera": {
+    "position": [0.0, 3.6, 10.5],
+    "yaw": -1.5707964,
+    "pitch": -0.19,
+    "up": [0.0, 1.0, 0.0]
+  },
+  "renderer_settings": {
+    "key_light_yaw_degrees": -135.0,
+    "key_light_elevation_degrees": -48.0,
+    "key_light_intensity": 0.45,
+    "fill_light_intensity": 0.18,
+    "environment_intensity": 0.95,
+    "exposure_ev": 0.65,
+    "shadows_enabled": true,
+    "shadow_pcf_samples": 8,
+    "debug_view": 0,
+    "unlocked_fps": true,
+    "render_scale": 1.0,
+    "msaa_samples": 4
+  }
+}

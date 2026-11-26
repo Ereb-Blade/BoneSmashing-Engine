@@ -1,0 +1,8 @@
+CarConcept sample asset
+
+Copyright (c) 2015 Khronos Group, Khronos logo. (c) 2017, Khronos Group,
+3D Commerce logo. Asset is CC BY 4.0 International, created by Eric Chadwick
+of Darmstadt Graphics Group GmbH, 2024.
+
+License: https://creativecommons.org/licenses/by/4.0/
+Source: https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/CarConcept

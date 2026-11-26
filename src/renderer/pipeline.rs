@@ -52,6 +52,13 @@ struct Camera {
     view_pos: vec4<f32>,
 };
 
+struct LocalLight {
+    position_range: vec4<f32>,
+    color_intensity: vec4<f32>,
+    direction_type: vec4<f32>,
+    spot_angles: vec4<f32>,
+};
+
 struct Light {
     direction_intensity: vec4<f32>,
     color: vec4<f32>,
@@ -59,6 +66,8 @@ struct Light {
     fill_color: vec4<f32>,
     ambient_top: vec4<f32>,
     render_options: vec4<f32>,
+    local_light_info: vec4<u32>,
+    local_lights: array<LocalLight, 16>,
 };
 
 struct MaterialParams {
@@ -222,6 +231,57 @@ fn evaluate_direct_light(
     let diffuse_weight = (vec3<f32>(1.0) - fresnel) * (1.0 - metallic);
     let diffuse = diffuse_weight * base_color / PI;
     return (diffuse + specular) * radiance * n_dot_l;
+}
+
+fn evaluate_local_lights(
+    world_pos: vec3<f32>,
+    normal: vec3<f32>,
+    view_dir: vec3<f32>,
+    base_color: vec3<f32>,
+    metallic: f32,
+    roughness: f32,
+    f0: vec3<f32>,
+    specular_weight: vec3<f32>,
+) -> vec3<f32> {
+    var contribution = vec3<f32>(0.0);
+    for (var index = 0u; index < light.local_light_info.x; index += 1u) {
+        let local = light.local_lights[index];
+        let to_light = local.position_range.xyz - world_pos;
+        let distance_squared = dot(to_light, to_light);
+        if distance_squared <= 1e-8 {
+            continue;
+        }
+        let distance = sqrt(distance_squared);
+        let range = local.position_range.w;
+        if distance >= range {
+            continue;
+        }
+        let light_dir = to_light / distance;
+        var spot_factor = 1.0;
+        if local.direction_type.w > 0.5 {
+            let spot_cosine = dot(-light_dir, safe_normalize(local.direction_type.xyz, vec3<f32>(0.0, -1.0, 0.0)));
+            spot_factor = smoothstep(local.spot_angles.y, local.spot_angles.x, spot_cosine);
+            if spot_factor <= 0.0 {
+                continue;
+            }
+        }
+        let range_factor = clamp(1.0 - pow(distance / range, 4.0), 0.0, 1.0);
+        let attenuation = range_factor * range_factor / max(distance_squared, 0.01);
+        let radiance = local.color_intensity.rgb
+            * (local.color_intensity.w * attenuation * spot_factor);
+        contribution += evaluate_direct_light(
+            normal,
+            view_dir,
+            light_dir,
+            radiance,
+            base_color,
+            metallic,
+            roughness,
+            f0,
+            specular_weight,
+        );
+    }
+    return contribution;
 }
 
 fn environment_uv(direction: vec3<f32>) -> vec2<f32> {
@@ -825,6 +885,16 @@ fn fs_glass(
             roughness,
             f0,
             specular_weight,
+        )
+        + evaluate_local_lights(
+            v.world_pos,
+            normal,
+            view_dir,
+            vec3<f32>(0.0),
+            0.0,
+            roughness,
+            f0,
+            specular_weight,
         );
     var clearcoat_fresnel = vec3<f32>(0.0);
     var direct_clearcoat = vec3<f32>(0.0);
@@ -856,6 +926,16 @@ fn fs_glass(
                 vec3<f32>(0.04),
                 vec3<f32>(1.0),
             )
+        );
+        direct_clearcoat += clearcoat_factor * evaluate_local_lights(
+            v.world_pos,
+            clearcoat_normal,
+            view_dir,
+            vec3<f32>(0.0),
+            1.0,
+            clearcoat_roughness,
+            vec3<f32>(0.04),
+            vec3<f32>(1.0),
         );
     }
     let reflected_environment =
@@ -1143,6 +1223,16 @@ fn fs_main(
         f0,
         specular_weight,
     );
+    radiance += evaluate_local_lights(
+        v.world_pos,
+        normal,
+        view_dir,
+        surface_color.rgb,
+        metallic,
+        roughness,
+        f0,
+        specular_weight,
+    );
     var clearcoat_fresnel = vec3<f32>(0.0);
     var direct_clearcoat = vec3<f32>(0.0);
     if clearcoat_factor > 0.0 {
@@ -1173,6 +1263,16 @@ fn fs_main(
                 vec3<f32>(0.04),
                 vec3<f32>(1.0),
             )
+        );
+        direct_clearcoat += clearcoat_factor * evaluate_local_lights(
+            v.world_pos,
+            clearcoat_normal,
+            view_dir,
+            vec3<f32>(0.0),
+            1.0,
+            clearcoat_roughness,
+            vec3<f32>(0.04),
+            vec3<f32>(1.0),
         );
     }
 

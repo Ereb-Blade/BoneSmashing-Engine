@@ -13,6 +13,81 @@ pub struct ObjectId(pub usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ModelGroupId(pub usize);
 
+pub const MAX_LOCAL_LIGHTS: usize = 16;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalLightKind {
+    Point,
+    Spot,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalLight {
+    pub name: String,
+    pub kind: LocalLightKind,
+    pub enabled: bool,
+    pub position: [f32; 3],
+    pub direction: [f32; 3],
+    pub color: [f32; 3],
+    pub intensity: f32,
+    pub range: f32,
+    pub inner_cone_degrees: f32,
+    pub outer_cone_degrees: f32,
+    #[serde(skip)]
+    parent: Option<ModelGroupId>,
+}
+
+impl LocalLight {
+    pub fn point(name: impl Into<String>, position: [f32; 3]) -> Self {
+        Self {
+            name: name.into(),
+            kind: LocalLightKind::Point,
+            enabled: true,
+            position,
+            direction: [0.0, -1.0, 0.0],
+            color: [1.0, 0.85, 0.65],
+            intensity: 12.0,
+            range: 8.0,
+            inner_cone_degrees: 20.0,
+            outer_cone_degrees: 30.0,
+            parent: None,
+        }
+    }
+
+    pub fn spot(name: impl Into<String>, position: [f32; 3], direction: [f32; 3]) -> Self {
+        Self {
+            kind: LocalLightKind::Spot,
+            direction,
+            ..Self::point(name, position)
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        let position = Vec3::from_array(self.position);
+        let direction = Vec3::from_array(self.direction);
+        self.name
+            .chars()
+            .any(|character| !character.is_whitespace())
+            && position.is_finite()
+            && direction.is_finite()
+            && direction.length_squared() > f32::EPSILON
+            && self
+                .color
+                .iter()
+                .all(|component| component.is_finite() && (0.0..=1.0).contains(component))
+            && self.intensity.is_finite()
+            && (0.0..=1000.0).contains(&self.intensity)
+            && self.range.is_finite()
+            && (0.1..=1000.0).contains(&self.range)
+            && self.inner_cone_degrees.is_finite()
+            && self.outer_cone_degrees.is_finite()
+            && (0.0..=89.0).contains(&self.inner_cone_degrees)
+            && (self.inner_cone_degrees..=89.0).contains(&self.outer_cone_degrees)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ModelGroup {
     pub name: String,
@@ -136,6 +211,7 @@ impl ModelAnimationPlayback {
 
 #[derive(Clone)]
 pub struct World {
+    local_lights: Vec<LocalLight>,
     objects: Vec<RenderObject>,
     object_ids: Vec<ObjectId>,
     object_indices: HashMap<ObjectId, usize>,
@@ -163,6 +239,7 @@ impl Default for World {
 impl World {
     pub fn new() -> Self {
         Self {
+            local_lights: Vec::new(),
             objects: Vec::new(),
             object_ids: Vec::new(),
             object_indices: HashMap::new(),
@@ -256,6 +333,154 @@ impl World {
         let id = self.push_object(object);
         self.standalone_objects.push(id);
         id
+    }
+
+    pub fn local_lights(&self) -> &[LocalLight] {
+        &self.local_lights
+    }
+
+    pub fn local_light_mut(&mut self, index: usize) -> Option<&mut LocalLight> {
+        self.local_lights.get_mut(index)
+    }
+
+    pub fn local_light_parent(&self, index: usize) -> Option<ModelGroupId> {
+        self.local_lights.get(index).and_then(|light| light.parent)
+    }
+
+    pub fn local_light_world_position(&self, index: usize) -> Option<Vec3> {
+        let light = self.local_lights.get(index)?;
+        let parent_matrix = light
+            .parent
+            .map_or(glam::Mat4::IDENTITY, |id| self.model_group_world_matrix(id));
+        Some(parent_matrix.transform_point3(Vec3::from_array(light.position)))
+    }
+
+    pub fn local_light_world_direction(&self, index: usize) -> Option<Vec3> {
+        let light = self.local_lights.get(index)?;
+        let parent_matrix = light
+            .parent
+            .map_or(glam::Mat4::IDENTITY, |id| self.model_group_world_matrix(id));
+        Some(
+            parent_matrix
+                .transform_vector3(Vec3::from_array(light.direction))
+                .normalize_or_zero(),
+        )
+    }
+
+    pub fn aim_local_light_at(&mut self, index: usize, target: Vec3) -> Result<(), String> {
+        let position = self
+            .local_light_world_position(index)
+            .ok_or_else(|| "Local light does not exist".to_owned())?;
+        let world_direction = (target - position).normalize_or_zero();
+        if !world_direction.is_finite() || world_direction.length_squared() <= f32::EPSILON {
+            return Err("The target is too close to the local light".to_owned());
+        }
+        let parent = self.local_light_parent(index);
+        let parent_matrix =
+            parent.map_or(glam::Mat4::IDENTITY, |id| self.model_group_world_matrix(id));
+        let determinant = parent_matrix.determinant();
+        if !determinant.is_finite() || determinant.abs() <= f32::EPSILON {
+            return Err("Cannot aim a light under a parent with zero scale".to_owned());
+        }
+        let local_direction = parent_matrix
+            .inverse()
+            .transform_vector3(world_direction)
+            .normalize_or_zero();
+        if !local_direction.is_finite() || local_direction.length_squared() <= f32::EPSILON {
+            return Err("Could not aim the local light at the selected target".to_owned());
+        }
+        self.local_lights[index].direction = local_direction.to_array();
+        Ok(())
+    }
+
+    pub fn set_local_light_parent(
+        &mut self,
+        index: usize,
+        parent: Option<ModelGroupId>,
+    ) -> Result<(), String> {
+        let current_parent = self
+            .local_lights
+            .get(index)
+            .ok_or_else(|| "Local light does not exist".to_owned())?
+            .parent;
+        if current_parent == parent {
+            return Ok(());
+        }
+        if parent.is_some_and(|id| self.model_group(id).is_none()) {
+            return Err("Local light parent does not exist".to_owned());
+        }
+
+        let world_position = self
+            .local_light_world_position(index)
+            .expect("validated local light index must exist");
+        let world_direction = self
+            .local_light_world_direction(index)
+            .expect("validated local light index must exist");
+        let parent_matrix =
+            parent.map_or(glam::Mat4::IDENTITY, |id| self.model_group_world_matrix(id));
+        let determinant = parent_matrix.determinant();
+        if !determinant.is_finite() || determinant.abs() <= f32::EPSILON {
+            return Err("Cannot attach a light to a parent with zero scale".to_owned());
+        }
+
+        let inverse_parent = parent_matrix.inverse();
+        let local_position = inverse_parent.transform_point3(world_position);
+        let local_direction = inverse_parent
+            .transform_vector3(world_direction)
+            .normalize_or_zero();
+        if !local_position.is_finite()
+            || !local_direction.is_finite()
+            || local_direction.length_squared() <= f32::EPSILON
+        {
+            return Err("Could not preserve the local light's world transform".to_owned());
+        }
+
+        let light = &mut self.local_lights[index];
+        light.parent = parent;
+        light.position = local_position.to_array();
+        light.direction = local_direction.to_array();
+        Ok(())
+    }
+
+    pub fn add_local_light(&mut self, light: LocalLight) -> Result<usize, String> {
+        if self.local_lights.len() >= MAX_LOCAL_LIGHTS {
+            return Err(format!(
+                "A scene can contain at most {MAX_LOCAL_LIGHTS} local lights"
+            ));
+        }
+        if !light.is_valid() {
+            return Err("Cannot add a local light with invalid settings".to_owned());
+        }
+        let index = self.local_lights.len();
+        self.local_lights.push(light);
+        Ok(index)
+    }
+
+    pub(crate) fn add_local_light_with_parent(
+        &mut self,
+        mut light: LocalLight,
+        parent: Option<ModelGroupId>,
+    ) -> Result<usize, String> {
+        if parent.is_some_and(|id| self.model_group(id).is_none()) {
+            return Err("Local light parent does not exist".to_owned());
+        }
+        light.parent = parent;
+        self.add_local_light(light)
+    }
+
+    pub fn remove_local_light(&mut self, index: usize) -> Option<LocalLight> {
+        (index < self.local_lights.len()).then(|| self.local_lights.remove(index))
+    }
+
+    pub fn duplicate_local_light(&mut self, index: usize) -> Option<usize> {
+        let mut light = self.local_lights.get(index)?.clone();
+        light.name = format!("{} Copy", light.name);
+        light.position[0] += 0.5;
+        self.add_local_light(light).ok()
+    }
+
+    pub(crate) fn set_local_lights(&mut self, lights: Vec<LocalLight>) {
+        self.local_lights = lights;
     }
 
     fn push_object(&mut self, object: RenderObject) -> ObjectId {
@@ -708,6 +933,20 @@ impl World {
                     .and_then(|_| self.object_ids.get(index).copied())
             })
             .collect();
+        let attached_lights: Vec<_> = self
+            .local_lights
+            .iter()
+            .enumerate()
+            .filter_map(|(index, light)| {
+                light
+                    .parent
+                    .filter(|parent| descendants.contains(parent))
+                    .map(|_| index)
+            })
+            .collect();
+        for index in attached_lights.into_iter().rev() {
+            self.local_lights.remove(index);
+        }
         for object_id in attached_objects {
             self.remove_object_storage(object_id);
         }
@@ -899,6 +1138,99 @@ mod tests {
     use crate::core::{MaterialId, MeshId};
     use crate::scene::Transform;
     use glam::Vec3;
+
+    #[test]
+    fn local_lights_validate_settings_and_respect_the_scene_limit() {
+        let mut world = World::new();
+        let point = LocalLight::point("Point", [1.0, 2.0, 3.0]);
+        assert!(point.is_valid());
+        assert_eq!(world.add_local_light(point.clone()), Ok(0));
+        assert_eq!(world.remove_local_light(4), None);
+        assert_eq!(world.remove_local_light(0), Some(point));
+
+        assert!(
+            world
+                .add_local_light(LocalLight::spot(
+                    "Invalid spot",
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                ))
+                .is_err()
+        );
+        for index in 0..MAX_LOCAL_LIGHTS {
+            world
+                .add_local_light(LocalLight::point(format!("Point {index}"), [0.0, 0.0, 0.0]))
+                .unwrap();
+        }
+        assert_eq!(world.local_lights().len(), MAX_LOCAL_LIGHTS);
+        assert!(
+            world
+                .add_local_light(LocalLight::point("Overflow", [0.0, 0.0, 0.0]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn local_lights_follow_parents_and_keep_world_pose_when_reparented() {
+        let mut world = World::new();
+        let light_index = world
+            .add_local_light(LocalLight::spot(
+                "Follow light",
+                [1.0, 2.0, 3.0],
+                [0.0, -1.0, 0.0],
+            ))
+            .unwrap();
+        let parent = world.add_empty_node(
+            "Moving node",
+            Transform::new(
+                Vec3::new(4.0, 0.0, -2.0),
+                Quat::from_rotation_y(0.7),
+                Vec3::ONE,
+            ),
+        );
+        let world_position = world.local_light_world_position(light_index).unwrap();
+        let world_direction = world.local_light_world_direction(light_index).unwrap();
+
+        world
+            .set_local_light_parent(light_index, Some(parent))
+            .unwrap();
+        assert!(
+            world
+                .local_light_world_position(light_index)
+                .unwrap()
+                .abs_diff_eq(world_position, 1e-5)
+        );
+        assert!(
+            world
+                .local_light_world_direction(light_index)
+                .unwrap()
+                .abs_diff_eq(world_direction, 1e-5)
+        );
+
+        world.model_group_mut(parent).unwrap().transform.position += Vec3::X;
+        assert!(
+            world
+                .local_light_world_position(light_index)
+                .unwrap()
+                .abs_diff_eq(world_position + Vec3::X, 1e-5)
+        );
+    }
+
+    #[test]
+    fn removing_a_parent_also_removes_its_local_lights() {
+        let mut world = World::new();
+        let parent = world.add_empty_node("Parent", Transform::default());
+        let light_index = world
+            .add_local_light(LocalLight::point("Child light", [1.0, 2.0, 3.0]))
+            .unwrap();
+        world
+            .set_local_light_parent(light_index, Some(parent))
+            .unwrap();
+
+        world.remove_model_group(parent);
+
+        assert!(world.local_lights().is_empty());
+    }
 
     #[test]
     fn keyboard_animation_control_is_opt_in_and_maps_named_clips() {

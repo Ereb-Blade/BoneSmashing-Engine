@@ -1,0 +1,116 @@
+{
+  "version": 8,
+  "groups": [
+    {
+      "name": "Fox - Survey",
+      "path": "../models/Fox/Fox.glb",
+      "position": [-1.6, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [0.012, 0.012, 0.012],
+      "animation": {
+        "clip_index": 0,
+        "speed": 1.0,
+        "looping": true,
+        "playing": true,
+        "crossfade_duration": 0.45
+      }
+    },
+    {
+      "name": "Fox - Walk",
+      "path": "../models/Fox/Fox.glb",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [0.012, 0.012, 0.012],
+      "animation": {
+        "clip_index": 1,
+        "speed": 1.0,
+        "looping": true,
+        "playing": true,
+        "crossfade_duration": 0.45
+      }
+    },
+    {
+      "name": "Fox - Run",
+      "path": "../models/Fox/Fox.glb",
+      "position": [1.6, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [0.012, 0.012, 0.012],
+      "animation": {
+        "clip_index": 2,
+        "speed": 1.0,
+        "looping": true,
+        "playing": true,
+        "crossfade_duration": 0.45
+      }
+    }
+  ],
+  "objects": [
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 1,
+        "material_id": 0
+      },
+      "name": "Test floor",
+      "position": [0.0, -0.02, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "source": {
+        "type": "asset",
+        "path": "../models/Fox/Fox.glb",
+        "instance_index": 0
+      },
+      "model_group": 0,
+      "name": "Fox Survey mesh",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "source": {
+        "type": "asset",
+        "path": "../models/Fox/Fox.glb",
+        "instance_index": 0
+      },
+      "model_group": 1,
+      "name": "Fox Walk mesh",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "source": {
+        "type": "asset",
+        "path": "../models/Fox/Fox.glb",
+        "instance_index": 0
+      },
+      "model_group": 2,
+      "name": "Fox Run mesh",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.0, 1.0, 1.0]
+    }
+  ],
+  "camera": {
+    "position": [0.0, 1.45, 5.2],
+    "yaw": -1.5707964,
+    "pitch": -0.12,
+    "up": [0.0, 1.0, 0.0]
+  },
+  "renderer_settings": {
+    "key_light_yaw_degrees": -142.0,
+    "key_light_elevation_degrees": -53.0,
+    "key_light_intensity": 2.0,
+    "fill_light_intensity": 0.25,
+    "environment_intensity": 0.85,
+    "exposure_ev": -0.5,
+    "shadows_enabled": true,
+    "shadow_pcf_samples": 8,
+    "debug_view": 0,
+    "unlocked_fps": true,
+    "render_scale": 1.0,
+    "msaa_samples": 1
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "version": 7,
+  "groups": [],
+  "objects": [
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 1,
+        "material_id": 0
+      },
+      "name": "Benchmark floor",
+      "position": [0.0, -1.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 2,
+        "material_id": 4
+      },
+      "name": "Benchmark gold sphere",
+      "position": [-2.0, -0.32, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [0.68, 0.68, 0.68]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 2,
+        "material_id": 3
+      },
+      "name": "Benchmark silver sphere",
+      "position": [0.0, -0.32, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [0.68, 0.68, 0.68]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 2,
+        "material_id": 5
+      },
+      "name": "Benchmark glass sphere",
+      "position": [2.0, -0.32, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [0.68, 0.68, 0.68]
+    }
+  ],
+  "camera": {
+    "position": [0.0, 2.0, 6.0],
+    "yaw": -1.5707964,
+    "pitch": -0.2617994,
+    "up": [0.0, 1.0, 0.0]
+  },
+  "renderer_settings": {
+    "key_light_yaw_degrees": -142.0,
+    "key_light_elevation_degrees": -53.0,
+    "key_light_intensity": 2.0,
+    "fill_light_intensity": 0.25,
+    "environment_intensity": 0.85,
+    "exposure_ev": -0.5,
+    "shadows_enabled": true,
+    "shadow_pcf_samples": 8,
+    "debug_view": 0,
+    "unlocked_fps": true,
+    "render_scale": 1.0,
+    "msaa_samples": 1
+  }
+}

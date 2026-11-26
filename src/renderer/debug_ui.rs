@@ -6,8 +6,9 @@ use crate::core::{MATERIAL_DEFAULT, MESH_CUBE};
 use crate::renderer::material::MaterialParams;
 use crate::renderer::state::{ParsedAsset, RenderTimings, Renderer, RendererSettings, parse_asset};
 use crate::scene::{
-    LoadedScene, ModelGroupId, ObjectId, RenderObject, SceneEnvironment, Transform, World,
-    load_scene,
+    LoadedScene, MAX_ANIMATION_CROSSFADE_SECONDS, ModelAnimationClip, ModelAnimationPlayback,
+    ModelAnimationTransition, ModelGroupId, ObjectId, RenderObject, SceneEnvironment, Transform,
+    World, load_scene,
 };
 use glam::{EulerRot, Mat4, Quat, Vec3};
 use serde::Serialize;
@@ -54,7 +55,266 @@ enum SceneSelection {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EditorTab {
     Scene,
+    Animation,
     Render,
+}
+
+fn animation_clip_selector(
+    ui: &mut egui::Ui,
+    group_id: ModelGroupId,
+    control: &str,
+    clips: &[ModelAnimationClip],
+    selected_clip: &mut usize,
+) {
+    let selected_name = clips
+        .get(*selected_clip)
+        .map(|clip| clip.name.as_str())
+        .unwrap_or("Missing animation");
+    egui::ComboBox::from_id_salt(("keyboard-animation-clip", group_id.0, control))
+        .selected_text(selected_name)
+        .show_ui(ui, |ui| {
+            for (index, clip) in clips.iter().enumerate() {
+                ui.selectable_value(selected_clip, index, &clip.name);
+            }
+        });
+}
+
+fn draw_animation_panel(
+    ui: &mut egui::Ui,
+    selection: Option<SceneSelection>,
+    world: &mut World,
+    morph_filter: &mut String,
+    animation_change: &mut Option<(ModelGroupId, ModelAnimationPlayback)>,
+    pause_morph_animation: &mut Option<ModelGroupId>,
+    morph_weights_change: &mut Option<(SceneSelection, Vec<f32>)>,
+    scene_modified: &mut bool,
+) {
+    let animation_group = match selection {
+        Some(SceneSelection::Model(group_id)) => Some(group_id),
+        Some(SceneSelection::Part(object_id) | SceneSelection::Object(object_id)) => world
+            .get_object(object_id)
+            .and_then(RenderObject::model_group),
+        None => None,
+    };
+
+    ui.heading("Clip playback");
+    if let Some(group_id) = animation_group {
+        let group_name = world
+            .model_group(group_id)
+            .map(|group| group.name.as_str())
+            .unwrap_or("Model");
+        ui.label(format!("Model: {group_name}"));
+        if let Some(group) = world.model_group_mut(group_id) {
+            if let Some(playback) = group.animation.as_mut() {
+                let before = *playback;
+                let selected_clip_name = group
+                    .animation_clips
+                    .get(playback.clip_index)
+                    .map(|clip| clip.name.as_str())
+                    .unwrap_or("Missing animation");
+                let mut selected_clip_index = playback.clip_index;
+                ui.add_enabled_ui(playback.transition.is_none(), |ui| {
+                    egui::ComboBox::from_id_salt(("model-animation-clip", group_id.0))
+                        .selected_text(selected_clip_name)
+                        .show_ui(ui, |ui| {
+                            for (index, clip) in group.animation_clips.iter().enumerate() {
+                                ui.selectable_value(&mut selected_clip_index, index, &clip.name);
+                            }
+                        });
+                });
+                if selected_clip_index != playback.clip_index {
+                    playback.switch_to_clip(selected_clip_index);
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(if playback.playing { "Pause" } else { "Play" })
+                        .clicked()
+                    {
+                        if !playback.playing
+                            && !playback.looping
+                            && group
+                                .animation_clips
+                                .get(playback.clip_index)
+                                .is_some_and(|clip| playback.time >= clip.duration)
+                        {
+                            playback.time = 0.0;
+                        }
+                        playback.playing = !playback.playing;
+                    }
+                    if ui.button("Restart").clicked() {
+                        playback.time = 0.0;
+                    }
+                });
+                ui.checkbox(&mut playback.looping, "Loop");
+                ui.add(egui::Slider::new(&mut playback.speed, 0.1..=4.0).text("Speed"));
+                ui.collapsing("Keyboard controller", |ui| {
+                    ui.add_enabled_ui(group.animation_clips.len() > 1, |ui| {
+                        ui.checkbox(
+                            &mut playback.keyboard_control.enabled,
+                            "Enable for this model",
+                        );
+                    });
+                    if group.animation_clips.len() <= 1 {
+                        ui.weak("At least two animation clips are required.");
+                    }
+                    ui.weak("Click the viewport; W selects Walk, Shift selects Run.");
+                    ui.weak("Releasing both keys returns to Idle.");
+                    ui.horizontal(|ui| {
+                        ui.label("Idle / released");
+                        animation_clip_selector(
+                            ui,
+                            group_id,
+                            "idle",
+                            &group.animation_clips,
+                            &mut playback.keyboard_control.idle_clip_index,
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("W");
+                        animation_clip_selector(
+                            ui,
+                            group_id,
+                            "walk",
+                            &group.animation_clips,
+                            &mut playback.keyboard_control.walk_clip_index,
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Shift");
+                        animation_clip_selector(
+                            ui,
+                            group_id,
+                            "run",
+                            &group.animation_clips,
+                            &mut playback.keyboard_control.run_clip_index,
+                        );
+                    });
+                });
+                ui.add(
+                    egui::Slider::new(
+                        &mut playback.crossfade_duration,
+                        0.0..=MAX_ANIMATION_CROSSFADE_SECONDS,
+                    )
+                    .text("Cross-fade (s)"),
+                );
+                if let Some(transition) = playback.transition {
+                    ui.add(
+                        egui::ProgressBar::new(ModelAnimationTransition::progress(transition))
+                            .text(format!("Cross-fading to {selected_clip_name}")),
+                    );
+                }
+                if let Some(clip) = group.animation_clips.get(playback.clip_index)
+                    && clip.duration > 0.0
+                {
+                    ui.add(egui::Slider::new(&mut playback.time, 0.0..=clip.duration).text("Time"));
+                }
+                if playback.clip_index != before.clip_index
+                    || playback.speed != before.speed
+                    || playback.looping != before.looping
+                    || playback.playing != before.playing
+                    || playback.crossfade_duration != before.crossfade_duration
+                    || playback.keyboard_control != before.keyboard_control
+                {
+                    *animation_change = Some((group_id, before));
+                    *scene_modified = true;
+                }
+            } else {
+                ui.weak("This model has no animation clips.");
+            }
+        }
+    } else {
+        ui.weak("Select an animated model or model part in the Scene tab.");
+    }
+
+    ui.separator();
+    ui.heading("Morph targets");
+    if let Some(selection @ (SceneSelection::Part(object_id) | SceneSelection::Object(object_id))) =
+        selection
+    {
+        let morph_animation_group = world
+            .get_object(object_id)
+            .and_then(RenderObject::model_group);
+        let (animation_playing, animation_transitioning) = morph_animation_group
+            .and_then(|id| world.model_group(id))
+            .and_then(|group| group.animation)
+            .map_or((false, false), |playback| {
+                (playback.playing, playback.transition.is_some())
+            });
+        let animation_active = animation_playing || animation_transitioning;
+        if let Some(object) = world.get_object_mut(object_id) {
+            let morph_before = object.morph_weights().to_vec();
+            if morph_before.is_empty() {
+                ui.weak("This object has no morph targets.");
+            } else {
+                let active_count = morph_before.iter().filter(|weight| **weight != 0.0).count();
+                ui.label(format!(
+                    "{} targets, {active_count} active",
+                    morph_before.len()
+                ));
+                let mut reset_weights = false;
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!animation_active, egui::Button::new("Reset all"))
+                        .clicked()
+                    {
+                        reset_weights = true;
+                    }
+                    if animation_playing && ui.button("Pause animation").clicked() {
+                        *pause_morph_animation = morph_animation_group;
+                    }
+                });
+                if animation_playing {
+                    ui.weak("Pause animation before editing weights.");
+                } else if animation_transitioning {
+                    ui.weak("Wait for the cross-fade to finish before editing weights.");
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Filter");
+                    ui.text_edit_singleline(morph_filter);
+                    if ui.button("Clear").clicked() {
+                        morph_filter.clear();
+                    }
+                });
+                let target_names = object.morph_target_names().to_vec();
+                let filter = morph_filter.trim().to_lowercase();
+                let mut matched_target = false;
+                ui.add_enabled_ui(!animation_active, |ui| {
+                    if reset_weights {
+                        object.morph_weights_mut().fill(0.0);
+                    }
+                    for (index, weight) in object.morph_weights_mut().iter_mut().enumerate() {
+                        let label = target_names
+                            .get(index)
+                            .map(String::as_str)
+                            .filter(|name| !name.is_empty())
+                            .map(|name| format!("{}. {}", index + 1, name))
+                            .unwrap_or_else(|| format!("Target {}", index + 1));
+                        if !filter.is_empty() && !label.to_lowercase().contains(&filter) {
+                            continue;
+                        }
+                        matched_target = true;
+                        if ui
+                            .add(egui::Slider::new(weight, 0.0..=1.0).text(label))
+                            .changed()
+                        {
+                            *scene_modified = true;
+                        }
+                    }
+                });
+                if !filter.is_empty() && !matched_target {
+                    ui.weak("No targets match this filter.");
+                }
+                if reset_weights && morph_before.iter().any(|weight| *weight != 0.0) {
+                    *scene_modified = true;
+                }
+                if object.morph_weights() != morph_before {
+                    *morph_weights_change = Some((selection, morph_before));
+                }
+            }
+        }
+    } else {
+        ui.weak("Select a model part or object in the Scene tab to edit morph targets.");
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1407,6 +1667,19 @@ impl DebugUi {
         self.profile_capture.is_some()
     }
 
+    pub fn animation_controller_target(&self, world: &World) -> Option<ModelGroupId> {
+        if self.active_tab != EditorTab::Animation {
+            return None;
+        }
+        match self.selected_scene_item {
+            Some(SceneSelection::Model(group_id)) => Some(group_id),
+            Some(SceneSelection::Part(object_id) | SceneSelection::Object(object_id)) => world
+                .get_object(object_id)
+                .and_then(RenderObject::model_group),
+            None => None,
+        }
+    }
+
     fn update_profile_capture(&mut self, timings: RenderTimings, cpu_frame_ms: f32, fps: f32) {
         let finished = self
             .profile_capture
@@ -1845,6 +2118,15 @@ impl DebugUi {
                             self.active_tab = EditorTab::Scene;
                         }
                         if ui
+                            .selectable_label(
+                                self.active_tab == EditorTab::Animation,
+                                "Animation",
+                            )
+                            .clicked()
+                        {
+                            self.active_tab = EditorTab::Animation;
+                        }
+                        if ui
                             .selectable_label(self.active_tab == EditorTab::Render, "Render")
                             .clicked()
                         {
@@ -2213,111 +2495,6 @@ impl DebugUi {
                                                                 ));
                                                                 scene_modified = true;
                                                             }
-                                                            if let Some(playback) = group.animation.as_mut() {
-                                                                ui.separator();
-                                                                ui.label("Animation");
-                                                                let before = *playback;
-                                                                let selected_clip = group
-                                                                    .animation_clips
-                                                                    .get(playback.clip_index)
-                                                                    .map(|clip| clip.name.as_str())
-                                                                    .unwrap_or("Missing animation");
-                                                                egui::ComboBox::from_id_salt((
-                                                                    "model-animation-clip",
-                                                                    group_id.0,
-                                                                ))
-                                                                .selected_text(selected_clip)
-                                                                .show_ui(ui, |ui| {
-                                                                    for (index, clip) in group
-                                                                        .animation_clips
-                                                                        .iter()
-                                                                        .enumerate()
-                                                                    {
-                                                                        ui.selectable_value(
-                                                                            &mut playback.clip_index,
-                                                                            index,
-                                                                            &clip.name,
-                                                                        );
-                                                                    }
-                                                                });
-                                                                if playback.clip_index
-                                                                    != before.clip_index
-                                                                {
-                                                                    playback.time = 0.0;
-                                                                }
-                                                                ui.horizontal(|ui| {
-                                                                    if ui
-                                                                        .button(if playback.playing {
-                                                                            "Pause"
-                                                                        } else {
-                                                                            "Play"
-                                                                        })
-                                                                        .clicked()
-                                                                    {
-                                                                        if !playback.playing
-                                                                            && !playback.looping
-                                                                            && group
-                                                                                .animation_clips
-                                                                                .get(
-                                                                                    playback
-                                                                                        .clip_index,
-                                                                                )
-                                                                                .is_some_and(
-                                                                                    |clip| {
-                                                                                        playback
-                                                                                            .time
-                                                                                            >= clip
-                                                                                                .duration
-                                                                                    },
-                                                                                )
-                                                                        {
-                                                                            playback.time = 0.0;
-                                                                        }
-                                                                        playback.playing =
-                                                                            !playback.playing;
-                                                                    }
-                                                                    if ui.button("Restart").clicked()
-                                                                    {
-                                                                        playback.time = 0.0;
-                                                                    }
-                                                                });
-                                                                ui.checkbox(
-                                                                    &mut playback.looping,
-                                                                    "Loop",
-                                                                );
-                                                                ui.add(
-                                                                    egui::Slider::new(
-                                                                        &mut playback.speed,
-                                                                        0.1..=4.0,
-                                                                    )
-                                                                    .text("Speed"),
-                                                                );
-                                                                if let Some(clip) = group
-                                                                    .animation_clips
-                                                                    .get(playback.clip_index)
-                                                                    && clip.duration > 0.0
-                                                                {
-                                                                    ui.add(
-                                                                        egui::Slider::new(
-                                                                            &mut playback.time,
-                                                                            0.0..=clip.duration,
-                                                                        )
-                                                                        .text("Time"),
-                                                                    );
-                                                                }
-                                                                if playback.clip_index
-                                                                    != before.clip_index
-                                                                    || playback.speed != before.speed
-                                                                    || playback.looping
-                                                                        != before.looping
-                                                                    || playback.playing
-                                                                        != before.playing
-                                                                {
-                                                                    animation_change =
-                                                                        Some((group_id, before));
-                                                                    scene_modified = true;
-                                                                }
-                                                            }
                                                         }
                                                     }
                                                     Some(
@@ -2328,13 +2505,6 @@ impl DebugUi {
                                                             object_id,
                                                         )),
                                                     ) => {
-                                                        let animation_group = world
-                                                            .get_object(object_id)
-                                                            .and_then(RenderObject::model_group);
-                                                        let animation_playing = animation_group
-                                                            .and_then(|id| world.model_group(id))
-                                                            .and_then(|group| group.animation)
-                                                            .is_some_and(|playback| playback.playing);
                                                         if let Some(object) =
                                                             world.get_object_mut(object_id)
                                                         {
@@ -2360,139 +2530,6 @@ impl DebugUi {
                                                                     Some((selection, before));
                                                                 scene_modified = true;
                                                             }
-                                                            let morph_before =
-                                                                object.morph_weights().to_vec();
-                                                            if !morph_before.is_empty() {
-                                                                ui.separator();
-                                                                let active_count = morph_before
-                                                                    .iter()
-                                                                    .filter(|weight| **weight != 0.0)
-                                                                    .count();
-                                                                ui.label(format!(
-                                                                    "Morph targets ({}, active {})",
-                                                                    morph_before.len(),
-                                                                    active_count
-                                                                ));
-                                                                let mut reset_weights = false;
-                                                                ui.horizontal(|ui| {
-                                                                    if ui
-                                                                        .add_enabled(
-                                                                            !animation_playing,
-                                                                            egui::Button::new(
-                                                                                "Reset all",
-                                                                            ),
-                                                                        )
-                                                                        .clicked()
-                                                                    {
-                                                                        reset_weights = true;
-                                                                    }
-                                                                    if animation_playing
-                                                                        && ui
-                                                                            .button("Pause animation")
-                                                                            .clicked()
-                                                                    {
-                                                                        pause_morph_animation =
-                                                                            animation_group;
-                                                                    }
-                                                                });
-                                                                if animation_playing {
-                                                                    ui.weak(
-                                                                        "Pause animation before editing weights.",
-                                                                    );
-                                                                }
-                                                                ui.horizontal(|ui| {
-                                                                    ui.label("Filter");
-                                                                    ui.text_edit_singleline(
-                                                                        &mut self.morph_filter,
-                                                                    );
-                                                                    if ui.button("Clear").clicked() {
-                                                                        self.morph_filter.clear();
-                                                                    }
-                                                                });
-                                                                let target_names = object
-                                                                    .morph_target_names()
-                                                                    .to_vec();
-                                                                let filter = self
-                                                                    .morph_filter
-                                                                    .trim()
-                                                                    .to_lowercase();
-                                                                let mut matched_target = false;
-                                                                ui.add_enabled_ui(
-                                                                    !animation_playing,
-                                                                    |ui| {
-                                                                        if reset_weights {
-                                                                            object
-                                                                                .morph_weights_mut()
-                                                                                .fill(0.0);
-                                                                        }
-                                                                        for (index, weight) in
-                                                                            object
-                                                                                .morph_weights_mut()
-                                                                                .iter_mut()
-                                                                                .enumerate()
-                                                                        {
-                                                                            let label = target_names
-                                                                                .get(index)
-                                                                                .map(String::as_str)
-                                                                                .filter(|name| {
-                                                                                    !name.is_empty()
-                                                                                })
-                                                                                .map(|name| {
-                                                                                    format!(
-                                                                                        "{}. {}",
-                                                                                        index + 1,
-                                                                                        name
-                                                                                    )
-                                                                                })
-                                                                                .unwrap_or_else(
-                                                                                    || {
-                                                                                        format!(
-                                                                                            "Target {}",
-                                                                                            index + 1
-                                                                                        )
-                                                                                    },
-                                                                                );
-                                                                            if !filter.is_empty()
-                                                                                && !label
-                                                                                    .to_lowercase()
-                                                                                    .contains(
-                                                                                        &filter,
-                                                                                    )
-                                                                            {
-                                                                                continue;
-                                                                            }
-                                                                            matched_target = true;
-                                                                            if ui
-                                                                                .add(
-                                                                                    egui::Slider::new(
-                                                                                        weight,
-                                                                                        0.0..=1.0,
-                                                                                    )
-                                                                                    .text(label),
-                                                                                )
-                                                                                .changed()
-                                                                            {
-                                                                                scene_modified = true;
-                                                                            }
-                                                                        }
-                                                                    },
-                                                                );
-                                                                if !filter.is_empty() && !matched_target {
-                                                                    ui.weak("No targets match this filter.");
-                                                                }
-                                                                if reset_weights
-                                                                    && morph_before
-                                                                        .iter()
-                                                                        .any(|weight| *weight != 0.0)
-                                                                {
-                                                                    scene_modified = true;
-                                                                }
-                                                                if object.morph_weights() != morph_before
-                                                                {
-                                                                    morph_weights_change =
-                                                                        Some((selection, morph_before));
-                                                                }
-                                                            }
                                                         }
                                                     }
                                                     None => {
@@ -2505,6 +2542,17 @@ impl DebugUi {
                                             self.selected_scene_item = selected_scene_item;
                                         }
                                     });
+                            } else if self.active_tab == EditorTab::Animation {
+                                draw_animation_panel(
+                                    ui,
+                                    selected_scene_item,
+                                    world,
+                                    &mut self.morph_filter,
+                                    &mut animation_change,
+                                    &mut pause_morph_animation,
+                                    &mut morph_weights_change,
+                                    &mut scene_modified,
+                                );
                             } else {
                                 egui::CollapsingHeader::new("Performance")
                                     .default_open(false)
@@ -3661,6 +3709,7 @@ mod tests {
             speed: 1.5,
             looping: false,
             playing: true,
+            crossfade_duration: 0.8,
             ..ModelAnimationPlayback::default()
         });
         let mut selection = selection;
@@ -3676,6 +3725,7 @@ mod tests {
         assert_eq!(playback.speed, 1.5);
         assert!(!playback.looping);
         assert!(playback.playing);
+        assert_eq!(playback.crossfade_duration, 0.8);
     }
 
     #[test]

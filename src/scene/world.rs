@@ -2,6 +2,7 @@ use glam::{Quat, Vec3};
 
 use crate::scene::Transform;
 use crate::scene::entity::RenderObject;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -30,6 +31,63 @@ pub struct ModelAnimationClip {
     pub duration: f32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnimationKeyboardControl {
+    pub enabled: bool,
+    pub idle_clip_index: usize,
+    pub walk_clip_index: usize,
+    pub run_clip_index: usize,
+}
+
+impl AnimationKeyboardControl {
+    pub fn for_clips(clips: &[ModelAnimationClip]) -> Self {
+        let find_named = |names: &[&str]| {
+            clips.iter().position(|clip| {
+                names
+                    .iter()
+                    .any(|name| clip.name.eq_ignore_ascii_case(name))
+            })
+        };
+        let idle_clip_index = find_named(&["Survey", "Idle", "Stand", "Standing"]).unwrap_or(0);
+        let walk_fallback = (0..clips.len())
+            .find(|index| *index != idle_clip_index)
+            .unwrap_or(idle_clip_index);
+        let walk_clip_index = find_named(&["Walk", "Walking"]).unwrap_or(walk_fallback);
+        let run_fallback = (0..clips.len())
+            .find(|index| *index != idle_clip_index && *index != walk_clip_index)
+            .unwrap_or(walk_clip_index);
+        let run_clip_index = find_named(&["Run", "Running"]).unwrap_or(run_fallback);
+        Self {
+            enabled: false,
+            idle_clip_index,
+            walk_clip_index,
+            run_clip_index,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ModelAnimationTransition {
+    pub from_clip_index: usize,
+    pub from_time: f32,
+    pub elapsed: f32,
+    pub duration: f32,
+}
+
+impl ModelAnimationTransition {
+    pub fn progress(self) -> f32 {
+        if self.duration > 0.0 {
+            (self.elapsed / self.duration).clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+    }
+}
+
+pub const DEFAULT_ANIMATION_CROSSFADE_SECONDS: f32 = 0.35;
+pub const MAX_ANIMATION_CROSSFADE_SECONDS: f32 = 2.0;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ModelAnimationPlayback {
     pub clip_index: usize,
@@ -37,6 +95,9 @@ pub struct ModelAnimationPlayback {
     pub speed: f32,
     pub looping: bool,
     pub playing: bool,
+    pub crossfade_duration: f32,
+    pub keyboard_control: AnimationKeyboardControl,
+    pub transition: Option<ModelAnimationTransition>,
 }
 
 impl Default for ModelAnimationPlayback {
@@ -47,7 +108,29 @@ impl Default for ModelAnimationPlayback {
             speed: 1.0,
             looping: true,
             playing: false,
+            crossfade_duration: DEFAULT_ANIMATION_CROSSFADE_SECONDS,
+            keyboard_control: AnimationKeyboardControl::default(),
+            transition: None,
         }
+    }
+}
+
+impl ModelAnimationPlayback {
+    pub fn switch_to_clip(&mut self, clip_index: usize) -> bool {
+        if self.clip_index == clip_index || self.transition.is_some() {
+            return false;
+        }
+        let from_clip_index = self.clip_index;
+        let from_time = self.time;
+        self.clip_index = clip_index;
+        self.time = 0.0;
+        self.transition = (self.crossfade_duration > 0.0).then_some(ModelAnimationTransition {
+            from_clip_index,
+            from_time,
+            elapsed: 0.0,
+            duration: self.crossfade_duration,
+        });
+        true
     }
 }
 
@@ -816,6 +899,66 @@ mod tests {
     use crate::core::{MaterialId, MeshId};
     use crate::scene::Transform;
     use glam::Vec3;
+
+    #[test]
+    fn keyboard_animation_control_is_opt_in_and_maps_named_clips() {
+        let clips = [
+            ModelAnimationClip {
+                name: "Run".to_owned(),
+                duration: 1.0,
+            },
+            ModelAnimationClip {
+                name: "survey".to_owned(),
+                duration: 1.0,
+            },
+            ModelAnimationClip {
+                name: "Walk".to_owned(),
+                duration: 1.0,
+            },
+        ];
+
+        assert_eq!(
+            AnimationKeyboardControl::for_clips(&clips),
+            AnimationKeyboardControl {
+                enabled: false,
+                idle_clip_index: 1,
+                walk_clip_index: 2,
+                run_clip_index: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn selecting_clip_starts_a_configured_transition() {
+        let mut playback = ModelAnimationPlayback {
+            clip_index: 0,
+            time: 0.4,
+            crossfade_duration: 0.8,
+            ..ModelAnimationPlayback::default()
+        };
+
+        assert!(playback.switch_to_clip(2));
+        assert_eq!(playback.clip_index, 2);
+        assert_eq!(playback.time, 0.0);
+        assert_eq!(
+            playback.transition,
+            Some(ModelAnimationTransition {
+                from_clip_index: 0,
+                from_time: 0.4,
+                elapsed: 0.0,
+                duration: 0.8,
+            })
+        );
+        assert!(!playback.switch_to_clip(1));
+        assert_eq!(playback.clip_index, 2);
+
+        let mut instant = ModelAnimationPlayback {
+            crossfade_duration: 0.0,
+            ..ModelAnimationPlayback::default()
+        };
+        assert!(instant.switch_to_clip(1));
+        assert!(instant.transition.is_none());
+    }
 
     #[test]
     fn test_add_and_get_object() {

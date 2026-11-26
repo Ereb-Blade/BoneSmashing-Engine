@@ -20,30 +20,123 @@ use crate::core::{
 };
 use crate::input::Input;
 use crate::renderer::debug_ui::{CameraControlMode, CameraLookButton, DebugUi};
-use crate::renderer::gltf::{GltfNodeInfo, GltfPrimitiveInstance, LoadedGltfModel};
+use crate::renderer::gltf::{
+    AnimationClipSample, GltfNodeInfo, GltfPrimitiveInstance, LoadedGltfModel,
+};
 use crate::renderer::state::{LoadedAsset, ParsedAsset, Renderer, RendererSettings};
 use crate::scene::{
-    ModelAnimationClip, ModelAnimationPlayback, ModelGroupId, RenderObject, SceneFile, Transform,
-    World, build_world,
+    AnimationKeyboardControl, ModelAnimationClip, ModelAnimationPlayback, ModelAnimationTransition,
+    ModelGroupId, RenderObject, SceneFile, Transform, World, build_world,
 };
 
-fn advance_animation_playback(playback: &mut ModelAnimationPlayback, duration: f32, dt: f32) {
-    if !playback.playing {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AnimationSampleState {
+    clip_index: usize,
+    time_bits: u32,
+    transition: Option<(usize, u32, u32)>,
+}
+
+fn advance_clip_time(
+    time: &mut f32,
+    playing: &mut bool,
+    speed: f32,
+    looping: bool,
+    duration: f32,
+    dt: f32,
+) {
+    if !*playing {
         return;
     }
     if duration <= 0.0 {
-        playback.time = 0.0;
-        playback.playing = false;
+        *time = 0.0;
+        *playing = false;
         return;
     }
-    playback.time += dt * playback.speed;
-    if playback.time >= duration {
-        if playback.looping {
-            playback.time %= duration;
+    *time += dt * speed;
+    if *time >= duration {
+        if looping {
+            *time %= duration;
         } else {
-            playback.time = duration;
-            playback.playing = false;
+            *time = duration;
+            *playing = false;
         }
+    }
+}
+
+fn advance_animation_playback(
+    playback: &mut ModelAnimationPlayback,
+    clips: &[ModelAnimationClip],
+    dt: f32,
+) {
+    let Some(clip) = clips.get(playback.clip_index) else {
+        playback.playing = false;
+        playback.transition = None;
+        return;
+    };
+    let was_playing = playback.playing;
+    advance_clip_time(
+        &mut playback.time,
+        &mut playback.playing,
+        playback.speed,
+        playback.looping,
+        clip.duration,
+        dt,
+    );
+
+    let Some(mut transition) = playback.transition else {
+        return;
+    };
+    if was_playing && let Some(from_clip) = clips.get(transition.from_clip_index) {
+        let mut from_playing = true;
+        advance_clip_time(
+            &mut transition.from_time,
+            &mut from_playing,
+            playback.speed,
+            playback.looping,
+            from_clip.duration,
+            dt,
+        );
+    }
+    transition.elapsed = (transition.elapsed + dt).min(transition.duration);
+    playback.transition = (transition.duration > 0.0 && transition.elapsed < transition.duration)
+        .then_some(transition);
+}
+
+fn animation_sample_state(playback: ModelAnimationPlayback) -> AnimationSampleState {
+    let transition = playback.transition.map(|transition| {
+        (
+            transition.from_clip_index,
+            transition.from_time.to_bits(),
+            ModelAnimationTransition::progress(transition).to_bits(),
+        )
+    });
+    AnimationSampleState {
+        clip_index: playback.clip_index,
+        time_bits: playback.time.to_bits(),
+        transition,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyboardAnimationControllerState {
+    group_id: ModelGroupId,
+    active: bool,
+}
+
+fn animation_controller_target_clip(
+    settings: AnimationKeyboardControl,
+    walk_pressed: bool,
+    run_pressed: bool,
+    controller_active: bool,
+) -> Option<usize> {
+    if run_pressed {
+        Some(settings.run_clip_index)
+    } else if walk_pressed {
+        Some(settings.walk_clip_index)
+    } else if controller_active {
+        Some(settings.idle_clip_index)
+    } else {
+        None
     }
 }
 
@@ -121,10 +214,11 @@ pub struct App {
     last_time: Instant,
     world: World,
     animation_models: HashMap<PathBuf, LoadedGltfModel>,
-    sampled_animations: HashMap<ModelGroupId, (usize, u32)>,
+    sampled_animations: HashMap<ModelGroupId, AnimationSampleState>,
     animated_instances: Vec<GltfPrimitiveInstance>,
     animated_node_transforms: Vec<(usize, Transform)>,
     debug_ui: Option<DebugUi>,
+    keyboard_animation_controller: Option<KeyboardAnimationControllerState>,
     fps_frames: u32,
     fps_elapsed: f32,
     displayed_fps: f32,
@@ -158,6 +252,7 @@ impl App {
             animated_instances: Vec::new(),
             animated_node_transforms: Vec::new(),
             debug_ui: None,
+            keyboard_animation_controller: None,
             fps_frames: 0,
             fps_elapsed: 0.0,
             displayed_fps: 0.0,
@@ -206,7 +301,12 @@ impl App {
                             duration: animation.duration,
                         })
                         .collect();
-                    group.animation = Some(ModelAnimationPlayback::default());
+                    group.animation = Some(ModelAnimationPlayback {
+                        keyboard_control: AnimationKeyboardControl::for_clips(
+                            &group.animation_clips,
+                        ),
+                        ..ModelAnimationPlayback::default()
+                    });
                 }
                 for (instance_index, instance) in model.instances.iter().enumerate() {
                     let node_id = *node_ids.get(instance.node_index).ok_or_else(|| {
@@ -428,12 +528,32 @@ impl App {
                         file.groups[index].name
                     ));
                 }
-                let mut playback = ModelAnimationPlayback::default();
+                let mut playback = ModelAnimationPlayback {
+                    keyboard_control: AnimationKeyboardControl::for_clips(&clips),
+                    ..ModelAnimationPlayback::default()
+                };
                 if let Some(saved_animation) = saved_animation {
                     playback.clip_index = saved_animation.clip_index;
                     playback.speed = saved_animation.speed;
                     playback.looping = saved_animation.looping;
                     playback.playing = saved_animation.playing;
+                    playback.crossfade_duration = saved_animation.crossfade_duration;
+                    if let Some(keyboard_control) = saved_animation.keyboard_control {
+                        if [
+                            keyboard_control.idle_clip_index,
+                            keyboard_control.walk_clip_index,
+                            keyboard_control.run_clip_index,
+                        ]
+                        .iter()
+                        .any(|clip_index| *clip_index >= clips.len())
+                        {
+                            return Err(format!(
+                                "Scene model group '{}' keyboard controller references a missing animation clip",
+                                file.groups[index].name
+                            ));
+                        }
+                        playback.keyboard_control = keyboard_control;
+                    }
                 }
                 let group = world
                     .model_group_mut(group_id)
@@ -473,7 +593,7 @@ impl App {
     fn update_animations(
         world: &mut World,
         animation_models: &mut HashMap<PathBuf, LoadedGltfModel>,
-        sampled_animations: &mut HashMap<ModelGroupId, (usize, u32)>,
+        sampled_animations: &mut HashMap<ModelGroupId, AnimationSampleState>,
         animated_instances: &mut Vec<GltfPrimitiveInstance>,
         animated_node_transforms: &mut Vec<(usize, Transform)>,
         dt: f32,
@@ -481,7 +601,7 @@ impl App {
         sampled_animations.retain(|group_id, _| world.model_group(*group_id).is_some());
         let group_ids = world.model_group_ids().to_vec();
         for group_id in group_ids {
-            let Some((path, clip_index, time, animation_state, should_sample)) = ({
+            let Some((path, clip_index, time, transition, animation_state, should_sample)) = ({
                 let Some(group) = world.model_group_mut(group_id) else {
                     continue;
                 };
@@ -491,19 +611,30 @@ impl App {
                 let Some(playback) = group.animation.as_mut() else {
                     continue;
                 };
-                let Some(clip) = group.animation_clips.get(playback.clip_index) else {
+                if group.animation_clips.get(playback.clip_index).is_none() {
                     eprintln!("Model '{}' references a missing animation clip", group.name);
                     playback.playing = false;
+                    playback.transition = None;
                     continue;
-                };
-                advance_animation_playback(playback, clip.duration, dt);
-                let animation_state = (playback.clip_index, playback.time.to_bits());
-                let should_sample =
-                    playback.playing || sampled_animations.get(&group_id) != Some(&animation_state);
+                }
+
+                advance_animation_playback(playback, &group.animation_clips, dt);
+                let transition = playback.transition.map(|transition| {
+                    (
+                        transition.from_clip_index,
+                        transition.from_time,
+                        ModelAnimationTransition::progress(transition),
+                    )
+                });
+                let animation_state = animation_sample_state(*playback);
+                let should_sample = playback.playing
+                    || transition.is_some()
+                    || sampled_animations.get(&group_id) != Some(&animation_state);
                 Some((
                     path,
                     playback.clip_index,
                     playback.time,
+                    transition,
                     animation_state,
                     should_sample,
                 ))
@@ -522,12 +653,26 @@ impl App {
                 }
                 continue;
             };
-            if let Err(error) = model.sample_animation_with_nodes_into(
-                clip_index,
-                time,
-                animated_instances,
-                animated_node_transforms,
-            ) {
+            let sample_result = if let Some((from_clip_index, from_time, weight)) = transition {
+                model.sample_blended_animations_with_nodes_into(
+                    AnimationClipSample {
+                        clip_index: from_clip_index,
+                        time: from_time,
+                    },
+                    AnimationClipSample { clip_index, time },
+                    weight,
+                    animated_instances,
+                    animated_node_transforms,
+                )
+            } else {
+                model.sample_animation_with_nodes_into(
+                    clip_index,
+                    time,
+                    animated_instances,
+                    animated_node_transforms,
+                )
+            };
+            if let Err(error) = sample_result {
                 eprintln!("Could not update model animation: {error}");
                 if let Some(group) = world.model_group_mut(group_id)
                     && let Some(playback) = group.animation.as_mut()
@@ -567,6 +712,88 @@ impl App {
                 }
             }
         }
+    }
+
+    fn update_keyboard_animation_controller(
+        controller: &mut Option<KeyboardAnimationControllerState>,
+        input: &Input,
+        world: &mut World,
+        debug_ui: Option<&mut DebugUi>,
+    ) -> bool {
+        let group_id = debug_ui
+            .as_deref()
+            .and_then(|debug_ui| debug_ui.animation_controller_target(world));
+        let Some(group_id) = group_id else {
+            *controller = None;
+            return false;
+        };
+        let Some(group) = world.model_group(group_id) else {
+            *controller = None;
+            return false;
+        };
+        let Some(playback) = group.animation else {
+            *controller = None;
+            return false;
+        };
+        let settings = playback.keyboard_control;
+        if !settings.enabled
+            || [
+                settings.idle_clip_index,
+                settings.walk_clip_index,
+                settings.run_clip_index,
+            ]
+            .iter()
+            .any(|clip_index| *clip_index >= group.animation_clips.len())
+        {
+            *controller = None;
+            return false;
+        }
+
+        let controller_active =
+            controller.is_some_and(|state| state.group_id == group_id && state.active);
+        let walk_pressed = input.is_key_pressed(KeyCode::KeyW);
+        let run_pressed =
+            input.is_key_pressed(KeyCode::ShiftLeft) || input.is_key_pressed(KeyCode::ShiftRight);
+        let movement_key_pressed = walk_pressed || run_pressed;
+        let target_clip = animation_controller_target_clip(
+            settings,
+            walk_pressed,
+            run_pressed,
+            controller_active,
+        );
+        let Some(target_clip) = target_clip else {
+            *controller = Some(KeyboardAnimationControllerState {
+                group_id,
+                active: false,
+            });
+            return false;
+        };
+
+        let mut active = controller_active || movement_key_pressed;
+        let mut scene_changed = false;
+        if let Some(group) = world.model_group_mut(group_id)
+            && let Some(playback) = group.animation.as_mut()
+        {
+            if movement_key_pressed && !playback.playing {
+                playback.playing = true;
+                scene_changed = true;
+            }
+            scene_changed |= playback.switch_to_clip(target_clip);
+            if !movement_key_pressed
+                && target_clip == settings.idle_clip_index
+                && playback.clip_index == settings.idle_clip_index
+                && playback.transition.is_none()
+            {
+                active = false;
+            }
+        } else {
+            active = false;
+        }
+        if scene_changed && let Some(debug_ui) = debug_ui {
+            debug_ui.mark_scene_dirty();
+        }
+        *controller = Some(KeyboardAnimationControllerState { group_id, active });
+        active
     }
 }
 
@@ -699,6 +926,9 @@ impl ApplicationHandler for App {
                                             .collect();
                                         group.animation = Some(ModelAnimationPlayback {
                                             playing: true,
+                                            keyboard_control: AnimationKeyboardControl::for_clips(
+                                                &group.animation_clips,
+                                            ),
                                             ..ModelAnimationPlayback::default()
                                         });
                                     }
@@ -913,8 +1143,15 @@ impl ApplicationHandler for App {
                     .debug_ui
                     .as_ref()
                     .is_some_and(DebugUi::profile_capture_active);
+                let keyboard_controller_active = !profile_capture_active
+                    && Self::update_keyboard_animation_controller(
+                        &mut self.keyboard_animation_controller,
+                        &self.input,
+                        &mut self.world,
+                        self.debug_ui.as_mut(),
+                    );
                 let camera_before = (self.camera.eye, self.camera.yaw, self.camera.pitch);
-                if !profile_capture_active {
+                if !profile_capture_active && !keyboard_controller_active {
                     self.camera_controller
                         .update_camera(&mut self.camera, &self.input, dt);
                 }
@@ -975,6 +1212,7 @@ impl ApplicationHandler for App {
                                 self.world = world;
                                 self.animation_models = animation_models;
                                 self.sampled_animations.clear();
+                                self.keyboard_animation_controller = None;
                                 self.animated_instances.clear();
                                 if let Some(camera) = &file.camera {
                                     camera.apply_to(&mut self.camera);
@@ -1056,6 +1294,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn keyboard_controller_maps_keys_and_release_to_configured_clips() {
+        let settings = AnimationKeyboardControl {
+            enabled: true,
+            idle_clip_index: 2,
+            walk_clip_index: 1,
+            run_clip_index: 0,
+        };
+
+        assert_eq!(
+            animation_controller_target_clip(settings, false, false, false),
+            None
+        );
+        assert_eq!(
+            animation_controller_target_clip(settings, true, false, false),
+            Some(1)
+        );
+        assert_eq!(
+            animation_controller_target_clip(settings, false, true, false),
+            Some(0)
+        );
+        assert_eq!(
+            animation_controller_target_clip(settings, false, false, true),
+            Some(2)
+        );
+        assert_eq!(
+            animation_controller_target_clip(settings, true, true, false),
+            Some(0)
+        );
+    }
+
+    fn test_animation_clips() -> [ModelAnimationClip; 2] {
+        [
+            ModelAnimationClip {
+                name: "Source".to_owned(),
+                duration: 1.0,
+            },
+            ModelAnimationClip {
+                name: "Target".to_owned(),
+                duration: 2.0,
+            },
+        ]
+    }
+
+    #[test]
     fn looping_animation_wraps_to_the_start() {
         let mut playback = ModelAnimationPlayback {
             time: 0.9,
@@ -1064,8 +1346,9 @@ mod tests {
             playing: true,
             ..ModelAnimationPlayback::default()
         };
+        let clips = test_animation_clips();
 
-        advance_animation_playback(&mut playback, 1.0, 0.2);
+        advance_animation_playback(&mut playback, &clips, 0.2);
 
         assert!((playback.time - 0.3).abs() < 0.0001);
         assert!(playback.playing);
@@ -1079,11 +1362,68 @@ mod tests {
             playing: true,
             ..ModelAnimationPlayback::default()
         };
+        let clips = test_animation_clips();
 
-        advance_animation_playback(&mut playback, 1.0, 0.2);
+        advance_animation_playback(&mut playback, &clips, 0.2);
 
         assert_eq!(playback.time, 1.0);
         assert!(!playback.playing);
+    }
+
+    #[test]
+    fn animation_crossfade_advances_both_clips_and_finishes() {
+        let clips = test_animation_clips();
+        let mut playback = ModelAnimationPlayback {
+            clip_index: 1,
+            playing: true,
+            transition: Some(ModelAnimationTransition {
+                from_clip_index: 0,
+                from_time: 0.2,
+                elapsed: 0.0,
+                duration: 0.5,
+            }),
+            ..ModelAnimationPlayback::default()
+        };
+
+        advance_animation_playback(&mut playback, &clips, 0.1);
+
+        assert!((playback.time - 0.1).abs() < 0.0001);
+        let transition = playback.transition.unwrap();
+        assert!((transition.from_time - 0.3).abs() < 0.0001);
+        assert!((transition.elapsed - 0.1).abs() < 0.0001);
+
+        advance_animation_playback(&mut playback, &clips, 0.4);
+
+        assert!((playback.time - 0.5).abs() < 0.0001);
+        assert!(playback.transition.is_none());
+    }
+
+    #[test]
+    fn paused_animation_crossfade_keeps_clip_times_and_completes() {
+        let clips = test_animation_clips();
+        let mut playback = ModelAnimationPlayback {
+            clip_index: 1,
+            time: 0.8,
+            playing: false,
+            transition: Some(ModelAnimationTransition {
+                from_clip_index: 0,
+                from_time: 0.4,
+                elapsed: 0.0,
+                duration: 0.5,
+            }),
+            ..ModelAnimationPlayback::default()
+        };
+
+        advance_animation_playback(&mut playback, &clips, 0.25);
+
+        assert_eq!(playback.time, 0.8);
+        let transition = playback.transition.unwrap();
+        assert_eq!(transition.from_time, 0.4);
+        assert_eq!(transition.elapsed, 0.25);
+
+        advance_animation_playback(&mut playback, &clips, 0.25);
+
+        assert!(playback.transition.is_none());
     }
 
     #[test]
@@ -1167,5 +1507,81 @@ mod tests {
                 .to_matrix()
                 .abs_diff_eq(edited_transform.to_matrix(), 1e-5)
         );
+    }
+
+    #[test]
+    fn animation_update_applies_crossfaded_node_transforms() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("models")
+            .join("Fox")
+            .join("Fox.glb");
+        let mut model = crate::renderer::gltf::GltfModelData::load(&path)
+            .unwrap()
+            .into_loaded(0, 0)
+            .unwrap();
+        let clips = model
+            .animations
+            .iter()
+            .map(|animation| ModelAnimationClip {
+                name: animation.name.clone(),
+                duration: animation.duration,
+            })
+            .collect::<Vec<_>>();
+        let from_time = clips[0].duration * 0.37;
+        let to_time = clips[2].duration * 0.61;
+        let node_hierarchy = model.node_hierarchy.clone();
+        let mut world = World::new();
+        let model_group = world.add_model_group("Fox", path.clone(), Transform::default());
+        let node_ids = create_gltf_node_groups(&mut world, model_group, &node_hierarchy).unwrap();
+        world.model_group_mut(model_group).unwrap().animation_clips = clips;
+        world.model_group_mut(model_group).unwrap().animation = Some(ModelAnimationPlayback {
+            clip_index: 2,
+            time: to_time,
+            transition: Some(ModelAnimationTransition {
+                from_clip_index: 0,
+                from_time,
+                elapsed: 0.0,
+                duration: 1.0,
+            }),
+            ..ModelAnimationPlayback::default()
+        });
+
+        let mut expected = Vec::new();
+        model
+            .sample_blended_animations_with_nodes_into(
+                AnimationClipSample {
+                    clip_index: 0,
+                    time: from_time,
+                },
+                AnimationClipSample {
+                    clip_index: 2,
+                    time: to_time,
+                },
+                0.5,
+                &mut Vec::new(),
+                &mut expected,
+            )
+            .unwrap();
+        let mut animation_models = HashMap::from([(path, model)]);
+        let mut sampled_animations = HashMap::new();
+        App::update_animations(
+            &mut world,
+            &mut animation_models,
+            &mut sampled_animations,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            0.5,
+        );
+
+        assert!(expected.iter().all(|(node_index, expected_transform)| {
+            world
+                .model_group(node_ids[*node_index])
+                .is_some_and(|node| {
+                    node.transform
+                        .to_matrix()
+                        .abs_diff_eq(expected_transform.to_matrix(), 1e-5)
+                })
+        }));
     }
 }

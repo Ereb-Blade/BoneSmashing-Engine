@@ -15,7 +15,7 @@ use winit::window::Window;
 
 use crate::camera::{Camera, CameraUniform};
 use crate::config::DEPTH_FORMAT;
-use crate::core::{MATERIAL_DEFAULT, MaterialId, MeshId};
+use crate::core::{MATERIAL_DEFAULT, MESH_PLANE, MaterialId, MeshId};
 use crate::renderer::gltf::{GltfModelData, LoadedGltfModel};
 use crate::renderer::material::{Material, MaterialParams, generate_mip_levels_with_alpha};
 use crate::renderer::mesh::{Mesh, MeshData, ObjModelData};
@@ -626,6 +626,60 @@ fn directional_shadow_matrix(ray_direction: Vec3) -> Mat4 {
     crate::math::orthographic_rh(-7.5, 7.5, -7.5, 7.5, 1.0, 40.0) * view
 }
 
+fn directional_shadow_matrix_for_bounds(ray_direction: Vec3, bounds: &[(Vec3, f32)]) -> Mat4 {
+    if !ray_direction.is_finite() || ray_direction.length_squared() <= f32::EPSILON {
+        return directional_shadow_matrix(Vec3::NEG_Y);
+    }
+
+    let ray_direction = ray_direction.normalize();
+    let up = if ray_direction.dot(Vec3::Y).abs() > 0.98 {
+        Vec3::X
+    } else {
+        Vec3::Y
+    };
+    let light_orientation = crate::math::look_at_rh(Vec3::ZERO, ray_direction, up);
+    let mut min = Vec3::splat(f32::MAX);
+    let mut max = Vec3::splat(f32::MIN);
+    let mut found_bounds = false;
+
+    for &(world_center, radius) in bounds {
+        if !world_center.is_finite() || !radius.is_finite() || radius < 0.0 {
+            continue;
+        }
+
+        let center = light_orientation.transform_point3(world_center);
+        let extent = Vec3::splat(radius);
+        min = min.min(center - extent);
+        max = max.max(center + extent);
+        found_bounds = true;
+    }
+
+    if !found_bounds {
+        return directional_shadow_matrix(ray_direction);
+    }
+
+    let light_center = (min + max) * 0.5;
+    let half_extents = (max - min) * 0.5;
+    let xy_padding = (half_extents.x.max(half_extents.y) * 0.05).max(0.5);
+    let half_width = (half_extents.x + xy_padding).max(1.0);
+    let half_height = (half_extents.y + xy_padding).max(1.0);
+    let depth_padding = (half_extents.z * 0.05).max(1.0);
+    let light_distance = half_extents.z + depth_padding + 1.0;
+    let world_center = light_orientation.inverse().transform_point3(light_center);
+    let eye = world_center - ray_direction * light_distance;
+    let view = crate::math::look_at_rh(eye, world_center, up);
+    let projection = crate::math::orthographic_rh(
+        -half_width,
+        half_width,
+        -half_height,
+        half_height,
+        0.1,
+        light_distance + half_extents.z + depth_padding,
+    );
+
+    projection * view
+}
+
 fn object_in_view(
     bounds: Option<(Vec3, f32)>,
     model: Mat4,
@@ -776,6 +830,7 @@ pub struct Renderer {
     msaa_view: Option<wgpu::TextureView>,
     missing_mesh_warnings: HashSet<MeshId>,
     missing_material_warnings: HashSet<MaterialId>,
+    shadow_bounds: Vec<(Vec3, f32)>,
     batches: HashMap<(MeshId, MaterialId), Vec<InstanceRaw>>,
     shadow_batches: HashMap<(MeshId, MaterialId), Vec<InstanceRaw>>,
     transparent_objects: Vec<TransparentObject>,
@@ -1186,6 +1241,7 @@ impl Renderer {
             postprocess_bind_group,
             missing_mesh_warnings: HashSet::new(),
             missing_material_warnings: HashSet::new(),
+            shadow_bounds: Vec::new(),
             batches: HashMap::new(),
             shadow_batches: HashMap::new(),
             transparent_objects: Vec::new(),
@@ -2270,6 +2326,8 @@ impl Renderer {
         for instances in self.shadow_batches.values_mut() {
             instances.clear();
         }
+        self.shadow_bounds.clear();
+        let mut has_skinned_shadow_object = false;
         self.transparent_objects.clear();
         self.skin_matrices.clear();
         self.skin_matrices.push(Mat4::IDENTITY);
@@ -2303,6 +2361,21 @@ impl Renderer {
                 .is_some_and(|material| material_casts_shadow(material.params.transmission_factor));
             if !should_prepare_instance(camera_visible, casts_shadow) {
                 continue;
+            }
+            // The built-in floor receives shadows but should not set the shadow-map footprint.
+            if casts_shadow && obj.mesh_id != MESH_PLANE {
+                if !obj.skin_matrices().is_empty() {
+                    has_skinned_shadow_object = true;
+                } else if let Some((bounds_center, bounds_radius)) = bounds {
+                    let conservative_scale = (model_matrix.x_axis.truncate().length_squared()
+                        + model_matrix.y_axis.truncate().length_squared()
+                        + model_matrix.z_axis.truncate().length_squared())
+                    .sqrt();
+                    self.shadow_bounds.push((
+                        model_matrix.transform_point3(bounds_center),
+                        bounds_radius * conservative_scale,
+                    ));
+                }
             }
             let Ok(skin_offset) = u32::try_from(self.skin_matrices.len()) else {
                 eprintln!("Не удалось отрисовать объект: превышен диапазон индексов скелета");
@@ -2504,7 +2577,11 @@ impl Renderer {
             );
         }
 
-        let shadow_matrix = directional_shadow_matrix(key_direction);
+        let shadow_matrix = if has_skinned_shadow_object {
+            directional_shadow_matrix(key_direction)
+        } else {
+            directional_shadow_matrix_for_bounds(key_direction, &self.shadow_bounds)
+        };
         let render_shadows = self.settings.shadows_enabled
             && (!self.shadow_cache_valid
                 || self.cached_shadow_matrix != shadow_matrix
@@ -3128,6 +3205,56 @@ mod tests {
         assert!(ndc.x.abs() < 1e-5);
         assert!(ndc.y.abs() < 1e-5);
         assert!((0.0..1.0).contains(&ndc.z));
+    }
+
+    #[test]
+    fn scene_shadow_camera_fits_bounds_outside_the_legacy_volume() {
+        let ray_direction = Vec3::new(0.3, -1.0, 0.2).normalize();
+        let bounds = [
+            (Vec3::new(25.0, 4.0, -15.0), 2.0),
+            (Vec3::new(-18.0, 1.0, 24.0), 1.5),
+        ];
+        let matrix = directional_shadow_matrix_for_bounds(ray_direction, &bounds);
+        let up = if ray_direction.dot(Vec3::Y).abs() > 0.98 {
+            Vec3::X
+        } else {
+            Vec3::Y
+        };
+        let light_orientation = crate::math::look_at_rh(Vec3::ZERO, ray_direction, up);
+        let light_to_world = light_orientation.inverse();
+
+        for (center, radius) in bounds {
+            let light_center = light_orientation.transform_point3(center);
+            for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+                for sign in [-1.0, 1.0] {
+                    let light_point = light_center + axis * (radius * sign);
+                    let world_point = light_to_world.transform_point3(light_point);
+                    let clip = matrix * world_point.extend(1.0);
+                    let ndc = clip.truncate() / clip.w;
+
+                    assert!((-1.0..=1.0).contains(&ndc.x));
+                    assert!((-1.0..=1.0).contains(&ndc.y));
+                    assert!((0.0..=1.0).contains(&ndc.z));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scene_shadow_camera_falls_back_without_valid_bounds() {
+        let ray_direction = RendererSettings::default().key_light_direction();
+
+        assert_eq!(
+            directional_shadow_matrix_for_bounds(ray_direction, &[]),
+            directional_shadow_matrix(ray_direction)
+        );
+        assert_eq!(
+            directional_shadow_matrix_for_bounds(
+                ray_direction,
+                &[(Vec3::splat(f32::NAN), f32::NAN)]
+            ),
+            directional_shadow_matrix(ray_direction)
+        );
     }
 
     #[test]

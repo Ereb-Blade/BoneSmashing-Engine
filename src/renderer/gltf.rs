@@ -334,6 +334,12 @@ pub struct GltfAnimationInfo {
     pub duration: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AnimationClipSample {
+    pub clip_index: usize,
+    pub time: f32,
+}
+
 impl LoadedGltfModel {
     #[cfg(test)]
     pub fn sample_animation(
@@ -370,6 +376,21 @@ impl LoadedGltfModel {
             .as_mut()
             .ok_or_else(|| "model does not contain skeletal animation data".to_owned())?;
         data.sample_into(animation_index, time, output, node_transforms)
+    }
+
+    pub fn sample_blended_animations_with_nodes_into(
+        &mut self,
+        from: AnimationClipSample,
+        to: AnimationClipSample,
+        blend_weight: f32,
+        output: &mut Vec<GltfPrimitiveInstance>,
+        node_transforms: &mut Vec<(usize, Transform)>,
+    ) -> Result<(), String> {
+        let data = self
+            .animation_data
+            .as_mut()
+            .ok_or_else(|| "model does not contain skeletal animation data".to_owned())?;
+        data.sample_blended_into(from, to, blend_weight, output, node_transforms)
     }
 }
 
@@ -451,9 +472,50 @@ struct GltfAnimationData {
     material_ids: Vec<MaterialId>,
     sample_nodes: Vec<NodePose>,
     sample_morph_weights: Vec<Vec<f32>>,
+    blend_nodes: Vec<NodePose>,
+    blend_morph_weights: Vec<Vec<f32>>,
     sample_globals: Vec<Mat4>,
     sample_computed: Vec<bool>,
     sample_visiting: Vec<bool>,
+}
+
+#[derive(Clone, Copy)]
+struct AnimationPoseSource<'a> {
+    base_nodes: &'a [NodePose],
+    base_morph_weights: &'a [Vec<f32>],
+    clips: &'a [AnimationClipData],
+    animation_infos: &'a [GltfAnimationInfo],
+}
+
+impl AnimationPoseSource<'_> {
+    fn sample(
+        self,
+        animation: AnimationClipSample,
+        nodes: &mut Vec<NodePose>,
+        morph_weights: &mut Vec<Vec<f32>>,
+    ) -> Result<(), String> {
+        if !animation.time.is_finite() {
+            return Err("animation time must be finite".to_owned());
+        }
+        let clip = self
+            .clips
+            .get(animation.clip_index)
+            .ok_or_else(|| format!("animation index {} is out of range", animation.clip_index))?;
+        let duration = self
+            .animation_infos
+            .get(animation.clip_index)
+            .ok_or_else(|| format!("animation index {} is out of range", animation.clip_index))?
+            .duration;
+        nodes.clear();
+        nodes.extend_from_slice(self.base_nodes);
+        morph_weights.resize_with(self.base_morph_weights.len(), Vec::new);
+        morph_weights.truncate(self.base_morph_weights.len());
+        for (sampled, base) in morph_weights.iter_mut().zip(self.base_morph_weights) {
+            sampled.clear();
+            sampled.extend_from_slice(base);
+        }
+        apply_animation_channels(clip, duration, animation.time, nodes, morph_weights)
+    }
 }
 
 impl GltfAnimationData {
@@ -518,28 +580,84 @@ impl GltfAnimationData {
         output: &mut Vec<GltfPrimitiveInstance>,
         node_transforms: &mut Vec<(usize, Transform)>,
     ) -> Result<(), String> {
-        if !time.is_finite() {
-            return Err("animation time must be finite".to_owned());
+        AnimationPoseSource {
+            base_nodes: &self.base_nodes,
+            base_morph_weights: &self.base_morph_weights,
+            clips: &self.clips,
+            animation_infos: &self.animation_infos,
         }
-        let clip = self
-            .clips
-            .get(animation_index)
-            .ok_or_else(|| format!("animation index {animation_index} is out of range"))?;
-        self.sample_nodes.copy_from_slice(&self.base_nodes);
-        self.sample_morph_weights
-            .resize_with(self.base_morph_weights.len(), Vec::new);
-        for (index, weights) in self.base_morph_weights.iter().enumerate() {
-            self.sample_morph_weights[index].clear();
-            self.sample_morph_weights[index].extend_from_slice(weights);
-        }
-        let duration = self.animation_infos[animation_index].duration;
-        apply_animation_channels(
-            clip,
-            duration,
-            time,
+        .sample(
+            AnimationClipSample {
+                clip_index: animation_index,
+                time,
+            },
             &mut self.sample_nodes,
             &mut self.sample_morph_weights,
         )?;
+        self.write_sampled_pose(output, node_transforms)
+    }
+
+    fn sample_blended_into(
+        &mut self,
+        from: AnimationClipSample,
+        to: AnimationClipSample,
+        blend_weight: f32,
+        output: &mut Vec<GltfPrimitiveInstance>,
+        node_transforms: &mut Vec<(usize, Transform)>,
+    ) -> Result<(), String> {
+        if !blend_weight.is_finite() {
+            return Err("animation blend weight must be finite".to_owned());
+        }
+        let pose_source = AnimationPoseSource {
+            base_nodes: &self.base_nodes,
+            base_morph_weights: &self.base_morph_weights,
+            clips: &self.clips,
+            animation_infos: &self.animation_infos,
+        };
+        pose_source.sample(from, &mut self.sample_nodes, &mut self.sample_morph_weights)?;
+        pose_source.sample(to, &mut self.blend_nodes, &mut self.blend_morph_weights)?;
+        let blend_weight = blend_weight.clamp(0.0, 1.0);
+        if blend_weight == 0.0 {
+            return self.write_sampled_pose(output, node_transforms);
+        }
+        if blend_weight == 1.0 {
+            self.sample_nodes.clone_from(&self.blend_nodes);
+            self.sample_morph_weights
+                .clone_from(&self.blend_morph_weights);
+            return self.write_sampled_pose(output, node_transforms);
+        }
+        for (from, to) in self.sample_nodes.iter_mut().zip(&self.blend_nodes) {
+            if from.animated || to.animated {
+                let from_pose = *from;
+                *from = NodePose {
+                    translation: from_pose.translation.lerp(to.translation, blend_weight),
+                    rotation: from_pose
+                        .rotation
+                        .slerp(to.rotation, blend_weight)
+                        .normalize(),
+                    scale: from_pose.scale.lerp(to.scale, blend_weight),
+                    matrix: Mat4::IDENTITY,
+                    animated: true,
+                };
+            }
+        }
+        for (from_node, to_node) in self
+            .sample_morph_weights
+            .iter_mut()
+            .zip(&self.blend_morph_weights)
+        {
+            for (from, &to) in from_node.iter_mut().zip(to_node) {
+                *from += (to - *from) * blend_weight;
+            }
+        }
+        self.write_sampled_pose(output, node_transforms)
+    }
+
+    fn write_sampled_pose(
+        &mut self,
+        output: &mut Vec<GltfPrimitiveInstance>,
+        node_transforms: &mut Vec<(usize, Transform)>,
+    ) -> Result<(), String> {
         node_transforms.clear();
         node_transforms.extend(
             self.sample_nodes
@@ -1873,6 +1991,8 @@ impl GltfModelData {
             let sample_nodes = self.nodes.clone();
             let node_count = sample_nodes.len();
             let sample_morph_weights = self.morph_weights.clone();
+            let blend_nodes = sample_nodes.clone();
+            let blend_morph_weights = sample_morph_weights.clone();
             Some(GltfAnimationData {
                 base_nodes: self.nodes,
                 base_morph_weights: self.morph_weights,
@@ -1885,6 +2005,8 @@ impl GltfModelData {
                 material_ids,
                 sample_nodes,
                 sample_morph_weights,
+                blend_nodes,
+                blend_morph_weights,
                 sample_globals: Vec::with_capacity(node_count),
                 sample_computed: Vec::with_capacity(node_count),
                 sample_visiting: Vec::with_capacity(node_count),
@@ -3196,6 +3318,114 @@ mod tests {
             capacities
         );
         assert_eq!(reused.capacity(), output_capacity);
+    }
+
+    #[test]
+    fn crossfades_fox_animation_poses() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("models")
+            .join("Fox")
+            .join("Fox.glb");
+        let model = GltfModelData::load(path).unwrap();
+        assert_eq!(
+            model
+                .animation_infos
+                .iter()
+                .map(|animation| animation.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Survey", "Walk", "Run"]
+        );
+        let mut loaded = model.into_loaded(0, 0).unwrap();
+        let from_time = loaded.animations[0].duration * 0.37;
+        let to_time = loaded.animations[2].duration * 0.61;
+        let source = loaded.sample_animation(0, from_time).unwrap();
+        let target = loaded.sample_animation(2, to_time).unwrap();
+        let mut blended = Vec::new();
+        let mut node_transforms = Vec::new();
+
+        loaded
+            .sample_blended_animations_with_nodes_into(
+                AnimationClipSample {
+                    clip_index: 0,
+                    time: from_time,
+                },
+                AnimationClipSample {
+                    clip_index: 2,
+                    time: to_time,
+                },
+                0.0,
+                &mut blended,
+                &mut node_transforms,
+            )
+            .unwrap();
+        assert_eq!(blended.len(), source.len());
+        assert!(blended.iter().zip(&source).all(|(blended, source)| {
+            blended
+                .skin_matrices
+                .iter()
+                .zip(&source.skin_matrices)
+                .all(|(blended, source)| blended.abs_diff_eq(*source, 1e-5))
+        }));
+
+        loaded
+            .sample_blended_animations_with_nodes_into(
+                AnimationClipSample {
+                    clip_index: 0,
+                    time: from_time,
+                },
+                AnimationClipSample {
+                    clip_index: 2,
+                    time: to_time,
+                },
+                1.0,
+                &mut blended,
+                &mut node_transforms,
+            )
+            .unwrap();
+        assert!(blended.iter().zip(&target).all(|(blended, target)| {
+            blended
+                .skin_matrices
+                .iter()
+                .zip(&target.skin_matrices)
+                .all(|(blended, target)| blended.abs_diff_eq(*target, 1e-5))
+        }));
+
+        loaded
+            .sample_blended_animations_with_nodes_into(
+                AnimationClipSample {
+                    clip_index: 0,
+                    time: from_time,
+                },
+                AnimationClipSample {
+                    clip_index: 2,
+                    time: to_time,
+                },
+                0.5,
+                &mut blended,
+                &mut node_transforms,
+            )
+            .unwrap();
+        assert!(!node_transforms.is_empty());
+        assert!(
+            blended
+                .iter()
+                .all(|instance| !instance.skin_matrices.is_empty())
+        );
+        assert!(
+            blended
+                .iter()
+                .zip(&source)
+                .zip(&target)
+                .any(|((blended, source), target)| blended
+                    .skin_matrices
+                    .iter()
+                    .zip(&source.skin_matrices)
+                    .zip(&target.skin_matrices)
+                    .any(|((blended, source), target)| {
+                        !blended.abs_diff_eq(*source, 1e-4) && !blended.abs_diff_eq(*target, 1e-4)
+                    }))
+        );
     }
 
     #[test]

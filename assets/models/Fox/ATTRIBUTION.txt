@@ -1,0 +1,14 @@
+Khronos glTF Sample Asset: Fox
+
+Source:
+https://github.com/KhronosGroup/glTF-Sample-Assets/tree/e124e8d8d7330a5372bc2b4d00d39a4a9d7997ea/Models/Fox
+
+The model demonstrates three animation clips: Survey, Walk, and Run.
+
+Credits and licenses:
+- Model: PixelMannen, 2014, CC0-1.0.
+- Rigging and animation: tomkranis, 2014, CC-BY-4.0.
+- glTF conversion: AsoboStudio and scurest, 2017, CC-BY-4.0.
+
+The model file is distributed without modifications. License details and links
+are in LICENSE.md.

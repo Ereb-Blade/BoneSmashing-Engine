@@ -2,14 +2,17 @@ use crate::camera::Camera;
 use crate::core::{MaterialId, MeshId};
 use crate::renderer::material::MaterialParams;
 use crate::renderer::state::{ParsedAsset, RendererSettings, parse_asset};
-use crate::scene::{ModelGroupId, RenderObject, Transform, World};
+use crate::scene::{
+    AnimationKeyboardControl, DEFAULT_ANIMATION_CROSSFADE_SECONDS, MAX_ANIMATION_CROSSFADE_SECONDS,
+    ModelGroupId, RenderObject, Transform, World,
+};
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const SCENE_FORMAT_VERSION: u32 = 7;
+const SCENE_FORMAT_VERSION: u32 = 9;
 const MAX_SCENE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SCENE_OBJECTS: usize = 100_000;
 const MAX_SCENE_ASSETS: usize = 256;
@@ -54,6 +57,14 @@ pub struct SceneAnimationSettings {
     pub speed: f32,
     pub looping: bool,
     pub playing: bool,
+    #[serde(default = "default_animation_crossfade_duration")]
+    pub crossfade_duration: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard_control: Option<AnimationKeyboardControl>,
+}
+
+fn default_animation_crossfade_duration() -> f32 {
+    DEFAULT_ANIMATION_CROSSFADE_SECONDS
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -263,6 +274,8 @@ impl SceneFile {
                     speed: animation.speed,
                     looping: animation.looping,
                     playing: animation.playing,
+                    crossfade_duration: animation.crossfade_duration,
+                    keyboard_control: Some(animation.keyboard_control),
                 }),
             });
         }
@@ -558,7 +571,11 @@ impl SceneFile {
                 || rotation.length_squared() <= f32::EPSILON
                 || !scale.is_finite()
                 || group.animation.is_some_and(|animation| {
-                    !animation.speed.is_finite() || !(0.1..=4.0).contains(&animation.speed)
+                    !animation.speed.is_finite()
+                        || !(0.1..=4.0).contains(&animation.speed)
+                        || !animation.crossfade_duration.is_finite()
+                        || !(0.0..=MAX_ANIMATION_CROSSFADE_SECONDS)
+                            .contains(&animation.crossfade_duration)
                 })
             {
                 return Err(format!("Model group {index} has invalid data"));
@@ -636,7 +653,7 @@ pub fn load_scene(path: &Path) -> Result<LoadedScene, String> {
     let mut file: SceneFile = serde_json::from_slice(&bytes)
         .map_err(|error| format!("Could not parse scene {}: {error}", path.display()))?;
     let legacy_scene = file.version == 1;
-    if matches!(file.version, 1..=6) {
+    if matches!(file.version, 1..=8) {
         file.version = SCENE_FORMAT_VERSION;
     }
     file.validate()?;
@@ -955,7 +972,7 @@ pub fn build_world(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scene::{ModelAnimationPlayback, Transform};
+    use crate::scene::{AnimationKeyboardControl, ModelAnimationPlayback, Transform};
 
     #[test]
     fn older_renderer_settings_default_to_eight_shadow_pcf_taps() {
@@ -1016,6 +1033,14 @@ mod tests {
             speed: 1.5,
             looping: false,
             playing: true,
+            crossfade_duration: 0.8,
+            keyboard_control: AnimationKeyboardControl {
+                enabled: true,
+                idle_clip_index: 1,
+                walk_clip_index: 0,
+                run_clip_index: 2,
+            },
+            ..ModelAnimationPlayback::default()
         });
 
         let file = SceneFile::from_world(&world, &scene_path).unwrap();
@@ -1028,11 +1053,34 @@ mod tests {
                 speed: 1.5,
                 looping: false,
                 playing: true,
+                crossfade_duration: 0.8,
+                keyboard_control: Some(AnimationKeyboardControl {
+                    enabled: true,
+                    idle_clip_index: 1,
+                    walk_clip_index: 0,
+                    run_clip_index: 2,
+                }),
             })
         );
+        let legacy_animation: SceneAnimationSettings = serde_json::from_value(serde_json::json!({
+            "clip_index": 0,
+            "speed": 1.0,
+            "looping": true,
+            "playing": false
+        }))
+        .unwrap();
+        assert_eq!(
+            legacy_animation.crossfade_duration,
+            DEFAULT_ANIMATION_CROSSFADE_SECONDS
+        );
+        assert_eq!(legacy_animation.keyboard_control, None);
 
         let mut invalid = decoded;
-        invalid.groups[0].animation.as_mut().unwrap().speed = 4.1;
+        invalid.groups[0]
+            .animation
+            .as_mut()
+            .unwrap()
+            .crossfade_duration = MAX_ANIMATION_CROSSFADE_SECONDS + 0.1;
         assert!(
             invalid
                 .validate()
@@ -1149,6 +1197,48 @@ mod tests {
         fs::create_dir(&scene_directory).unwrap();
         let scene_path = scene_directory.join("legacy.bse-scene");
         fs::write(&scene_path, br#"{"version":4,"objects":[]}"#).unwrap();
+
+        let loaded = load_scene(&scene_path).unwrap();
+
+        assert_eq!(loaded.file.version, SCENE_FORMAT_VERSION);
+        assert!(loaded.file.groups.is_empty());
+        fs::remove_dir_all(scene_directory).unwrap();
+    }
+
+    #[test]
+    fn migrates_version_seven_scenes_to_current_format() {
+        let scene_directory = std::env::temp_dir().join(format!(
+            "bone-smashing-v7-scene-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&scene_directory).unwrap();
+        let scene_path = scene_directory.join("legacy.bse-scene");
+        fs::write(&scene_path, br#"{"version":7,"objects":[]}"#).unwrap();
+
+        let loaded = load_scene(&scene_path).unwrap();
+
+        assert_eq!(loaded.file.version, SCENE_FORMAT_VERSION);
+        assert!(loaded.file.groups.is_empty());
+        fs::remove_dir_all(scene_directory).unwrap();
+    }
+
+    #[test]
+    fn migrates_version_eight_scenes_to_current_format() {
+        let scene_directory = std::env::temp_dir().join(format!(
+            "bone-smashing-v8-scene-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&scene_directory).unwrap();
+        let scene_path = scene_directory.join("legacy.bse-scene");
+        fs::write(&scene_path, br#"{"version":8,"objects":[]}"#).unwrap();
 
         let loaded = load_scene(&scene_path).unwrap();
 
@@ -1441,6 +1531,126 @@ mod tests {
         assert_eq!(
             world.objects()[0].transform.position,
             Vec3::new(1.0, 2.0, 3.0)
+        );
+    }
+
+    #[test]
+    fn benchmark_scene_fixture_has_fixed_scene_camera_and_render_settings() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("scenes")
+            .join("benchmark.bse-scene");
+        let loaded = load_scene(&path).unwrap();
+
+        assert!(loaded.assets.is_empty());
+        assert_eq!(loaded.file.objects.len(), 4);
+        let camera = loaded.file.camera.as_ref().unwrap();
+        assert_eq!(camera.position, [0.0, 2.0, 6.0]);
+        assert_eq!(camera.yaw, -std::f32::consts::FRAC_PI_2);
+        assert_eq!(camera.pitch, -15.0_f32.to_radians());
+        let settings = loaded.file.renderer_settings.unwrap();
+        assert!(settings.shadows_enabled);
+        assert_eq!(settings.shadow_pcf_samples, 8);
+        assert_eq!(settings.render_scale, 1.0);
+        assert_eq!(settings.msaa_samples, 1);
+        assert!(settings.unlocked_fps);
+        assert_eq!(settings.key_light_yaw_degrees, -142.0);
+        assert_eq!(settings.key_light_elevation_degrees, -53.0);
+        assert_eq!(settings.exposure_ev, -0.5);
+
+        let world = build_world(
+            &loaded.file,
+            crate::core::MESH_SPHERE.0 + 1,
+            crate::core::MATERIAL_GLASS.0 + 1,
+            HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(world.objects()[0].mesh_id, crate::core::MESH_PLANE);
+        assert_eq!(world.objects()[1].mesh_id, crate::core::MESH_SPHERE);
+        assert_eq!(world.objects()[1].material_id, crate::core::MATERIAL_GOLD);
+        assert_eq!(world.objects()[2].material_id, crate::core::MATERIAL_SILVER);
+        assert_eq!(world.objects()[3].material_id, crate::core::MATERIAL_GLASS);
+        assert_eq!(
+            world.objects()[1].transform.position,
+            Vec3::new(-2.0, -0.32, 0.0)
+        );
+        assert_eq!(world.objects()[1].transform.scale, Vec3::splat(0.68));
+    }
+
+    #[test]
+    fn flight_helmet_test_scene_loads_all_pbr_parts_and_textures() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("scenes")
+            .join("flight_helmet_test.bse-scene");
+        let loaded = load_scene(&path).unwrap();
+
+        assert_eq!(loaded.file.groups.len(), 1);
+        assert_eq!(loaded.file.objects.len(), 7);
+        assert_eq!(loaded.assets.len(), 1);
+        let SceneObjectSource::Asset {
+            path: object_path, ..
+        } = &loaded.file.objects[1].source
+        else {
+            panic!("Flight Helmet model part must reference the imported asset");
+        };
+        assert_eq!(
+            loaded.file.groups[0].path.as_deref().unwrap(),
+            object_path.as_str()
+        );
+        let ParsedAsset::Gltf(model) = loaded.assets.values().next().unwrap() else {
+            panic!("Flight Helmet fixture must load as glTF");
+        };
+        assert_eq!(model.instance_count(), 6);
+        assert_eq!(model.primitives.len(), 6);
+        assert_eq!(model.materials.len(), 7);
+        assert_eq!(model.images.len(), 15);
+
+        let settings = loaded.file.renderer_settings.unwrap();
+        assert!(settings.shadows_enabled);
+        assert_eq!(settings.shadow_pcf_samples, 8);
+        assert_eq!(settings.render_scale, 1.0);
+        assert_eq!(settings.msaa_samples, 1);
+    }
+
+    #[test]
+    fn animation_crossfade_scene_loads_three_playing_foxes() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("scenes")
+            .join("animation_crossfade_test.bse-scene");
+        let loaded = load_scene(&path).unwrap();
+
+        assert_eq!(loaded.file.groups.len(), 3);
+        assert_eq!(loaded.file.objects.len(), 4);
+        assert_eq!(loaded.assets.len(), 1);
+        assert_eq!(
+            loaded
+                .file
+                .groups
+                .iter()
+                .map(|group| group.animation.unwrap().clip_index)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert!(loaded.file.groups.iter().all(|group| {
+            let animation = group.animation.unwrap();
+            animation.playing
+                && animation.looping
+                && animation.crossfade_duration == 0.45
+                && group
+                    .path
+                    .as_deref()
+                    .is_some_and(|path| Path::new(path).ends_with(Path::new("Fox").join("Fox.glb")))
+        }));
+        assert!(
+            loaded
+                .file
+                .objects
+                .iter()
+                .skip(1)
+                .enumerate()
+                .all(|(index, object)| object.model_group == Some(index))
         );
     }
 

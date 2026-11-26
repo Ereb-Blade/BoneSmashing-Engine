@@ -1,0 +1,7 @@
+Model: Flight Helmet
+Source: KhronosGroup/glTF-Sample-Assets, Models/FlightHelmet
+Source revision: e124e8d7330a5372bc2b4d00d39a4a9d7997ea
+Model files are licensed CC0-1.0; see LICENSE.md.
+Upstream: https://github.com/KhronosGroup/glTF-Sample-Assets/tree/e124e8d7330a5372bc2b4d00d39a4a9d7997ea/Models/FlightHelmet
+The geometry and glTF material data are unmodified. Source textures larger than
+1024x1024 were downscaled to 1024x1024 for the local test fixture.

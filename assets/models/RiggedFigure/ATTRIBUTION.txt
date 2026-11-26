@@ -1,0 +1,7 @@
+Khronos glTF Sample Asset: Rigged Figure
+
+Source:
+https://github.com/KhronosGroup/glTF-Sample-Assets/tree/e124e8d8d7330a5372bc2b4d00d39a4a9d7997ea/Models/RiggedFigure
+
+Model: Cesium, 2017, CC-BY-4.0.
+The model file is distributed without modifications.

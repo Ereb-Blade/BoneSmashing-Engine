@@ -3429,6 +3429,107 @@ mod tests {
     }
 
     #[test]
+    fn crossfades_rigged_figure_animation_on_its_own_skeleton() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("models")
+            .join("RiggedFigure")
+            .join("RiggedFigure.glb");
+        let model = GltfModelData::load(path).unwrap();
+        assert_eq!(model.skins.len(), 1);
+        assert_eq!(model.skins[0].joints.len(), 19);
+        assert_eq!(model.animation_infos.len(), 1);
+
+        let mut loaded = model.into_loaded(0, 0).unwrap();
+        let duration = loaded.animations[0].duration;
+        let from = AnimationClipSample {
+            clip_index: 0,
+            time: 0.0,
+        };
+        let to = AnimationClipSample {
+            clip_index: 0,
+            time: duration,
+        };
+        let source = loaded.sample_animation(from.clip_index, from.time).unwrap();
+        let target = loaded.sample_animation(to.clip_index, to.time).unwrap();
+        let mut blended = Vec::new();
+        let mut node_transforms = Vec::new();
+
+        loaded
+            .sample_blended_animations_with_nodes_into(
+                from,
+                to,
+                0.0,
+                &mut blended,
+                &mut node_transforms,
+            )
+            .unwrap();
+        assert!(blended.iter().zip(&source).all(|(blended, source)| {
+            blended
+                .node_transform
+                .abs_diff_eq(source.node_transform, 1e-5)
+                && blended.skin_matrices.len() == 19
+                && blended
+                    .skin_matrices
+                    .iter()
+                    .zip(&source.skin_matrices)
+                    .all(|(blended, source)| blended.abs_diff_eq(*source, 1e-5))
+        }));
+
+        loaded
+            .sample_blended_animations_with_nodes_into(
+                from,
+                to,
+                0.5,
+                &mut blended,
+                &mut node_transforms,
+            )
+            .unwrap();
+        assert!(!node_transforms.is_empty());
+        assert!(blended.iter().all(|instance| {
+            instance
+                .skin_matrices
+                .iter()
+                .all(|matrix| matrix.is_finite())
+        }));
+        assert!(
+            blended
+                .iter()
+                .zip(&source)
+                .zip(&target)
+                .any(|((blended, source), target)| blended
+                    .skin_matrices
+                    .iter()
+                    .zip(&source.skin_matrices)
+                    .zip(&target.skin_matrices)
+                    .any(|((blended, source), target)| {
+                        !blended.abs_diff_eq(*source, 1e-4) && !blended.abs_diff_eq(*target, 1e-4)
+                    }))
+        );
+
+        loaded
+            .sample_blended_animations_with_nodes_into(
+                from,
+                to,
+                1.0,
+                &mut blended,
+                &mut node_transforms,
+            )
+            .unwrap();
+        assert!(blended.iter().zip(&target).all(|(blended, target)| {
+            blended
+                .node_transform
+                .abs_diff_eq(target.node_transform, 1e-5)
+                && blended.skin_matrices.len() == 19
+                && blended
+                    .skin_matrices
+                    .iter()
+                    .zip(&target.skin_matrices)
+                    .all(|(blended, target)| blended.abs_diff_eq(*target, 1e-5))
+        }));
+    }
+
+    #[test]
     fn samples_linear_morph_target_weights() {
         let channel = AnimationChannelData {
             node_index: 0,

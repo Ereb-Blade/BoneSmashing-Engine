@@ -42,6 +42,20 @@
         "playing": true,
         "crossfade_duration": 0.45
       }
+    },
+    {
+      "name": "Rigged Figure",
+      "path": "../models/RiggedFigure/RiggedFigure.glb",
+      "position": [3.2, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.0, 1.0, 1.0],
+      "animation": {
+        "clip_index": 0,
+        "speed": 1.0,
+        "looping": true,
+        "playing": true,
+        "crossfade_duration": 0.45
+      }
     }
   ],
   "objects": [
@@ -91,10 +105,22 @@
       "position": [0.0, 0.0, 0.0],
       "rotation": [0.0, 0.0, 0.0, 1.0],
       "scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "source": {
+        "type": "asset",
+        "path": "../models/RiggedFigure/RiggedFigure.glb",
+        "instance_index": 0
+      },
+      "model_group": 3,
+      "name": "Rigged Figure mesh",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.0, 1.0, 1.0]
     }
   ],
   "camera": {
-    "position": [0.0, 1.45, 5.2],
+    "position": [0.0, 1.55, 7.0],
     "yaw": -1.5707964,
     "pitch": -0.12,
     "up": [0.0, 1.0, 0.0]

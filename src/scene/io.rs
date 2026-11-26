@@ -1614,16 +1614,16 @@ mod tests {
     }
 
     #[test]
-    fn animation_crossfade_scene_loads_three_playing_foxes() {
+    fn animation_crossfade_scene_loads_fox_and_rigged_figure() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets")
             .join("scenes")
             .join("animation_crossfade_test.bse-scene");
         let loaded = load_scene(&path).unwrap();
 
-        assert_eq!(loaded.file.groups.len(), 3);
-        assert_eq!(loaded.file.objects.len(), 4);
-        assert_eq!(loaded.assets.len(), 1);
+        assert_eq!(loaded.file.groups.len(), 4);
+        assert_eq!(loaded.file.objects.len(), 5);
+        assert_eq!(loaded.assets.len(), 2);
         assert_eq!(
             loaded
                 .file
@@ -1631,18 +1631,45 @@ mod tests {
                 .iter()
                 .map(|group| group.animation.unwrap().clip_index)
                 .collect::<Vec<_>>(),
-            [0, 1, 2]
+            [0, 1, 2, 0]
         );
         assert!(loaded.file.groups.iter().all(|group| {
             let animation = group.animation.unwrap();
-            animation.playing
-                && animation.looping
-                && animation.crossfade_duration == 0.45
-                && group
-                    .path
-                    .as_deref()
-                    .is_some_and(|path| Path::new(path).ends_with(Path::new("Fox").join("Fox.glb")))
+            animation.playing && animation.looping && animation.crossfade_duration == 0.45
         }));
+        assert!(loaded.file.groups[..3].iter().all(|group| {
+            group
+                .path
+                .as_deref()
+                .is_some_and(|path| Path::new(path).ends_with(Path::new("Fox").join("Fox.glb")))
+        }));
+        assert!(loaded.file.groups[3].path.as_deref().is_some_and(|path| {
+            Path::new(path).ends_with(Path::new("RiggedFigure").join("RiggedFigure.glb"))
+        }));
+        let fox_model = loaded
+            .assets
+            .iter()
+            .find_map(|(path, asset)| {
+                path.ends_with(Path::new("Fox").join("Fox.glb"))
+                    .then_some(asset)
+            })
+            .unwrap();
+        let ParsedAsset::Gltf(fox_model) = fox_model else {
+            panic!("Fox fixture must load as glTF");
+        };
+        assert!(fox_model.instance_count() > 0);
+        let rigged_figure = loaded
+            .assets
+            .iter()
+            .find_map(|(path, asset)| {
+                path.ends_with(Path::new("RiggedFigure").join("RiggedFigure.glb"))
+                    .then_some(asset)
+            })
+            .unwrap();
+        let ParsedAsset::Gltf(rigged_figure) = rigged_figure else {
+            panic!("Rigged Figure fixture must load as glTF");
+        };
+        assert!(rigged_figure.instance_count() > 0);
         assert!(
             loaded
                 .file

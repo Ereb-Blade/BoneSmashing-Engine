@@ -1,8 +1,8 @@
 # Полный технический аудит Rust-движка
 
-**Дата аудита:** 2026-11-24
+**Первичный аудит:** 2026-11-24
 
-**Актуализация этапа 1:** 2026-11-25
+**Актуализировано:** 2026-11-27 по состоянию коммита `91a9bde`
 
 ## 1. Общая информация о проекте
 
@@ -19,20 +19,21 @@
 - файловые диалоги: `rfd`;
 - сборка: один исполняемый binary crate.
 
-Проект уже значительно превратился в рабочее демонстрационное ядро. Реализованы сцена, редакторский UI, загрузка моделей, PBR, IBL, HDR, тени, скелетная анимация и стекло.
+Проект уже значительно превратился в рабочее демонстрационное ядро. Реализованы сцена, редакторский UI, загрузка моделей, PBR, IBL, HDR, тени, скелетная анимация, стекло и локальные point/spot lights с редакторским gizmo.
 
 Текущая общая оценка: **рабочая прототипная и демонстрационная база, но пока не production-ready для больших или сложных сцен**.
 
-Ниже все выводы основаны на изученном исходном коде и проверках `cargo test` и strict Clippy.
+Ниже выводы сверены с текущим исходным кодом, включая локальное освещение, сценовую иерархию и viewport-иконки.
 
 ### Результаты проверки
 
-- `cargo test`: пройдена, **105 тестов**, 0 ошибок.
-- Покрытие тестами включает математику камеры и матриц, scene hierarchy, cache matrices, scene serialization и миграции формата, undo/redo, animation sampling, OBJ/glTF импорт, mipmaps, IBL/environment, frustum culling, MSAA и shadow queue.
-- `cargo build --release`: согласно предыдущей проверке проекта сборка проходит.
-- `cargo clippy --all-targets --all-features -- -D warnings`: проходит после cleanup.
+- `cargo test`: пройдена, **144 теста**, 0 ошибок.
+- Покрытие тестами включает scene hierarchy и parented lights, их сериализацию и загрузку тестовых сцен, viewport picking, one-step undo для перетаскивания света, animation sampling, импорт OBJ/glTF, mipmaps, IBL/environment, frustum culling, MSAA, shader validation и shadow queue.
+- `cargo check --release`: проходит без предупреждений.
+- `cargo clippy --all-targets --all-features -- -D warnings`: проходит.
+- `cargo fmt --all -- --check` и `git diff --check`: проходят.
 - Strict lint-проверка включена в GitHub Actions CI.
-- Live-render/FPS/визуальная проверка не была проведена; по коду нельзя подтверждать FPS или реальную GPU-производительность.
+- Автоматические тесты проверяют поведение и компиляцию, но live-визуальная проверка значков в запущенном окне не проводилась; FPS и реальную GPU-производительность аудит не подтверждает.
 
 ## 2. Полная структура проекта
 
@@ -67,10 +68,11 @@
 
 ### Ресурсы и документация
 
-- `assets/models/Verity.glb` — тестовая animated glTF-модель.
-- `assets/models/sample.gltf` и `assets/models/sample.obj` — тестовые модели.
+- `assets/models/` содержит тестовые модели Fox, RiggedFigure, FlightHelmet и CarConcept.
+- `assets/scenes/` содержит animation, local-light, showroom, benchmark и другие тестовые сцены.
+- `assets/environments/dikhololo_night_2k.hdr` — ночное окружение CC0 для сцены локального освещения.
 - `Dark grey.jpg` и `texture.png` — встроенные и тестовые текстуры.
-- `README.md` — краткая документация возможностей.
+- `README.md` — пользовательская документация; `AUDIT.md` — техническая оценка и ограничения.
 - `Cargo.toml` / `Cargo.lock` — зависимости и lock-файл.
 
 Директория `target/` содержит артефакты сборки и не является исходным кодом движка. Файлы `Dark grey.jpg` и `texture.png` находятся в корне проекта; небольшая организация репозитория стала бы чище, если разместить встроенные и тестовые текстуры внутри `assets/textures/`.
@@ -118,7 +120,7 @@ winit
 
 - `App` хранит window, renderer, world, анимационные кеши и UI одновременно;
 - `Renderer` является владельцем pipeline, resource state, frame state, shadow cache и environment cache;
-- `DebugUi` имеет около 3000 строк и сильно связан с World и Renderer;
+- `DebugUi` имеет около 4.5 тыс. строк и сильно связан с World и Renderer;
 - нет отдельного asset manager с lifetime и reference counting;
 - нет ECS или устойчивого runtime API;
 - нет render graph или явной модели frame dependencies;
@@ -142,7 +144,7 @@ winit
 
 При resize обновляется aspect камеры и внутренние render targets.
 
-Проблема: [`src/app.rs:571`](src/app.rs:571) содержит `.unwrap()` при создании окна. Это означает, что системная ошибка окна может стать process panic вместо graceful shutdown.
+Создание окна обрабатывает ошибку через `Result`, пишет диагностику в stderr и завершает event loop без `.unwrap()`; startup panic path из первичного аудита устранён.
 
 ### Ввод
 
@@ -190,6 +192,7 @@ winit
 - standalone objects;
 - model groups;
 - group parent links;
+- local point/spot lights with optional model-group parents;
 - glTF node metadata;
 - animation playback;
 - rotating object;
@@ -204,6 +207,9 @@ World умеет:
 - сохранять world transform при reparent;
 - проверять cycle;
 - отклонять shear-only reparent;
+- сохранять мировую позу света при attach/detach;
+- получать мировые position/direction источника через transform parent;
+- удалять дочерние lights вместе с удаляемой model-group веткой;
 - кэшировать world matrices;
 - маркировать только затронутые descendants dirty.
 
@@ -222,8 +228,9 @@ model = parent_node_world или model_group_world * object_local
 Формат:
 
 - JSON;
-- версия формата 7;
+- текущая версия формата 9;
 - scene groups;
+- до 16 локальных point/spot lights с optional `parent_group`;
 - scene objects;
 - camera;
 - renderer settings;
@@ -237,14 +244,17 @@ model = parent_node_world или model_group_world * object_local
 - max 100 000 объектов;
 - max 1000 model groups;
 - max 256 assets;
-- backward compatibility до старых форматов;
+- backward compatibility для старых форматов, включая сцены без `lights`;
 - reject unknown fields;
 - validation finite values;
 - cycle detection;
 - относительные asset paths внутри папки сцены;
 - absolute paths за пределами папки проекта.
 
-Сцена сохраняет camera, light, exposure, shadows, MSAA, render scale, HDR environment и animation playback state. Время анимации намеренно не сохраняется.
+Сцена сохраняет camera, направленный и локальные источники света, exposure,
+shadows, MSAA, render scale, HDR environment и animation playback state. Parent
+света сериализуется индексом группы, а не runtime ID. Время анимации намеренно
+не сохраняется.
 
 Главный недостаток формата: он привязан к mesh/material numeric IDs и конкретным renderer settings. Более стабильный формат должен оперировать asset handles и named resources.
 
@@ -268,13 +278,15 @@ Morph targets загружаются с POSITION/NORMAL/TANGENT displacements; �
 
 Анимационные модели загружаются в `animation_models: HashMap<PathBuf, LoadedGltfModel>`. Сэмплинг выполняется только при изменении clip/time.
 
-Поддержка хорошо реализована для базовых skeletal animations. Не реализован animation graph/blending/layering.
+Поддерживаются базовые clip cross-fades и смешивание skeletal poses/morph weights. Не реализованы animation graph, state machine и layered blending.
 
 ### Редактор и UI
 
 Debug UI включает:
 
 - scene hierarchy;
+- отдельную вкладку **Lights** с add/edit/delete и выбором родителя;
+- кликабельные редакторские point/spot glyphs в viewport, hover-name и spot direction;
 - object/group selection;
 - material inspector;
 - model inspector;
@@ -291,7 +303,12 @@ Debug UI включает:
 - scene open/save;
 - profiler counters.
 
-Undo хранит до 32 snapshots.
+Light icons рисуются только egui overlay при открытом редакторе и не попадают
+в игровой render path. Они не используют depth test, поэтому видны поверх
+геометрии. Spot glyph показывает направление, но не масштаб cone/range.
+
+Undo хранит до 32 snapshots. Для одной операции перетаскивания света создаётся
+один undo step.
 
 UI рабочий, но `debug_ui.rs` является очень крупным orchestration-модулем. Он зависит от world, renderer, scene I/O и egui одновременно.
 
@@ -299,7 +316,7 @@ UI рабочий, но `debug_ui.rs` является очень крупным
 
 ### GPU backend
 
-В [`Renderer::new`](src/renderer/state.rs:616):
+В [`Renderer::new`](src/renderer/state.rs):
 
 - создаётся `wgpu::Instance`;
 - создаётся surface;
@@ -315,8 +332,11 @@ UI рабочий, но `debug_ui.rs` является очень крупным
 - recovery после lost device;
 - GPU health monitor;
 - fallback backend UI;
-- adaptive backend selection;
-- GPU timestamp infrastructure.
+- adaptive backend selection.
+
+При поддержке необходимых adapter features доступны GPU timestamp queries для
+кадра, shadow map и opaque pass; при отсутствии поддержки эти значения
+показываются как unavailable.
 
 ### Render path от модели до экрана
 
@@ -406,6 +426,7 @@ PBR включает GGX, Schlick geometry, Fresnel, ambient IBL, direct light, 
 - transmission;
 - volume thickness;
 - IOR;
+- clearcoat factors and textures;
 - specular factor;
 - specular color;
 - specular-glossiness;
@@ -415,7 +436,7 @@ PBR включает GGX, Schlick geometry, Fresnel, ambient IBL, direct light, 
 - до 4 UV sets;
 - glTF texture transform.
 
-Обнаружено ограничение: clearcoat, sheen, iridescence, anisotropy и dispersion могут считаться допустимыми extension именами при загрузке, но в shader соответствующие параметры не реализованы. Для таких форматов фактическая реализация будет неполной.
+Обнаружено ограничение: clearcoat уже импортируется и поддерживается в PBR shader, но sheen, iridescence, anisotropy и dispersion не реализованы. Такие расширения игнорируются с предупреждением; фактический материал может отличаться от оригинала.
 
 ### Textures и mipmaps
 
@@ -428,6 +449,9 @@ PBR включает GGX, Schlick geometry, Fresnel, ambient IBL, direct light, 
 - emissive;
 - specular;
 - specular color;
+- clearcoat;
+- clearcoat roughness;
+- clearcoat normal;
 - transmission;
 - thickness.
 
@@ -438,13 +462,13 @@ GLTF-контент ограничен:
 - device max texture dimension;
 - `MAX_IMPORTED_TEXTURE_DIMENSION = 4096`.
 
-OBJ текстуры downscale до 4096 px. Самый значимый риск — отсутствует общий OBJ memory budget на все изображения.
+OBJ текстуры downscale до 4096 px и ограничены общими бюджетами 128 MiB для raw image data и 128 MiB для mipmaps. Пиковое потребление памяти на крупных наборах текстур отдельно не профилировалось.
 
 ### Форматы GPU-ресурсов и валидация данных
 
-- Индексы в обоих импортерах хранятся как `Uint32`; в [`src/renderer/mesh.rs:17`](src/renderer/mesh.rs:17) массив индексов имеет тип `Vec<u32>`, а glTF индексы конвертируются через `into_u32()` в [`src/renderer/gltf.rs:1097`](src/renderer/gltf.rs:1097). Поддержки `Uint16` для экономии индекса нет.
-- OBJ проверяет u32 vertex count с `u32::try_from` и checked addition в [`src/renderer/mesh.rs:280`](src/renderer/mesh.rs:280). Также проверяются пустые triangles, incomplete normals/UV, out-of-range indices и non-finite vertex data.
-- glTF проверяет количество и диапазоны индексов, mismatched vertex attributes и non-finite positions/normals/tangents/UV/colors/weights в [`src/renderer/gltf.rs:1058`](src/renderer/gltf.rs:1058).
+- Индексы в обоих импортерах хранятся как `Uint32`; массив индексов имеет тип `Vec<u32>` в [`src/renderer/mesh.rs`](src/renderer/mesh.rs), а glTF индексы конвертируются через `into_u32()` в [`src/renderer/gltf.rs`](src/renderer/gltf.rs). Поддержки `Uint16` для экономии индекса нет.
+- OBJ проверяет u32 vertex count с `u32::try_from` и checked addition в [`src/renderer/mesh.rs`](src/renderer/mesh.rs). Также проверяются пустые triangles, incomplete normals/UV, out-of-range indices и non-finite vertex data.
+- glTF проверяет количество и диапазоны индексов, mismatched vertex attributes и non-finite positions/normals/tangents/UV/colors/weights в [`src/renderer/gltf.rs`](src/renderer/gltf.rs).
 - Нулевые glTF/OBJ меши отклоняются по empty position/index conditions.
 - Матрицы glTF node и animation дополнительно проверяются на finite/invalid rotation/non-invertible skin node data.
 - Большой формат индексов пока не приводит к явной переполненной нумерации, так как count/ranges проверены и индексный тип фиксирован, но без mesh splitting каждый primitive ограничен общим u32-диапазоном.
@@ -488,13 +512,20 @@ HDR/EXR loading выполняется в worker thread. Texture processing ис
 - один fill directional light;
 - ambient IBL;
 - ambient top/bottom coefficients;
-- no point/spot lights.
+- до 16 локальных point/spot lights на сцену;
+- дальностное затухание с мягким обрезанием по range;
+- smooth cone для spotlights;
+- локальная позиция/направление с преобразованием через parent group;
+- сохранение и загрузка lights в формате сцены.
 
-Это рабочая демонстрационная система. Для большого количества lights потребуется другой архитектурный подход.
+Локальные источники добавляются в shared light uniform и вычисляются
+per-fragment в основном PBR path. Текущий shader перебирает все включённые
+источники до фиксированного лимита; clustered/forward+ culling не реализованы.
+Локальные lights не отбрасывают тени.
 
 ### Shadows
 
-Используется одна directional shadow map 2048×2048.
+Используется одна directional shadow map 4096×4096.
 
 Shadow pass:
 
@@ -503,9 +534,9 @@ Shadow pass:
 - поддерживает cutout shadows;
 - имеет отдельный shadow instance buffer;
 - кэширует matrix/instances/batches;
-- использует PCF 4 taps.
+- поддерживает выбираемое PCF число taps 2/4/8/16 (по умолчанию 8).
 
-Fixed orthographic volume ±7.5 является основным ограничением. Shadow frustum не follows scene bounds и не является cascaded.
+Directional shadow camera подстраивается под bounds сцены. Если валидных bounds нет, используется legacy fallback volume ±7.5. Остаются ограничения одной directional shadow map без cascades и без локальных теней.
 
 ### Frustum culling
 
@@ -570,7 +601,7 @@ Glass shader использует:
 
 #### Window creation
 
-Место: [`src/app.rs:571`](src/app.rs:571)
+Место: [`src/app.rs`](src/app.rs)
 Статус: исправлено в этапе 1.
 
 Ошибка создания окна теперь обрабатывается через `match`; текст ошибки выводится в stderr, а event loop завершается явно.
@@ -584,7 +615,7 @@ Glass shader использует:
 
 #### Сворачивание окна и resize до нуля
 
-Место: [`src/app.rs:809`](src/app.rs:809) и [`src/renderer/state.rs:969`](src/renderer/state.rs:969)
+Место: [`src/app.rs`](src/app.rs) и [`src/renderer/state.rs`](src/renderer/state.rs)
 
 Статус: исправлено в этапе 1.
 
@@ -593,7 +624,7 @@ Glass shader использует:
 
 #### Необработанные uncaptured GPU validation errors
 
-Место: создание device в [`src/renderer/state.rs:616`](src/renderer/state.rs:616)
+Место: создание device в [`src/renderer/state.rs`](src/renderer/state.rs)
 
 Статус: частично исправлено в этапе 1.
 
@@ -607,10 +638,10 @@ Glass shader использует:
 
 #### glTF extensions
 
-Место: [`src/renderer/gltf.rs:204`](src/renderer/gltf.rs:204)
+Место: [`src/renderer/gltf.rs`](src/renderer/gltf.rs)
 Статус: исправлено в совместимом режиме на этапе 1.
 
-Проблема: clearcoat, sheen, iridescence, anisotropy и dispersion считаются допустимыми, но параметров в shader нет.
+Clearcoat импортируется и поддерживается шейдером, включая factors/textures. Sheen, iridescence, anisotropy и dispersion остаются неподдержанными extensions.
 
 Причина: file format allowlist шире actual rendering support.
 
@@ -618,16 +649,16 @@ Glass shader использует:
 
 Критичность: средняя.
 
-Решение этапа 1: импорт не прерывается целиком; неподдержанное расширение игнорируется с диагностическим предупреждением, а базовый PBR-материал сохраняется. Полная реализация clearcoat/sheen/etc остаётся отдельной задачей графического этапа.
+Решение этапа 1: импорт не прерывается целиком; неподдержанное расширение игнорируется с диагностическим предупреждением, а базовый PBR-материал сохраняется. Полная реализация sheen/iridescence/anisotropy/dispersion остаётся отдельной задачей графического этапа.
 
 ### P1 — память текстур
 
 #### OBJ texture budget
 
-Место: [`src/renderer/mesh.rs:28`](src/renderer/mesh.rs:28)
+Место: [`src/renderer/mesh.rs`](src/renderer/mesh.rs)
 Статус: исправлено в этапе 1.
 
-Проблема: для OBJ нет общего image/mipmap budget; ограничиваются только dimension 4096.
+Для OBJ добавлены общие лимиты 128 MiB на raw images и 128 MiB на mipmaps, помимо dimension 4096.
 
 Причина: множество текстур суммарно могут потреблять много RAM/VRAM.
 
@@ -635,21 +666,21 @@ Glass shader использует:
 
 Критичность: средняя-высокая.
 
-Рекомендация: общая policy для raw/mipmap budgets и device limits.
+Остаточный риск: реальные пиковые RAM/VRAM на больших наборах текстур отдельно не измерялись.
 
 ### P1 — shadow scaling
 
-Место: [`src/renderer/state.rs:404`](src/renderer/state.rs:404)
+Место: [`src/renderer/state.rs`](src/renderer/state.rs)
 
-Проблема: fixed ±7.5 shadow volume.
+Directional shadow camera теперь автоматически подбирается по bounds сцены. Legacy fixed volume ±7.5 остаётся fallback, если нет валидных bounds.
 
-Причина: орфографическая матрица не масштабируется по scene bounds.
+Причина: fallback матрица не масштабируется по scene bounds; основной bounds-aware путь уже расширяет покрытие.
 
-Последствия: удалённые объекты теряют тени.
+Последствия: fallback может обрезать удалённые объекты; основной путь всё ещё использует одну карту и не поддерживает cascades.
 
 Критичность: средняя для open world.
 
-Рекомендация: scene-aware shadow framing или cascaded shadow maps.
+Рекомендация: проверить качество bounds-based framing на разнообразных сценах и рассмотреть cascaded shadow maps.
 
 ### P1 — strict Clippy
 
@@ -663,7 +694,7 @@ Glass shader использует:
 
 #### HDR environment
 
-Место: [`src/renderer/state.rs:1195`](src/renderer/state.rs:1195) и [`src/renderer/debug_ui.rs:1028`](src/renderer/debug_ui.rs:1028)
+Место: [`src/renderer/state.rs`](src/renderer/state.rs) и [`src/renderer/debug_ui.rs`](src/renderer/debug_ui.rs)
 
 Проблема: повторный запуск HDR blocked до завершения текущей загрузки через единственный `environment_load` receiver. В данном потоке кода старый результат не перезаписывает новый, потому что новый результат не может быть запущен до очистки receiver.
 
@@ -681,7 +712,7 @@ Glass shader использует:
 
 #### Scene/asset loading
 
-Место: [`src/renderer/debug_ui.rs:1080`](src/renderer/debug_ui.rs:1080), [`src/renderer/debug_ui.rs:1180`](src/renderer/debug_ui.rs:1180)
+Место: [`src/renderer/debug_ui.rs`](src/renderer/debug_ui.rs)
 
 Проблема: UI временно отключает scene I/O и asset import, пока загрузка активна, поэтому параллельная загрузка нескольких сцен или моделей в основных ветках не создаётся пользователем.
 
@@ -695,7 +726,7 @@ Glass shader использует:
 
 ### P1 — выгрузка GPU-ресурсов
 
-Место: [`src/renderer/state.rs:1089`](src/renderer/state.rs:1089), [`src/renderer/state.rs:1102`](src/renderer/state.rs:1102)
+Место: [`src/renderer/state.rs`](src/renderer/state.rs)
 
 Проблема: при discard/scene asset retain ненужные `Mesh`/`Material` удаляются из Vec и Rust-owned GPU resources могут быть освобождены при drop. Перекрывающийся bind group/textures lifecycle определяется вложенными владельцами этих типов.
 
@@ -714,7 +745,7 @@ Glass shader использует:
 
 ### P1 — память Undo и согласованность snapshots
 
-Место: [`src/renderer/debug_ui.rs:71`](src/renderer/debug_ui.rs:71), [`src/renderer/debug_ui.rs:108`](src/renderer/debug_ui.rs:108)
+Место: [`src/renderer/debug_ui.rs`](src/renderer/debug_ui.rs)
 
 Проблема: хранится до 32 глубоких clones `World`, каждый snapshot содержит scene hierarchy, objects и caches.
 
@@ -735,7 +766,7 @@ Glass shader использует:
 
 #### Монолитный Renderer
 
-Место: [`src/renderer/state.rs:514`](src/renderer/state.rs:514)
+Место: [`src/renderer/state.rs`](src/renderer/state.rs)
 
 Проблема: один state хранит pipelines, resources, batches, cache, settings и async receiver.
 
@@ -761,7 +792,7 @@ Glass shader использует:
 
 #### Монолитный App
 
-Место: [`src/app.rs:115`](src/app.rs:115)
+Место: [`src/app.rs`](src/app.rs)
 
 Проблема: App хранит window, renderer, camera, world, UI, animation и asset caches.
 
@@ -782,9 +813,10 @@ Glass shader использует:
 - нет GPU culling;
 - нет LOD;
 - нет occlusion culling;
-- fixed shadow pass;
+- одна directional shadow map фиксированного разрешения 4096×4096, без cascades;
 - environment preprocessing занимает CPU worker;
-- нет timestamp queries.
+- GPU timestamps cover frame/shadow/opaque, но нет устойчивого benchmark baseline
+  и профилей для каждой стадии.
 
 ## 7. Анализ производительности
 
@@ -809,7 +841,7 @@ Glass shader использует:
 - triangle count;
 - MSAA;
 - Rgba16Float frame copies;
-- 4-tap PCF;
+- PCF с настраиваемым числом taps (default 8);
 - glass extra passes/copies;
 - skinning vertex shader;
 - many material bind groups;
@@ -818,26 +850,16 @@ Glass shader использует:
 
 Нет данных для гарантированной оценки FPS.
 
-### Неизмеренные параметры
+### Инструментирование и неизмеренные параметры
 
-Нужны benchmarks и профилирование:
+В editor Performance panel доступны CPU UI/scene/acquire/submit timings,
+GPU frame/shadow/opaque timings при поддержке adapter timestamps, draw calls,
+triangles и scene counters. Это базовое live-инструментирование, не benchmark.
 
-- CPU scene preparation;
-- CPU animation;
-- CPU UI;
-- acquire/encode cost;
-- GPU frame time;
-- draw calls;
-- triangles;
-- active instances;
-- active materials;
-- batches;
-- peak VRAM;
-- peak RAM;
-- import time;
-- environment preparation time.
-
-Без этих измерений нельзя указывать конкретные FPS или обещанные лимиты сцен.
+Не измерены воспроизводимые performance baselines, peak VRAM/RAM, стоимость
+импорта и подготовки environment, а также масштабирование на фиксированных
+наборах 10k/100k объектов. Без таких прогонов нельзя указывать конкретные FPS
+или обещанные лимиты сцен.
 
 ## 8. Оценка готовности подсистем
 
@@ -856,21 +878,21 @@ Glass shader использует:
 | Materials | Рабочая реализация |
 | PBR | Частично реализована |
 | IBL/HDR | Хорошо реализована |
-| Direct lighting | Начальная реализация |
+| Direct lighting | Частично реализована |
+| Локальные point/spot lights | Начальная реализация, до 16; без теней |
 | Shadows | Частично реализована |
 | Frustum culling | Частично реализована |
 | Transparency | Частично реализована |
 | Glass/transmission | Частично реализована |
 | Skeletal animation | Хорошо реализована |
 | Debug UI/editor | Частично реализована |
-| GPU profiling | Не реализована |
+| GPU profiling | Базовая реализация; несколько pass timings при поддержке GPU |
 | Physics/collision | Не реализована |
 | ECS | Не реализована |
 | Instancing system | Начальная реализация |
 | LOD | Не реализована |
 | Occlusion culling | Не реализована |
 | GPU culling | Не реализована |
-| Point/spot lights | Не реализована |
 | Automated benchmarks | Не реализована |
 
 ## 9. Отсутствующие важные компоненты
@@ -880,19 +902,17 @@ Glass shader использует:
 3. GPU resource manager.
 4. Render graph.
 5. LOD/mesh streaming.
-6. Point/spot lights.
-7. Clustered/deferred lighting.
+6. Clustered/forward+ lighting для масштабирования за лимит 16 lights.
+7. Тени от локальных lights; сейчас тени есть только у directional light.
 8. Cascaded shadow maps.
 9. GPU culling and indirect rendering.
 10. Occlusion culling.
-11. Animation state machine and blending.
-12. Редакторский controls для morph target weights и blending clips.
-13. Physics/collision.
-14. Central logger and diagnostic report.
-15. GPU frame profiling.
-16. Automated benchmark suite.
-17. Asset hot reload.
-18. Public engine API policy.
+11. Animation state machine and layered blending; базовые cross-fades уже есть.
+12. Physics/collision.
+13. Central logger and diagnostic report.
+14. Reproducible benchmark suite and performance baselines.
+15. Asset hot reload.
+16. Public engine API policy.
 
 ## 10. Архитектурные рекомендации
 
@@ -946,8 +966,7 @@ Glass shader использует:
 
 - AssetManager;
 - handle-based resources;
-- animation state machine;
-- point/spot lights;
+- расширенная animation state machine/layered blending поверх имеющихся cross-fades;
 - dedicated physics subsystem;
 - formal input action system;
 - scene validation improvements.
@@ -955,11 +974,11 @@ Glass shader использует:
 ### Этап 4 — Графика
 
 - cascade shadows;
-- scene-aware shadow framing;
+- проверка bounds-based shadow framing и cascaded shadow maps;
+- локальные shadows и масштабирование числа lights;
 - improve glass/refraction;
 - formal color management;
 - advanced glTF material support;
-- optional morph targets;
 - TAA только после baseline measurement;
 - SSR только после workload evidence.
 
@@ -973,13 +992,13 @@ Glass shader использует:
 - spatial hierarchy;
 - LOD;
 - occlusion culling;
-- GPU timestamps.
+- benchmark-ами измерять GPU timestamps и результаты оптимизаций.
 
 ### Этап 6 — Инструменты разработчика
 
-- CPU/GPU profiler;
+- расширение существующих CPU/GPU timings и scene counters;
 - asset inspector;
-- draw call/triangle counter;
+- дополнительные draw call/triangle diagnostics;
 - shader debug views;
 - scene validation UI;
 - crash/log diagnostics;
@@ -988,21 +1007,18 @@ Glass shader использует:
 
 ## 12. Приоритетный список следующих задач
 
-1. Устранить crash-пути window/surface initialization.
-2. Ввести general OBJ texture/mipmap budget.
-3. Явно определить поддержку glTF extensions.
-4. Поддерживать strict Clippy и CI зелёными при каждом изменении.
-5. Добавить benchmark baseline и GPU/CPU profiling.
-6. Улучшить fixed shadow volume/cascade.
-7. Разделить `Renderer::render` на named render passes.
-8. Ввести resource/material descriptors.
-9. Разделить `DebugUi` на editor components.
-10. Ввести handle-based AssetManager.
-11. Добавить persistent instance buffers и dedicated batching.
-12. Реализовать GPU/occlusion/LOD culling.
-13. Затем добавить point/spot lights.
-14. После стабилизации runtime рассмотреть ECS.
-15. Physics и collision реализовать в отдельной подсистеме.
+1. Создать воспроизводимый benchmark baseline для CPU/GPU и больших сцен.
+2. Использовать текущие GPU timestamps для измерения отдельных render passes.
+3. Проверить bounds-based directional shadow framing на сценах разных масштабов; затем оценить cascades.
+4. Определить план локальных теней и clustered/forward+ lighting сверх лимита 16.
+5. Разделить `Renderer::render` на named render passes.
+6. Выделить resource/material descriptors и handle-based AssetManager.
+7. Разделить `DebugUi` на editor components и панели.
+8. Добавить persistent instance buffers и dedicated batching.
+9. Реализовать GPU/occlusion/LOD culling только после измерения bottlenecks.
+10. Расширить анимационную систему поверх существующих cross-fades.
+11. После стабилизации runtime рассмотреть ECS.
+12. Physics и collision реализовать в отдельной подсистеме.
 
 ## 13. Общая оценка текущего состояния
 
@@ -1017,17 +1033,23 @@ Glass shader использует:
 - scene graph;
 - skeletal animation;
 - editor UI;
+- point/spot lighting с scene hierarchy, parent transforms и clickable editor icons;
 - undo/redo;
 - scene JSON format;
+- базовые CPU/GPU profiler timings и draw/scene counters;
 - glass/transmission approximation.
 
 Ключевые слабости:
 
 - monolithic `App`, `Renderer` и `DebugUi`;
-- fixed shadow system;
+- одна directional shadow map без cascades и локальных теней;
 - отсутствуют LOD, occlusion, GPU culling и indirect drawing;
 - неполная support policy для glTF extensions;
-- нет benchmark/profile baseline;
+- нет воспроизводимого benchmark/performance baseline;
 - отсутствуют physics/ECS/asset manager.
 
-**Итог:** фундамент движка рабочий и его можно развивать итеративно. Наиболее важный следующий шаг — стабилизация startup-путей, Clippy/CI и profiling, затем выделение resource/asset subsystems и оптимизация рендер-пайплайна под большие сцены.
+**Итог:** фундамент движка рабочий и его можно развивать итеративно. Startup,
+scene loading и текущие проверки проходят. Ближайшие инженерные задачи —
+измеримый benchmark baseline, дальнейшее разделение renderer/editor modules и
+планирование теней/масштабирования локального света; конкретные FPS без
+воспроизводимых профилей утверждать нельзя.

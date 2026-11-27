@@ -8,6 +8,7 @@ pub use io::{LoadedScene, SceneEnvironment, SceneFile, build_world, load_scene};
 pub use transform::Transform;
 pub use world::{
     AnimationKeyboardControl, DEFAULT_ANIMATION_CROSSFADE_SECONDS, LocalLight, LocalLightKind,
-    MAX_ANIMATION_CROSSFADE_SECONDS, MAX_LOCAL_LIGHTS, ModelAnimationClip, ModelAnimationPlayback,
-    ModelAnimationTransition, ModelGroupId, ObjectId, World,
+    MAX_ANIMATION_CROSSFADE_SECONDS, MAX_LOCAL_LIGHTS, MAX_LOCAL_SHADOW_SPOTLIGHTS,
+    ModelAnimationClip, ModelAnimationPlayback, ModelAnimationTransition, ModelGroupId, ObjectId,
+    World,
 };

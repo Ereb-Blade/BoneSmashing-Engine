@@ -2,7 +2,8 @@
 
 **Первичный аудит:** 2026-11-24
 
-**Актуализировано:** 2026-11-27 по состоянию коммита `fe2b597`
+**Актуализировано:** 2026-11-27 по текущему коду: CPU benchmark/profiling,
+scene format v10 и тени до четырёх локальных прожекторов.
 
 ## 1. Общая информация о проекте
 
@@ -21,18 +22,18 @@
 
 Проект уже значительно превратился в рабочее демонстрационное ядро. Реализованы сцена, редакторский UI, загрузка моделей, PBR, IBL, HDR, тени, скелетная анимация, стекло и локальные point/spot lights с редакторским gizmo.
 
-Текущая общая оценка: **рабочая прототипная и демонстрационная база, но пока не production-ready для больших или сложных сцен**. Добавлены воспроизводимый CLI benchmark, fullscreen-режим замера и stress fixture; это даёт реальные данные на GTX 650, но пока не покрывает CI regression testing или сцены на десятки тысяч объектов.
+Текущая общая оценка: **рабочая прототипная и демонстрационная база, но пока не production-ready для больших или сложных сцен**. Есть воспроизводимый CLI benchmark для 1k/10k/100k объектов, fullscreen-режим, CPU-профилирование по этапам, stress fixture и локальные spotlight shadows. Нет benchmark CI, межадаптерных regression baselines и полного визуального набора для проверки качества теней.
 
-Ниже выводы сверены с текущим исходным кодом по состоянию `fe2b597`, включая benchmark pipeline, fullscreen запуск, новые тестовые сцены и замену CarConcept в `test.bse-scene`.
+Ниже выводы сверены с текущим рабочим кодом на 2026-11-27, включая изменения benchmark pipeline, CPU timings, scene format v10 и локальные spotlight shadows.
 
 ### Результаты проверки
 
-- `cargo test`: **151 passed, 0 failed**.
+- `cargo test --all-targets --all-features`: **159 passed, 0 failed**.
 - Покрытие включает scene hierarchy и parented lights, viewport picking, animation sampling, importer, mipmaps, IBL/environment, frustum culling, MSAA, shader validation, benchmark CLI и загрузку stress scene.
-- Release benchmark успешно запускался на NVIDIA GeForce GTX 650; borderless fullscreen-профиль подтвердил фактический размер **1680×1050**.
-- `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` и `git diff --check`: проходят.
+- Release benchmark успешно запускался на NVIDIA GeForce GTX 650; borderless fullscreen-профиль подтвердил фактический размер **1680×1050**. Последний showcase benchmark с двумя теневыми прожекторами успешно завершился и сохранил профиль.
+- `cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt --all -- --check` и `git diff --check`: проходят.
 - Strict lint-проверка включена в GitHub Actions CI.
-- Автоматические benchmark-профили снимают CPU/GPU timings, но benchmark не запускается в CI. Пользовательский скриншот stress scene показывает, что текущая локация — функциональный low-poly greybox, а не визуально законченный игровой уровень.
+- Автоматические benchmark-профили снимают CPU/GPU timings, но benchmark не запускается в CI. Synthetic workloads на 1k/10k/100k объектов уже есть; stress scene с 1 167 исходными объектами остаётся функциональным low-poly greybox, а не визуально законченным игровым уровнем.
 
 ## 2. Полная структура проекта
 
@@ -68,7 +69,7 @@
 ### Ресурсы и документация
 
 - `assets/models/` содержит Fox, RiggedFigure, FlightHelmet и Khronos Boom Box; CarConcept остаётся legacy-ассетом, но удалён из пользовательской `test.bse-scene`.
-- `assets/scenes/` включает `renderer_feature_test.bse-scene` для интеграционных проверок и `mesa_relay_stress.bse-scene` для высокой нагрузки.
+- `assets/scenes/` включает интеграционные и benchmark-сцены, `spotlight_shadow_gallery.bse-scene` для локальных теней и `mesa_relay_stress.bse-scene` для высокой нагрузки.
 - Stress scene содержит 1 167 исходных объектов, 13 model groups (12 анимированных), 16 локальных источников света, HDR и прозрачные окна.
 - `assets/environments/dikhololo_night_2k.hdr` — ночное окружение CC0 для сцены локального освещения.
 - `Dark grey.jpg` и `texture.png` — встроенные и тестовые текстуры.
@@ -228,9 +229,9 @@ model = parent_node_world или model_group_world * object_local
 Формат:
 
 - JSON;
-- текущая версия формата 9;
+- текущая версия формата 10;
 - scene groups;
-- до 16 локальных point/spot lights с optional `parent_group`;
+- до 16 локальных point/spot lights с optional `parent_group`, из них до четырёх spotlights могут отбрасывать тени;
 - scene objects;
 - camera;
 - renderer settings;
@@ -335,8 +336,8 @@ UI рабочий, но `debug_ui.rs` является очень крупным
 - adaptive backend selection.
 
 При поддержке необходимых adapter features доступны GPU timestamp queries для
-кадра, shadow map и opaque pass; при отсутствии поддержки эти значения
-показываются как unavailable.
+кадра и shadow, opaque, transparent, glass и postprocess passes; при отсутствии
+поддержки эти значения показываются как unavailable.
 
 ### Render path от модели до экрана
 
@@ -366,7 +367,9 @@ UI рабочий, но `debug_ui.rs` является очень крупным
 - vertex/index buffers;
 - tangent/UV/skin buffers.
 
-Instance и skin buffers grow до next power-of-two. Это простая и рабочая стратегия для прототипа, но не для системы streaming resources.
+Instance и skin buffers grow до next power-of-two и повторно используют
+выделенную capacity. Instance data при этом записывается в GPU buffer заново
+каждый кадр; отдельной arena/dirty-range streaming-системы нет.
 
 ### Draw batching
 
@@ -382,7 +385,8 @@ Batches организованы как `HashMap<(MeshId, MaterialId), Vec<Insta
 Риски:
 
 - нет dedicated batch sorting structure;
-- нет persistent GPU instance arena;
+- GPU instance buffer сохраняет capacity между кадрами, но нет persistent
+  instance arena или частичного обновления dirty ranges;
 - нет indirect rendering;
 - нет GPU culling;
 - каждый transparent instance может стать отдельным draw batch;
@@ -521,22 +525,35 @@ HDR/EXR loading выполняется в worker thread. Texture processing ис
 Локальные источники добавляются в shared light uniform и вычисляются
 per-fragment в основном PBR path. Текущий shader перебирает все включённые
 источники до фиксированного лимита; clustered/forward+ culling не реализованы.
-Локальные lights не отбрасывают тени.
+До четырёх включённых прожекторов могут отбрасывать тени одновременно;
+point lights тени не отбрасывают. В UI и scene validation действует тот же
+лимит, состояние `casts_shadows` сериализуется в scene format v10.
 
 ### Shadows
 
-Используется одна directional shadow map 4096×4096.
+Используются одна directional shadow map 4096×4096 и texture array из четырёх
+локальных shadow maps 2048×2048 для spotlights. Для каждого локального слоя
+есть отдельный render view, матрица и render-pass uniform buffer/bind group;
+шейдер выбирает слой по локальному источнику света.
 
-Shadow pass:
+Directional и local shadow passes:
 
 - собирает casters независимо от camera frustum;
 - исключает transmission glass;
 - поддерживает cutout shadows;
 - имеет отдельный shadow instance buffer;
-- кэширует matrix/instances/batches;
+- кэширует scene instances/batches; directional matrix и spotlight matrix
+  кэшируются отдельно, по каждому spotlight slot;
 - поддерживает выбираемое PCF число taps 2/4/8/16 (по умолчанию 8).
 
-Directional shadow camera подстраивается под bounds сцены. Если валидных bounds нет, используется legacy fallback volume ±7.5. Остаются ограничения одной directional shadow map без cascades и без локальных теней.
+Directional shadow camera подстраивается под bounds сцены. Если валидных bounds
+нет, используется legacy fallback volume ±7.5. Ограничения: одна directional
+shadow map без cascades; локальные тени есть только у spotlights, максимум
+четыре активных caster одновременно. После сообщения о неверной тени при
+нескольких spotlights render-pass matrix buffers разделены по слоям; release
+benchmark с двумя теневыми прожекторами успешно выполняется. Визуальный A/B
+после этой коррекции на пользовательском screenshot workflow ещё нужно
+подтвердить.
 
 ### Frustum culling
 
@@ -808,8 +825,9 @@ Directional shadow camera теперь автоматически подбира
 - batches пересобираются в каждом frame;
 - transparent object сортируется как отдельный instance;
 - skin matrices собираются в один CPU buffer;
-- instance matrices переписываются при изменении state;
-- нет persistent GPU instance buffers;
+- instance matrices отправляются в persistent GPU buffer каждый кадр;
+- GPU instance/skin buffers сохраняют capacity при повторном использовании, но
+  нет dirty-range updates или отдельной streaming arena;
 - нет GPU culling;
 - нет LOD;
 - нет occlusion culling;
@@ -817,28 +835,41 @@ Directional shadow camera теперь автоматически подбира
 - environment preprocessing занимает CPU worker;
 - GPU timestamps cover frame, shadow, opaque, transparent, glass и postprocess;
   есть CLI capture с фиксированным warmup/capture, medians и p95.
-- Нет автоматического benchmark CI, regression thresholds или тестовых наборов
-  на 10k/100k объектов.
+- Нет автоматического benchmark CI и regression thresholds; локальные
+  synthetic workloads на 1k/10k/100k объектов уже реализованы.
 
 ## 7. Анализ производительности
 
 ### CPU узкие места
 
-Профиль записывает CPU frame/acquire timings и scene counters. Он не разделяет
-время на отдельные CPU subsystems, поэтому следующие пункты остаются
-гипотезами для дальнейшего профилирования:
+Профиль и Performance UI записывают CPU timings для UI, world update,
+animation, scene/render preparation, world transforms, scene traversal,
+batch rebuilding, draw preparation, surface acquire и command encode/submit.
+Это stage-level instrumentation, а не sampling profiler: отдельные функции
+внутри этапов и lock/hash-map costs не профилируются самостоятельно.
 
-- scene object traversal;
-- world matrix cache propagation;
-- batch map rebuilding;
-- sorting transparent objects;
-- animation sampling;
-- egui prepare frame;
-- stable object ID lookup;
-- model hierarchy validation.
+Есть воспроизводимые synthetic benchmark workloads на 1k, 10k и 100k объектов,
+с повторными Release captures, фиксированными настройками и fullscreen режимом.
+В сравнении прежнего одиночного baseline с медианой трёх новых p95 captures
+(GTX 650, 1680×1050, render scale 1, MSAA 1×, directional shadows off)
+измерены следующие изменения CPU frame / transforms / traversal / batch,
+мс:
 
-Для сцен >10k объектов потребуются отдельные масштабируемые benchmarks,
-явный dirty transform pass и spatial acceleration.
+| Объекты | CPU frame p95 | Transforms p95 | Traversal p95 | Batch rebuild p95 |
+|---:|---:|---:|---:|---:|
+| 1 000 | 4.49 → 4.17 | 0.189 → 0.054 | 0.172 → 0.099 | 0.039 → 0.005 |
+| 10 000 | 36.86 → 7.82 | 16.48 → 0.443 | 5.45 → 1.23 | 0.880 → 0.176 |
+| 100 000 | 65.41 → 29.81 | 26.58 → 5.29 | 24.48 → 13.92 | 10.05 → 3.39 |
+
+Baseline — один capture до изменений, новые значения — median per-run p95
+трёх captures; это полезный локальный A/B, но не статистически симметричный
+регрессионный тест. Параметры synthetic сцен держатся постоянными, тени в
+этой серии выключены. Эти цифры не являются межадаптерным baseline.
+
+Оставшиеся CPU расходы: полный обход объектов и пересборка CPU batch lists
+каждый кадр, особенно traversal на 100k. Persistent GPU buffers уже повторно
+используются; дальнейшая задача — оценить dirty-range/partial uploads и
+инкрементальные batches только после отдельного измерения.
 
 ### GPU узкие места
 
@@ -874,11 +905,13 @@ triangles и scene counters. CLI ждёт завершения environment/HDR �
 режим использует текущее разрешение монитора. GPU timings доступны только при
 поддержке timestamp queries адаптером.
 
-Для Flight Helmet и integrated renderer scene также есть повторяемые профили,
-но это небольшая выборка одного GPU и нескольких fixtures, а не универсальный
-performance baseline. Не измерены peak VRAM/RAM, стоимость импорта и
-environment preprocessing, динамическое обновление shadow map и масштабирование
-на фиксированных наборах 10k/100k объектов. Benchmarks пока не входят в CI.
+Для Flight Helmet, integrated renderer, stress scene и synthetic workloads
+есть повторяемые профили, но это небольшая выборка одного GPU и нескольких
+fixtures, а не универсальный performance baseline. Не измерены peak VRAM/RAM
+и стоимость импорта/environment preprocessing. Не сделано автоматическое
+разделение GPU shadow timing на полный rebuild и cache hit; synthetic
+100k-профили с directional shadows off нельзя использовать для оценки shadow
+cost. Benchmarks пока не входят в CI.
 
 ## 8. Оценка готовности подсистем
 
@@ -898,8 +931,8 @@ environment preprocessing, динамическое обновление shadow 
 | PBR | Частично реализована |
 | IBL/HDR | Хорошо реализована |
 | Direct lighting | Частично реализована |
-| Локальные point/spot lights | Начальная реализация, до 16; без теней |
-| Shadows | Частично реализована |
+| Локальные point/spot lights | До 16 локальных источников; тени у максимум 4 spotlights |
+| Shadows | Directional + локальные spot shadows; без cascades |
 | Frustum culling | Частично реализована |
 | Transparency | Частично реализована |
 | Glass/transmission | Частично реализована |
@@ -912,7 +945,7 @@ environment preprocessing, динамическое обновление shadow 
 | LOD | Не реализована |
 | Occlusion culling | Не реализована |
 | GPU culling | Не реализована |
-| Automated benchmarks | CLI и UI capture реализованы; нет benchmark CI и regression thresholds |
+| Automated benchmarks | CLI, UI capture и 1k/10k/100k synthetic workloads; нет benchmark CI и regression thresholds |
 
 ## 9. Отсутствующие важные компоненты
 
@@ -922,8 +955,8 @@ environment preprocessing, динамическое обновление shadow 
 4. Render graph.
 5. LOD/mesh streaming.
 6. Clustered/forward+ lighting для масштабирования за лимит 16 lights.
-7. Тени от локальных lights; сейчас тени есть только у directional light.
-8. Cascaded shadow maps.
+7. Cascaded directional shadows, point-light shadows и визуальная проверка
+   локальных теней на большем наборе GPU/сцен.
 9. GPU culling and indirect rendering.
 10. Occlusion culling.
 11. Animation state machine and layered blending; базовые cross-fades уже есть.
@@ -995,7 +1028,8 @@ environment preprocessing, динамическое обновление shadow 
 
 - cascade shadows;
 - проверка bounds-based shadow framing и cascaded shadow maps;
-- локальные shadows и масштабирование числа lights;
+- локальные spotlight shadows до четырёх одновременно реализованы; остаются
+  визуальная проверка качества и решение о дальнейшем масштабировании;
 - improve glass/refraction;
 - formal color management;
 - advanced glTF material support;
@@ -1006,10 +1040,12 @@ environment preprocessing, динамическое обновление shadow 
 
 - fixed-scene Release benchmark, GPU pass timestamps, render-scale/PCF/MSAA overrides
   и borderless fullscreen capture реализованы;
+- synthetic benchmark workloads на 1k/10k/100k объектов, повторные captures и
+  CPU stage timings реализованы; локальные A/B профили получены;
 - stress fixture на 1 167 исходных объектов добавлена и проверена на GTX 650;
 - сравнение baseline и настроек проведено на фактическом разрешении 1680×1050;
-- benchmark 10k/100k scenes;
-- persistent instance buffers;
+- persistent GPU buffers и reuse capacity уже есть; partial/dirty-range updates
+  и выделенная streaming arena остаются возможными оптимизациями;
 - dedicated batch structures;
 - GPU frustum culling;
 - indirect draw;
@@ -1035,18 +1071,18 @@ environment preprocessing, динамическое обновление shadow 
 
 1. Довести stress scene от procedural greybox до читаемой игровой локации, не
    меняя отдельный benchmark fixture; использовать проверенные модели и лицензии.
-2. Добавить воспроизводимые workload-наборы на 10k/100k объектов и определить,
-   где ограничение: CPU preparation, GPU geometry или fragment shading.
+2. Продолжить сравнение synthetic workloads на 1k/10k/100k, отдельно с тенями
+   и без них; не считать локальные captures универсальными regression thresholds.
 3. Оптимизировать opaque pass по измерениям, отдельно проверяя влияние числа
    локальных lights; не менять PCF default без визуального A/B.
-4. Профилировать dynamic shadow-map rebuild: текущая статическая сцена в основном
-   использует кэш, поэтому timestamp shadow pass близок к нулю.
-5. Проверить bounds-based directional shadow framing на больших/движущихся
-   сценах, затем оценить cascades и shadows для локальных lights.
+4. Снимать shadow pass timings отдельно на cache hit и rebuild, используя
+   статические и изменяющиеся сцены.
+5. Проверить bounds-based directional shadow framing и исправленное multi-spot
+   shadow обновление на движущихся сценах, затем оценить cascades.
 6. Повторить benchmark на дополнительных GPU и добавить автоматические
    regression thresholds только после получения стабильных baseline.
-7. Выделить persistent instance buffers, dedicated batching и spatial hierarchy;
-   добавить GPU/occlusion/LOD culling после подтверждения bottleneck.
+7. Оценить dirty-range instance uploads, dedicated batching и spatial
+   hierarchy; добавить GPU/occlusion/LOD culling после подтверждения bottleneck.
 8. Поэтапно разделить `Renderer::render`, `App` и `DebugUi`, сохраняя проверяемые
    scene/import/render boundaries.
 9. Выделить handle-based AssetManager и resource/material descriptors.
@@ -1077,10 +1113,10 @@ environment preprocessing, динамическое обновление shadow 
 Ключевые слабости:
 
 - monolithic `App`, `Renderer` и `DebugUi`;
-- одна directional shadow map без cascades и локальных теней;
+- одна directional shadow map без cascades; локальные shadows ограничены четырьмя spotlights;
 - отсутствуют LOD, occlusion, GPU culling и indirect drawing;
 - неполная support policy для glTF extensions;
-- нет benchmark CI, межадаптерных baselines и stress workload на 10k/100k объектов;
+- нет benchmark CI и межадаптерных baselines; синтетические workload-сцены на 1k/10k/100k есть;
 - большая стресс-сцена пока визуально выглядит как greybox и не является game-ready;
 - отсутствуют physics/ECS/asset manager.
 
@@ -1090,5 +1126,6 @@ scene loading и тесты проходят. На GTX 650 stress fixture зам
 снижает результат примерно до 38.8 ms, а 4× MSAA увеличивает до 118.7 ms.
 Эти цифры относятся только к конкретной синтетической сцене и адаптеру; они не
 обобщаются на обычный игровой workload. Следующие практические задачи —
-визуально улучшить greybox и расширить performance tests на разные размеры
-сцен/адаптеры, затем оптимизировать доминирующий opaque pass по данным профилей.
+подтвердить визуально исправление multi-spot shadow artifact, улучшить greybox
+и расширить performance baselines на другие адаптеры, затем оптимизировать
+доминирующий opaque pass по данным профилей.

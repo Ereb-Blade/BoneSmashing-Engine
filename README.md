@@ -9,8 +9,8 @@
 ## Возможности
 
 - Рендеринг на `wgpu` с оконным циклом `winit`.
-- PBR-материалы, HDR-освещение окружением (IBL), направленный свет с тенями и
-  настраиваемые точечные/прожекторные источники света без теней.
+- PBR-материалы, HDR-освещение окружением (IBL), направленный свет с тенями,
+  точечные источники и до четырёх прожекторов с тенями.
 - HDR-буфер, ACES tone mapping и экранные эффекты для стекла.
 - Импорт моделей `.glb`, `.gltf` и `.obj`.
 - Сохранение и загрузка сцен с объектами, трансформациями и ссылками на модели.
@@ -120,8 +120,8 @@ roughness и metallic материалов, назначенных объект�
 направление. Полупрозрачные значки источников видны только в редакторе: их можно
 выбрать кликом в окне сцены; у прожектора значок также показывает направление.
 Выбранный свет можно двигать, вращать (spotlight) и менять его радиус gizmo в
-окне сцены. Параметры сохраняются в файле сцены. Локальные источники пока не
-отбрасывают тени.
+окне сцены. Параметры сохраняются в файле сцены. Точечные источники не
+отбрасывают тени; тени поддерживают до четырёх прожекторов одновременно.
 Текущее время и незавершённый переход не сохраняются.
 Если для сцены HDR-карта не выбрана, при загрузке используется стандартное
 студийное окружение. Для glTF сохраняются
@@ -193,10 +193,11 @@ specular, transmission, volume, clearcoat и specular-glossiness. Поддерж
 
 Стекло использует экранное преломление непрозрачной сцены: объекты за
 поверхностью, не попавшие в экранный буфер, не видны в преломлении. Это
-приближение, а не трассировка лучей. Точечные и прожекторные источники пока не
-отбрасывают тени; sheen не реализован, параметры sampler из glTF пока не
-применяются. Анимация glTF morph targets поддерживается для position/normal/tangent
-displacements и step/linear/cubic sampling весов. Во вкладке **Animation**
+приближение, а не трассировка лучей. Точечные источники не отбрасывают тени;
+для локальных теней поддерживаются до четырёх прожекторов одновременно. Sheen
+не реализован, параметры sampler из glTF пока не применяются. Анимация glTF
+morph targets поддерживается для position/normal/tangent displacements и
+step/linear/cubic sampling весов. Во вкладке **Animation**
 доступны фильтр, сброс всех весов и редактирование по одному target; названия берутся из
 `mesh.extras.targetNames`, если они заданы, иначе показывается номер target.
 Если клип проигрывается, его можно поставить на паузу там же перед ручной
@@ -228,14 +229,47 @@ cargo run -- --benchmark-size 1920x1080
 cargo run -- --benchmark-scene assets\scenes\flight_helmet_test.bse-scene --benchmark-size 1920x1080
 cargo run -- --benchmark-scene assets\scenes\flight_helmet_test.bse-scene --benchmark-size 1280x720 --benchmark-render-scale 0.5
 cargo run -- --benchmark-scene assets\scenes\flight_helmet_test.bse-scene --benchmark-shadow-pcf-samples 4
+cargo run --release -- --benchmark-objects 10000 --benchmark-runs 3 --benchmark-fullscreen
 ```
 
 Автоматический запуск открывает указанную сцену, дожидается завершения фоновой
 загрузки окружения (включая HDR из сцены), затем прогревает 2 секунды, записывает
 10 секунд профиля и сохраняет тот же JSON, что и UI capture. GPU timings
 разделяют shadow map, opaque, transparent, glass и postprocess passes.
+Для нагрузочного CPU-сравнения `--benchmark-objects` создаёт воспроизводимую
+сетку из 1 000, 10 000 или 100 000 одинаковых кубов. `--benchmark-runs` повторяет
+прогрев и захват от 1 до 10 раз; каждый прогон сохраняется отдельным JSON с
+числом объектов в метаданных сцены. Например, чтобы получить три прогона для
+каждого размера в одном разрешении. Для этих сцен используются одинаковые
+камера, материал, render scale 1.0, MSAA 1x и отключённые тени; fullscreen
+берёт разрешение текущего монитора. Флаг `--benchmark-shadows` включает тени
+для benchmark-сцены (по умолчанию они выключены).
+
+```powershell
+foreach ($count in @(1000, 10000, 100000)) {
+    cargo run --release -- --benchmark-objects $count --benchmark-runs 3 --benchmark-fullscreen
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+```
+
+Для проверки штатной стресс-сцены с анимацией и 1 167 объектами используйте:
+
+```powershell
+cargo run --release -- --benchmark-scene assets\scenes\mesa_relay_stress.bse-scene --benchmark-fullscreen --benchmark-msaa-samples 1 --benchmark-shadow-pcf-samples 8
+```
+
+Чтобы измерить 100 000 объектов с тенями:
+
+```powershell
+cargo run --release -- --benchmark-objects 100000 --benchmark-runs 3 --benchmark-fullscreen --benchmark-shadows
+```
+
+CPU timings отдельно сохраняют обновление мира и анимацию, вычисление мировых
+трансформаций, обход объектов, упаковку батчей и подготовку draw calls; для
+каждой метрики в итогах JSON указаны median и p95.
 `--benchmark-render-scale` переопределяет масштаб рендера в диапазоне 0.5–1.0,
-не меняя размер окна. `--benchmark-shadow-pcf-samples` позволяет сравнить
+не меняя размер окна. `--benchmark-shadows` также переопределяет настройку теней
+загруженной benchmark-сцены. `--benchmark-shadow-pcf-samples` позволяет сравнить
 2/4/8/16 taps теневого PCF. `--benchmark-msaa-samples` переопределяет MSAA
 значениями 1/2/4/8; если выбранный режим не поддерживает адаптер, выводится
 предупреждение и профиль записывается с фактически включенным режимом.
@@ -261,6 +295,12 @@ CC0-1.0; источник и лицензия записаны в `assets/models
 cargo run -- --benchmark-scene assets\scenes\renderer_feature_test.bse-scene --benchmark-size 1280x720
 cargo run --release -- --benchmark-scene assets\scenes\renderer_feature_test.bse-scene --benchmark-size 1280x720
 ```
+
+Для проверки теней от локального прожектора откройте
+`assets/scenes/spotlight_shadow_gallery.bse-scene`. В ней отдельная spotlight
+shadow map работает параллельно с directional shadow map; остальные локальные
+светильники могут отбрасывать тени одновременно (до четырёх shadow-casting
+spotlights). Переключатель **Cast shadows** находится во вкладке Lights.
 
 Для тяжёлого игрового стресс-сценария откройте
 `assets/scenes/mesa_relay_stress.bse-scene`: индустриальный аванпост включает

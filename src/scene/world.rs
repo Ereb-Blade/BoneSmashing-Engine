@@ -14,6 +14,7 @@ pub struct ObjectId(pub usize);
 pub struct ModelGroupId(pub usize);
 
 pub const MAX_LOCAL_LIGHTS: usize = 16;
+pub const MAX_LOCAL_SHADOW_SPOTLIGHTS: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -28,6 +29,7 @@ pub struct LocalLight {
     pub name: String,
     pub kind: LocalLightKind,
     pub enabled: bool,
+    pub casts_shadows: bool,
     pub position: [f32; 3],
     pub direction: [f32; 3],
     pub color: [f32; 3],
@@ -45,6 +47,7 @@ impl LocalLight {
             name: name.into(),
             kind: LocalLightKind::Point,
             enabled: true,
+            casts_shadows: false,
             position,
             direction: [0.0, -1.0, 0.0],
             color: [1.0, 0.85, 0.65],
@@ -77,6 +80,8 @@ impl LocalLight {
                 .color
                 .iter()
                 .all(|component| component.is_finite() && (0.0..=1.0).contains(component))
+            && (!self.casts_shadows
+                || (self.kind == LocalLightKind::Spot && self.outer_cone_degrees > 0.0))
             && self.intensity.is_finite()
             && (0.0..=1000.0).contains(&self.intensity)
             && self.range.is_finite()
@@ -451,6 +456,18 @@ impl World {
         if !light.is_valid() {
             return Err("Cannot add a local light with invalid settings".to_owned());
         }
+        if light.casts_shadows
+            && self
+                .local_lights
+                .iter()
+                .filter(|light| light.casts_shadows)
+                .count()
+                >= MAX_LOCAL_SHADOW_SPOTLIGHTS
+        {
+            return Err(format!(
+                "A scene can have at most {MAX_LOCAL_SHADOW_SPOTLIGHTS} local shadow-casting spotlights"
+            ));
+        }
         let index = self.local_lights.len();
         self.local_lights.push(light);
         Ok(index)
@@ -476,6 +493,7 @@ impl World {
         let mut light = self.local_lights.get(index)?.clone();
         light.name = format!("{} Copy", light.name);
         light.position[0] += 0.5;
+        light.casts_shadows = false;
         self.add_local_light(light).ok()
     }
 
@@ -1168,6 +1186,27 @@ mod tests {
                 .add_local_light(LocalLight::point("Overflow", [0.0, 0.0, 0.0]))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn local_shadow_casting_is_limited_to_four_spotlights() {
+        let mut world = World::new();
+        for index in 0..MAX_LOCAL_SHADOW_SPOTLIGHTS {
+            let mut spot = LocalLight::spot(
+                format!("Shadow spot {index}"),
+                [index as f32, 3.0, 0.0],
+                [0.0, -1.0, 0.0],
+            );
+            spot.casts_shadows = true;
+            assert!(world.add_local_light(spot).is_ok());
+        }
+        let mut overflow = LocalLight::spot("Overflow spot", [0.0, 3.0, 0.0], [0.0, -1.0, 0.0]);
+        overflow.casts_shadows = true;
+        assert!(world.add_local_light(overflow).is_err());
+
+        let mut point = LocalLight::point("Point", [0.0, 3.0, 0.0]);
+        point.casts_shadows = true;
+        assert!(!point.is_valid());
     }
 
     #[test]

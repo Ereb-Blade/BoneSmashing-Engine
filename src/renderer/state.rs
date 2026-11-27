@@ -24,7 +24,9 @@ use crate::renderer::material::{
 use crate::renderer::mesh::{Mesh, MeshData, ObjModelData};
 use crate::renderer::pipeline::{HDR_FORMAT, RenderPipelineBundle};
 use crate::renderer::{debug_ui::DebugUi, environment::Environment};
-use crate::scene::{LocalLightKind, MAX_LOCAL_LIGHTS, RenderObject, World};
+use crate::scene::{
+    LocalLightKind, MAX_LOCAL_LIGHTS, MAX_LOCAL_SHADOW_SPOTLIGHTS, RenderObject, World,
+};
 
 #[derive(Debug)]
 pub enum ParsedAsset {
@@ -89,9 +91,26 @@ pub struct LightUniform {
 }
 
 const SHADOW_MAP_SIZE: u32 = 4096;
+const LOCAL_SHADOW_MAP_SIZE: u32 = 2048;
+const LOCAL_SHADOW_MATRIX_BUFFER_SIZE: u64 =
+    (MAX_LOCAL_SHADOW_SPOTLIGHTS * std::mem::size_of::<[[f32; 4]; 4]>()) as u64;
+
+fn shadow_casting_spotlight_indices(world: &World) -> [Option<usize>; MAX_LOCAL_SHADOW_SPOTLIGHTS] {
+    let mut indices = [None; MAX_LOCAL_SHADOW_SPOTLIGHTS];
+    for (index, light) in world.local_lights().iter().enumerate() {
+        if light.enabled && light.kind == LocalLightKind::Spot && light.casts_shadows {
+            let Some(slot) = indices.iter_mut().find(|slot| slot.is_none()) else {
+                break;
+            };
+            *slot = Some(index);
+        }
+    }
+    indices
+}
 
 fn build_light_uniform(settings: RendererSettings, world: &World) -> LightUniform {
     let key_direction = settings.key_light_direction();
+    let shadow_spotlight_indices = shadow_casting_spotlight_indices(world);
     let mut lights = [LocalLightUniform::default(); MAX_LOCAL_LIGHTS];
     let mut light_count = 0_u32;
     for (index, light) in world.local_lights().iter().enumerate() {
@@ -126,7 +145,10 @@ fn build_light_uniform(settings: RendererSettings, world: &World) -> LightUnifor
             spot_angles: [
                 light.inner_cone_degrees.to_radians().cos(),
                 light.outer_cone_degrees.to_radians().cos(),
-                0.0,
+                shadow_spotlight_indices
+                    .iter()
+                    .position(|spotlight| *spotlight == Some(index))
+                    .map_or(0.0, |slot| (slot + 1) as f32),
                 0.0,
             ],
         };
@@ -241,7 +263,13 @@ pub struct RendererSettings {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RenderTimings {
     pub ui_cpu_ms: f32,
+    pub world_update_cpu_ms: f32,
+    pub animation_cpu_ms: f32,
     pub scene_cpu_ms: f32,
+    pub world_transform_cpu_ms: f32,
+    pub scene_traversal_cpu_ms: f32,
+    pub batch_rebuild_cpu_ms: f32,
+    pub draw_prep_cpu_ms: f32,
     pub acquire_cpu_ms: f32,
     pub encode_submit_cpu_ms: f32,
     pub gpu_frame_ms: Option<f32>,
@@ -650,6 +678,8 @@ fn create_shared_bind_group(
     skin_buffer: &wgpu::Buffer,
     shadow_matrix_buffer: &wgpu::Buffer,
     shadow_view: &wgpu::TextureView,
+    spot_shadow_matrix_buffer: &wgpu::Buffer,
+    spot_shadow_view: &wgpu::TextureView,
     shadow_sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -680,6 +710,14 @@ fn create_shared_bind_group(
                 binding: 5,
                 resource: wgpu::BindingResource::Sampler(shadow_sampler),
             },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: spot_shadow_matrix_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(spot_shadow_view),
+            },
         ],
     })
 }
@@ -706,12 +744,12 @@ fn create_shadow_bind_group(
     })
 }
 
-fn create_shadow_view(device: &wgpu::Device) -> wgpu::TextureView {
+fn create_shadow_view(device: &wgpu::Device, label: &'static str, size: u32) -> wgpu::TextureView {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("directional shadow map"),
+        label: Some(label),
         size: wgpu::Extent3d {
-            width: SHADOW_MAP_SIZE,
-            height: SHADOW_MAP_SIZE,
+            width: size,
+            height: size,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -722,6 +760,44 @@ fn create_shadow_view(device: &wgpu::Device) -> wgpu::TextureView {
         view_formats: &[],
     });
     texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+fn create_local_shadow_views(
+    device: &wgpu::Device,
+) -> (
+    wgpu::Texture,
+    wgpu::TextureView,
+    [wgpu::TextureView; MAX_LOCAL_SHADOW_SPOTLIGHTS],
+) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("local spotlight shadow map array"),
+        size: wgpu::Extent3d {
+            width: LOCAL_SHADOW_MAP_SIZE,
+            height: LOCAL_SHADOW_MAP_SIZE,
+            depth_or_array_layers: MAX_LOCAL_SHADOW_SPOTLIGHTS as u32,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let sample_view = texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("local spotlight shadow map array view"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    let render_views = std::array::from_fn(|layer| {
+        texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("local spotlight shadow layer view"),
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            base_array_layer: layer as u32,
+            array_layer_count: Some(1),
+            ..Default::default()
+        })
+    });
+    (texture, sample_view, render_views)
 }
 
 fn directional_shadow_matrix(ray_direction: Vec3) -> Mat4 {
@@ -791,34 +867,110 @@ fn directional_shadow_matrix_for_bounds(ray_direction: Vec3, bounds: &[(Vec3, f3
     projection * view
 }
 
+fn spotlight_shadow_matrix(
+    light_position: Vec3,
+    light_direction: Vec3,
+    outer_cone_degrees: f32,
+    range: f32,
+) -> Option<Mat4> {
+    let direction = light_direction.normalize_or_zero();
+    if !light_position.is_finite()
+        || !direction.is_finite()
+        || direction.length_squared() <= f32::EPSILON
+        || !outer_cone_degrees.is_finite()
+        || !(0.0..=89.0).contains(&outer_cone_degrees)
+        || outer_cone_degrees <= 0.0
+        || !range.is_finite()
+        || range <= 0.05
+    {
+        return None;
+    }
+
+    let up = if direction.dot(Vec3::Y).abs() > 0.98 {
+        Vec3::X
+    } else {
+        Vec3::Y
+    };
+    let view = crate::math::look_at_rh(light_position, light_position + direction, up);
+    let projection =
+        crate::math::perspective_rh(outer_cone_degrees.to_radians() * 2.0, 1.0, 0.1, range);
+    Some(projection * view)
+}
+
+fn spotlight_shadow_matrix_for_world(world: &World, index: usize) -> Option<Mat4> {
+    let light = world.local_lights().get(index)?;
+    if !light.enabled || !light.casts_shadows || light.kind != LocalLightKind::Spot {
+        return None;
+    }
+    spotlight_shadow_matrix(
+        world.local_light_world_position(index)?,
+        world.local_light_world_direction(index)?,
+        light.outer_cone_degrees,
+        light.range,
+    )
+}
+
+#[cfg(test)]
 fn object_in_view(
     bounds: Option<(Vec3, f32)>,
     model: Mat4,
     is_skinned: bool,
     view_projection: Mat4,
 ) -> bool {
+    let frustum = view_frustum_planes(view_projection);
+    let world_bounds = if is_skinned {
+        None
+    } else {
+        object_world_sphere(bounds, model)
+    };
+    object_visible_in_frustum(world_bounds, is_skinned, frustum.as_ref())
+}
+
+fn object_visible_in_frustum(
+    world_bounds: Option<(Vec3, f32)>,
+    is_skinned: bool,
+    frustum: Option<&[glam::Vec4; 6]>,
+) -> bool {
     if is_skinned {
         return true;
     }
-    let Some((bounds_center, bounds_radius)) = bounds else {
-        return true;
-    };
+    world_bounds.is_none_or(|(center, radius)| {
+        frustum.is_none_or(|planes| sphere_in_frustum(center, radius, planes))
+    })
+}
+
+fn object_world_sphere(bounds: Option<(Vec3, f32)>, model: Mat4) -> Option<(Vec3, f32)> {
+    let (bounds_center, bounds_radius) = bounds?;
     if bounds_radius <= 0.0 {
-        return true;
+        return None;
     }
-    let world_center = model.transform_point3(bounds_center);
+    let center = model.transform_point3(bounds_center);
     let conservative_scale = (model.x_axis.truncate().length_squared()
         + model.y_axis.truncate().length_squared()
         + model.z_axis.truncate().length_squared())
     .sqrt();
-    sphere_in_view(
-        world_center,
-        bounds_radius * conservative_scale,
-        view_projection,
-    )
+    Some((center, bounds_radius * conservative_scale))
 }
 
+fn object_model_matrix(world: &World, object_index: usize, object: &RenderObject) -> Mat4 {
+    if object.model_group().is_none() && object.parent_node().is_none() {
+        return object.model_matrix();
+    }
+
+    world
+        .object_id_at(object_index)
+        .and_then(|object_id| world.group_model_matrix_for_id(object_id))
+        .unwrap_or_else(|| object.model_matrix())
+}
+
+#[cfg(test)]
 fn sphere_in_view(center: Vec3, radius: f32, view_projection: Mat4) -> bool {
+    view_frustum_planes(view_projection)
+        .as_ref()
+        .is_none_or(|planes| sphere_in_frustum(center, radius, planes))
+}
+
+fn view_frustum_planes(view_projection: Mat4) -> Option<[glam::Vec4; 6]> {
     let columns = view_projection.to_cols_array_2d();
     let row = |index: usize| {
         glam::Vec4::new(
@@ -844,15 +996,17 @@ fn sphere_in_view(center: Vec3, radius: f32, view_projection: Mat4) -> bool {
     for plane in &mut planes {
         let length = plane.truncate().length();
         if !length.is_finite() || length <= f32::EPSILON {
-            return true;
+            return None;
         }
         *plane /= length;
     }
 
+    Some(planes)
+}
+
+fn sphere_in_frustum(center: Vec3, radius: f32, planes: &[glam::Vec4; 6]) -> bool {
     let center = center.extend(1.0);
-    planes
-        .into_iter()
-        .all(|plane| plane.dot(center) >= -(radius))
+    planes.iter().all(|plane| plane.dot(center) >= -radius)
 }
 
 const INITIAL_INSTANCE_CAPACITY: usize = 256;
@@ -918,10 +1072,16 @@ pub struct Renderer {
     _light_buffer: wgpu::Buffer,
     shared_bind_group: wgpu::BindGroup,
     shadow_shared_bind_group: wgpu::BindGroup,
+    spot_shadow_render_bind_groups: [wgpu::BindGroup; MAX_LOCAL_SHADOW_SPOTLIGHTS],
     skin_buffer: wgpu::Buffer,
     skin_matrix_capacity: usize,
     shadow_matrix_buffer: wgpu::Buffer,
     shadow_view: wgpu::TextureView,
+    spot_shadow_matrix_buffer: wgpu::Buffer,
+    spot_shadow_render_matrix_buffers: [wgpu::Buffer; MAX_LOCAL_SHADOW_SPOTLIGHTS],
+    _spot_shadow_texture: wgpu::Texture,
+    spot_shadow_view: wgpu::TextureView,
+    spot_shadow_render_views: [wgpu::TextureView; MAX_LOCAL_SHADOW_SPOTLIGHTS],
     shadow_sampler: wgpu::Sampler,
     environment: Environment,
     environment_bind_group: wgpu::BindGroup,
@@ -946,6 +1106,7 @@ pub struct Renderer {
     shadow_batches: HashMap<(MeshId, MaterialId), Vec<InstanceRaw>>,
     transparent_objects: Vec<TransparentObject>,
     skin_matrices: Vec<Mat4>,
+    object_model_matrices: Vec<Mat4>,
     all_instances: Vec<InstanceRaw>,
     shadow_instances: Vec<InstanceRaw>,
     draw_batches: Vec<DrawBatch>,
@@ -956,7 +1117,10 @@ pub struct Renderer {
     cached_shadow_skin_matrices: Vec<Mat4>,
     cached_shadow_batches: Vec<ShadowBatch>,
     cached_shadow_matrix: Mat4,
+    cached_spot_shadow_matrices: [Mat4; MAX_LOCAL_SHADOW_SPOTLIGHTS],
     shadow_cache_valid: bool,
+    shadow_content_cache_valid: bool,
+    spot_shadow_cache_valid: [bool; MAX_LOCAL_SHADOW_SPOTLIGHTS],
     timings: RenderTimings,
     gpu_timestamp_profiler: Option<GpuTimestampProfiler>,
     environment_load: Option<mpsc::Receiver<(Option<PathBuf>, Result<Environment, String>)>>,
@@ -1135,7 +1299,22 @@ impl Renderer {
             contents: bytemuck::bytes_of(&shadow_matrix.to_cols_array_2d()),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let shadow_view = create_shadow_view(&device);
+        let spot_shadow_matrix_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("spotlight shadow matrices buffer"),
+            size: LOCAL_SHADOW_MATRIX_BUFFER_SIZE,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let spot_shadow_render_matrix_buffers = std::array::from_fn(|_| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("spotlight shadow render matrix buffer"),
+                contents: bytemuck::bytes_of(&Mat4::IDENTITY.to_cols_array_2d()),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        });
+        let shadow_view = create_shadow_view(&device, "directional shadow map", SHADOW_MAP_SIZE);
+        let (spot_shadow_texture, spot_shadow_view, spot_shadow_render_views) =
+            create_local_shadow_views(&device);
         let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("shadow comparison sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -1155,6 +1334,8 @@ impl Renderer {
             &skin_buffer,
             &shadow_matrix_buffer,
             &shadow_view,
+            &spot_shadow_matrix_buffer,
+            &spot_shadow_view,
             &shadow_sampler,
         );
         let shadow_shared_bind_group = create_shadow_bind_group(
@@ -1163,6 +1344,14 @@ impl Renderer {
             &skin_buffer,
             &shadow_matrix_buffer,
         );
+        let spot_shadow_render_bind_groups = std::array::from_fn(|slot| {
+            create_shadow_bind_group(
+                &device,
+                &pipeline_bundle.shadow_bind_group_layout,
+                &skin_buffer,
+                &spot_shadow_render_matrix_buffers[slot],
+            )
+        });
 
         // Создание материалов через удобные методы Material
         let default_material = Material::from_image_bytes_with_linear_gain(
@@ -1311,10 +1500,16 @@ impl Renderer {
             _light_buffer: light_buffer,
             shared_bind_group,
             shadow_shared_bind_group,
+            spot_shadow_render_bind_groups,
             skin_buffer,
             skin_matrix_capacity: INITIAL_SKIN_MATRIX_CAPACITY,
             shadow_matrix_buffer,
             shadow_view,
+            spot_shadow_matrix_buffer,
+            spot_shadow_render_matrix_buffers,
+            _spot_shadow_texture: spot_shadow_texture,
+            spot_shadow_view,
+            spot_shadow_render_views,
             shadow_sampler,
             environment,
             environment_bind_group,
@@ -1339,6 +1534,7 @@ impl Renderer {
             shadow_batches: HashMap::new(),
             transparent_objects: Vec::new(),
             skin_matrices: Vec::with_capacity(INITIAL_SKIN_MATRIX_CAPACITY),
+            object_model_matrices: Vec::new(),
             all_instances: Vec::new(),
             shadow_instances: Vec::new(),
             draw_batches: Vec::new(),
@@ -1349,7 +1545,10 @@ impl Renderer {
             cached_shadow_skin_matrices: Vec::new(),
             cached_shadow_batches: Vec::new(),
             cached_shadow_matrix: Mat4::IDENTITY,
+            cached_spot_shadow_matrices: [Mat4::IDENTITY; MAX_LOCAL_SHADOW_SPOTLIGHTS],
             shadow_cache_valid: false,
+            shadow_content_cache_valid: false,
+            spot_shadow_cache_valid: [false; MAX_LOCAL_SHADOW_SPOTLIGHTS],
             timings: RenderTimings::default(),
             gpu_timestamp_profiler,
             environment_load: None,
@@ -1443,6 +1642,60 @@ impl Renderer {
 
     pub fn current_timings(&self) -> RenderTimings {
         self.timings
+    }
+
+    pub fn record_update_timings(&mut self, world_update_cpu_ms: f32, animation_cpu_ms: f32) {
+        self.timings.world_update_cpu_ms = world_update_cpu_ms;
+        self.timings.animation_cpu_ms = animation_cpu_ms;
+    }
+
+    fn encode_shadow_map_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        shadow_view: &wgpu::TextureView,
+        shadow_bind_group: &wgpu::BindGroup,
+        label: &'static str,
+    ) -> usize {
+        let draw_count = self
+            .shadow_draw_batches
+            .iter()
+            .filter(|(mesh_id, material_id, _)| {
+                self.meshes.get(mesh_id.0).is_some() && self.materials.get(material_id.0).is_some()
+            })
+            .count();
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: shadow_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&self.shadow_pipeline);
+        pass.set_bind_group(0, shadow_bind_group, &[]);
+        pass.set_vertex_buffer(1, self.shadow_instance_buffer.slice(..));
+        for (mesh_id, material_id, range) in &self.shadow_draw_batches {
+            let (Some(mesh), Some(material)) = (
+                self.meshes.get(mesh_id.0),
+                self.materials.get(material_id.0),
+            ) else {
+                continue;
+            };
+            pass.set_bind_group(1, &material.bind_group, &[]);
+            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(2, mesh.skin_buffer.slice(..));
+            pass.set_vertex_buffer(3, mesh.tangent_buffer.slice(..));
+            pass.set_vertex_buffer(4, mesh.uv_sets_buffer.slice(..));
+            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.num_indices, 0, range.clone());
+        }
+        draw_count
     }
 
     pub fn set_settings(&mut self, settings: RendererSettings) {
@@ -2414,61 +2667,66 @@ impl Renderer {
         self.transparent_objects.clear();
         self.skin_matrices.clear();
         self.skin_matrices.push(Mat4::IDENTITY);
+        self.object_model_matrices.clear();
+        let transform_started = Instant::now();
+        for (object_index, object) in objects.iter().enumerate() {
+            self.object_model_matrices
+                .push(object_model_matrix(world, object_index, object));
+        }
+        self.timings.world_transform_cpu_ms = transform_started.elapsed().as_secs_f32() * 1000.0;
         let view_projection = camera.build_view_projection_matrix();
+        let view_frustum = view_frustum_planes(view_projection);
+        let spot_shadow_light_indices = shadow_casting_spotlight_indices(world);
+        let shadow_maps_enabled =
+            self.settings.shadows_enabled || spot_shadow_light_indices.iter().any(Option::is_some);
         let camera_forward = Vec3::new(
             camera.yaw.cos() * camera.pitch.cos(),
             camera.pitch.sin(),
             camera.yaw.sin() * camera.pitch.cos(),
         )
         .normalize();
+        let traversal_started = Instant::now();
         for (object_index, obj) in objects.iter().enumerate() {
-            let Some(object_id) = world.object_id_at(object_index) else {
-                continue;
-            };
-            let model_matrix = world
-                .group_model_matrix_for_id(object_id)
-                .unwrap_or_else(|| obj.model_matrix());
+            let model_matrix = self.object_model_matrices[object_index];
             let mesh = self.meshes.get(obj.mesh_id.0);
             let bounds = mesh.map(|mesh| (mesh.bounds_center, mesh.bounds_radius));
-            let camera_visible = object_in_view(
-                bounds,
-                model_matrix,
-                !obj.skin_matrices().is_empty(),
-                view_projection,
-            );
+            let skin_matrices = obj.skin_matrices();
+            let is_skinned = !skin_matrices.is_empty();
+            let world_bounds = if is_skinned {
+                None
+            } else {
+                object_world_sphere(bounds, model_matrix)
+            };
+            let camera_visible =
+                object_visible_in_frustum(world_bounds, is_skinned, view_frustum.as_ref());
             let material = self.materials.get(obj.material_id.0);
             let is_transparent = material.is_some_and(|material| {
                 is_transparent_material(material.alpha_mode, material.params.transmission_factor)
             });
-            let casts_shadow = material
-                .is_some_and(|material| material_casts_shadow(material.params.transmission_factor));
+            let casts_shadow = shadow_maps_enabled
+                && material.is_some_and(|material| {
+                    material_casts_shadow(material.params.transmission_factor)
+                });
             if !should_prepare_instance(camera_visible, casts_shadow) {
                 continue;
             }
             // The built-in floor receives shadows but should not set the shadow-map footprint.
             if casts_shadow && obj.mesh_id != MESH_PLANE {
-                if !obj.skin_matrices().is_empty() {
+                if is_skinned {
                     has_skinned_shadow_object = true;
-                } else if let Some((bounds_center, bounds_radius)) = bounds {
-                    let conservative_scale = (model_matrix.x_axis.truncate().length_squared()
-                        + model_matrix.y_axis.truncate().length_squared()
-                        + model_matrix.z_axis.truncate().length_squared())
-                    .sqrt();
-                    self.shadow_bounds.push((
-                        model_matrix.transform_point3(bounds_center),
-                        bounds_radius * conservative_scale,
-                    ));
+                } else if let Some(world_bounds) = world_bounds {
+                    self.shadow_bounds.push(world_bounds);
                 }
             }
             let Ok(skin_offset) = u32::try_from(self.skin_matrices.len()) else {
                 eprintln!("Не удалось отрисовать объект: превышен диапазон индексов скелета");
                 continue;
             };
-            let Ok(skin_count) = u32::try_from(obj.skin_matrices().len()) else {
+            let Ok(skin_count) = u32::try_from(skin_matrices.len()) else {
                 eprintln!("Не удалось отрисовать объект: слишком большой скелет");
                 continue;
             };
-            self.skin_matrices.extend_from_slice(obj.skin_matrices());
+            self.skin_matrices.extend_from_slice(skin_matrices);
             let instance = InstanceRaw::from_model(model_matrix, skin_offset, skin_count);
             if casts_shadow {
                 self.shadow_batches
@@ -2498,23 +2756,27 @@ impl Renderer {
             }
         }
         sort_transparent_objects(&mut self.transparent_objects);
+        self.timings.scene_traversal_cpu_ms = traversal_started.elapsed().as_secs_f32() * 1000.0;
 
+        let batch_started = Instant::now();
         self.all_instances.clear();
         self.shadow_instances.clear();
         self.draw_batches.clear();
         self.shadow_draw_batches.clear();
 
-        let mut shadow_batches: Vec<_> = self.shadow_batches.iter().collect();
-        shadow_batches.sort_by_key(|((mesh_id, material_id), _)| (mesh_id.0, material_id.0));
-        for (&(mesh_id, material_id), instances) in shadow_batches {
-            if instances.is_empty() {
-                continue;
+        if shadow_maps_enabled {
+            let mut shadow_batches: Vec<_> = self.shadow_batches.iter().collect();
+            shadow_batches.sort_by_key(|((mesh_id, material_id), _)| (mesh_id.0, material_id.0));
+            for (&(mesh_id, material_id), instances) in shadow_batches {
+                if instances.is_empty() {
+                    continue;
+                }
+                let start = self.shadow_instances.len() as u32;
+                let count = instances.len() as u32;
+                self.shadow_instances.extend_from_slice(instances);
+                self.shadow_draw_batches
+                    .push((mesh_id, material_id, start..start + count));
             }
-            let start = self.shadow_instances.len() as u32;
-            let count = instances.len() as u32;
-            self.shadow_instances.extend_from_slice(instances);
-            self.shadow_draw_batches
-                .push((mesh_id, material_id, start..start + count));
         }
 
         let mut opaque_batches: Vec<_> = self.batches.iter().collect();
@@ -2536,9 +2798,11 @@ impl Renderer {
             self.draw_batches
                 .push((mesh_id, material_id, start..start + 1, true));
         }
+        self.timings.batch_rebuild_cpu_ms = batch_started.elapsed().as_secs_f32() * 1000.0;
 
         let visible_instance_count = self.all_instances.len();
 
+        let draw_prep_started = Instant::now();
         self.active_mesh_ids.clear();
         self.active_material_ids.clear();
         for (mesh_id, material_id, _, _) in &self.draw_batches {
@@ -2591,6 +2855,7 @@ impl Renderer {
         self.timings.active_materials = self.active_material_ids.len();
         self.timings.render_batches = self.draw_batches.len();
         self.timings.active_instances = visible_instance_count;
+        self.timings.draw_prep_cpu_ms = draw_prep_started.elapsed().as_secs_f32() * 1000.0;
 
         let skin_buffer_bytes = self.skin_matrices.len() * std::mem::size_of::<Mat4>();
         let max_storage_binding_size =
@@ -2622,6 +2887,8 @@ impl Renderer {
                 &self.skin_buffer,
                 &self.shadow_matrix_buffer,
                 &self.shadow_view,
+                &self.spot_shadow_matrix_buffer,
+                &self.spot_shadow_view,
                 &self.shadow_sampler,
             );
             self.shadow_shared_bind_group = create_shadow_bind_group(
@@ -2630,6 +2897,14 @@ impl Renderer {
                 &self.skin_buffer,
                 &self.shadow_matrix_buffer,
             );
+            self.spot_shadow_render_bind_groups = std::array::from_fn(|slot| {
+                create_shadow_bind_group(
+                    &self.device,
+                    &self.shadow_bind_group_layout,
+                    &self.skin_buffer,
+                    &self.spot_shadow_render_matrix_buffers[slot],
+                )
+            });
         }
         self.queue.write_buffer(
             &self.skin_buffer,
@@ -2666,13 +2941,35 @@ impl Renderer {
         } else {
             directional_shadow_matrix_for_bounds(key_direction, &self.shadow_bounds)
         };
-        let render_shadows = self.settings.shadows_enabled
+        let spot_shadow_matrices: [Option<Mat4>; MAX_LOCAL_SHADOW_SPOTLIGHTS] =
+            std::array::from_fn(|slot| {
+                spot_shadow_light_indices[slot]
+                    .and_then(|index| spotlight_shadow_matrix_for_world(world, index))
+            });
+        let shadow_content_changed = !self.shadow_content_cache_valid
+            || self.cached_shadow_instances != self.shadow_instances
+            || self.cached_shadow_skin_matrices != self.skin_matrices
+            || self.shadow_draw_batches != self.cached_shadow_batches;
+        if !self.settings.shadows_enabled {
+            self.shadow_cache_valid = false;
+        }
+        let render_directional_shadow = self.settings.shadows_enabled
             && (!self.shadow_cache_valid
-                || self.cached_shadow_matrix != shadow_matrix
-                || self.cached_shadow_instances != self.shadow_instances
-                || self.cached_shadow_skin_matrices != self.skin_matrices
-                || self.shadow_draw_batches != self.cached_shadow_batches);
-        if render_shadows {
+                || shadow_content_changed
+                || self.cached_shadow_matrix != shadow_matrix);
+        let render_spot_shadows: [bool; MAX_LOCAL_SHADOW_SPOTLIGHTS] =
+            std::array::from_fn(|slot| {
+                let Some(matrix) = spot_shadow_matrices[slot] else {
+                    self.spot_shadow_cache_valid[slot] = false;
+                    return false;
+                };
+                !self.spot_shadow_cache_valid[slot]
+                    || shadow_content_changed
+                    || self.cached_spot_shadow_matrices[slot] != matrix
+            });
+        let render_any_shadow =
+            render_directional_shadow || render_spot_shadows.iter().any(|render| *render);
+        if render_any_shadow {
             if self.shadow_instances.len() > self.shadow_instance_capacity {
                 self.shadow_instance_capacity = self
                     .shadow_instances
@@ -2730,53 +3027,49 @@ impl Renderer {
                 profiler.write_timestamp(&mut encoder, GPU_TIMESTAMP_SHADOW_START);
             }
         }
-        if render_shadows {
+        if render_directional_shadow {
             self.queue.write_buffer(
                 &self.shadow_matrix_buffer,
                 0,
                 bytemuck::bytes_of(&shadow_matrix.to_cols_array_2d()),
             );
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("directional shadow pass"),
-                color_attachments: &[],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.shadow_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(&self.shadow_pipeline);
-            pass.set_bind_group(0, &self.shadow_shared_bind_group, &[]);
-            pass.set_vertex_buffer(1, self.shadow_instance_buffer.slice(..));
-            self.timings.draw_calls += self
-                .shadow_draw_batches
-                .iter()
-                .filter(|(mesh_id, material_id, _)| {
-                    self.meshes.get(mesh_id.0).is_some()
-                        && self.materials.get(material_id.0).is_some()
-                })
-                .count();
-
-            for (mesh_id, material_id, range) in &self.shadow_draw_batches {
-                let (Some(mesh), Some(material)) = (
-                    self.meshes.get(mesh_id.0),
-                    self.materials.get(material_id.0),
-                ) else {
-                    continue;
-                };
-                pass.set_bind_group(1, &material.bind_group, &[]);
-                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                pass.set_vertex_buffer(2, mesh.skin_buffer.slice(..));
-                pass.set_vertex_buffer(3, mesh.tangent_buffer.slice(..));
-                pass.set_vertex_buffer(4, mesh.uv_sets_buffer.slice(..));
-                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.num_indices, 0, range.clone());
+            self.timings.draw_calls += self.encode_shadow_map_pass(
+                &mut encoder,
+                &self.shadow_view,
+                &self.shadow_shared_bind_group,
+                "directional shadow pass",
+            );
+            self.cached_shadow_matrix = shadow_matrix;
+            self.shadow_cache_valid = true;
+        }
+        for slot in 0..MAX_LOCAL_SHADOW_SPOTLIGHTS {
+            if !render_spot_shadows[slot] {
+                continue;
             }
+            let spot_matrix = spot_shadow_matrices[slot]
+                .expect("a spotlight shadow pass requires a valid matrix");
+            let matrix_columns = spot_matrix.to_cols_array_2d();
+            let matrix_bytes = bytemuck::bytes_of(&matrix_columns);
+            self.queue.write_buffer(
+                &self.spot_shadow_matrix_buffer,
+                (slot * std::mem::size_of::<[[f32; 4]; 4]>()) as u64,
+                matrix_bytes,
+            );
+            self.queue.write_buffer(
+                &self.spot_shadow_render_matrix_buffers[slot],
+                0,
+                matrix_bytes,
+            );
+            self.timings.draw_calls += self.encode_shadow_map_pass(
+                &mut encoder,
+                &self.spot_shadow_render_views[slot],
+                &self.spot_shadow_render_bind_groups[slot],
+                "spotlight shadow pass",
+            );
+            self.cached_spot_shadow_matrices[slot] = spot_matrix;
+            self.spot_shadow_cache_valid[slot] = true;
+        }
+        if render_any_shadow {
             self.cached_shadow_instances.clear();
             self.cached_shadow_instances
                 .extend_from_slice(&self.shadow_instances);
@@ -2785,8 +3078,7 @@ impl Renderer {
             self.cached_shadow_batches.clear();
             self.cached_shadow_batches
                 .clone_from(&self.shadow_draw_batches);
-            self.cached_shadow_matrix = shadow_matrix;
-            self.shadow_cache_valid = true;
+            self.shadow_content_cache_valid = true;
         }
 
         if capture_gpu_frame {
@@ -3138,7 +3430,42 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::{MATERIAL_DEFAULT, MESH_CUBE};
     use crate::scene::LocalLight;
+    use crate::scene::Transform;
+    use glam::Vec3;
+
+    #[test]
+    fn object_model_matrix_fast_path_preserves_standalone_and_group_transforms() {
+        let mut world = World::new();
+        let standalone = RenderObject::new(
+            Transform::from_translation(Vec3::X),
+            MESH_CUBE,
+            MATERIAL_DEFAULT,
+        );
+        world.add_object(standalone.clone());
+        assert_eq!(
+            object_model_matrix(&world, 0, &standalone),
+            standalone.model_matrix()
+        );
+
+        let parent = world.add_model_group(
+            "Parent",
+            PathBuf::from("model.glb"),
+            Transform::from_translation(Vec3::new(0.0, 2.0, 0.0)),
+        );
+        let grouped = RenderObject::new(
+            Transform::from_translation(Vec3::Z),
+            MESH_CUBE,
+            MATERIAL_DEFAULT,
+        );
+        let grouped_id = world.add_group_object(parent, grouped.clone()).unwrap();
+        let grouped = world.get_object(grouped_id).unwrap();
+        assert_eq!(
+            object_model_matrix(&world, 1, grouped),
+            world.model_group_world_matrix(parent) * grouped.model_matrix()
+        );
+    }
 
     #[test]
     fn gpu_timestamps_require_encoder_timestamp_support() {
@@ -3239,16 +3566,26 @@ mod tests {
     #[test]
     fn light_uniform_packs_enabled_point_and_spot_lights() {
         let point = LocalLight::point("Point", [1.0, 2.0, 3.0]);
-        let spot = LocalLight::spot("Spot", [4.0, 5.0, 6.0], [0.0, -2.0, 0.0]);
+        let mut spot = LocalLight::spot("Spot", [4.0, 5.0, 6.0], [0.0, -2.0, 0.0]);
+        spot.casts_shadows = true;
         let mut disabled = LocalLight::point("Disabled", [0.0; 3]);
         disabled.enabled = false;
         let mut world = World::new();
         world.add_local_light(point).unwrap();
         world.add_local_light(spot).unwrap();
         world.add_local_light(disabled).unwrap();
+        for index in 1..MAX_LOCAL_SHADOW_SPOTLIGHTS {
+            let mut spot = LocalLight::spot(
+                format!("Shadow spot {index}"),
+                [index as f32, 5.0, 6.0],
+                [0.0, -1.0, 0.0],
+            );
+            spot.casts_shadows = true;
+            world.add_local_light(spot).unwrap();
+        }
         let uniform = build_light_uniform(RendererSettings::default(), &world);
 
-        assert_eq!(uniform.local_light_info[0], 2);
+        assert_eq!(uniform.local_light_info[0], 5);
         assert_eq!(uniform.local_lights[0].position_range, [1.0, 2.0, 3.0, 8.0]);
         assert_eq!(uniform.local_lights[0].direction_type[3], 0.0);
         assert_eq!(uniform.local_lights[1].position_range[..3], [4.0, 5.0, 6.0]);
@@ -3257,6 +3594,13 @@ mod tests {
             [0.0, -1.0, 0.0, 1.0]
         );
         assert!(uniform.local_lights[1].spot_angles[0] > uniform.local_lights[1].spot_angles[1]);
+        assert_eq!(uniform.local_lights[1].spot_angles[2], 1.0);
+        for slot in 0..MAX_LOCAL_SHADOW_SPOTLIGHTS {
+            assert_eq!(
+                uniform.local_lights[slot + 1].spot_angles[2],
+                (slot + 1) as f32
+            );
+        }
     }
 
     #[test]
@@ -3337,6 +3681,25 @@ mod tests {
         assert!(ndc.x.abs() < 1e-5);
         assert!(ndc.y.abs() < 1e-5);
         assert!((0.0..1.0).contains(&ndc.z));
+    }
+
+    #[test]
+    fn spotlight_shadow_camera_projects_its_axis_into_the_depth_range() {
+        let light_position = Vec3::new(2.0, 5.0, 3.0);
+        let direction = Vec3::new(-0.2, -1.0, -0.3).normalize();
+        let matrix = spotlight_shadow_matrix(light_position, direction, 35.0, 12.0).unwrap();
+        let clip = matrix * (light_position + direction * 5.0).extend(1.0);
+        let ndc = clip.truncate() / clip.w;
+
+        assert!(ndc.x.abs() < 1e-5);
+        assert!(ndc.y.abs() < 1e-5);
+        assert!((0.0..1.0).contains(&ndc.z));
+    }
+
+    #[test]
+    fn spotlight_shadow_camera_rejects_invalid_light_settings() {
+        assert!(spotlight_shadow_matrix(Vec3::ZERO, Vec3::ZERO, 35.0, 12.0).is_none());
+        assert!(spotlight_shadow_matrix(Vec3::ZERO, -Vec3::Y, 0.0, 12.0).is_none());
     }
 
     #[test]
@@ -3435,7 +3798,7 @@ mod tests {
         ));
         assert!(!sphere_in_view(
             Vec3::new(1001.0, 0.0, 0.0),
-            0.1,
+            0.05,
             view_projection
         ));
         assert!(sphere_in_view(

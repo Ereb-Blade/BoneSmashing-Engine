@@ -1,0 +1,202 @@
+{
+  "version": 10,
+  "groups": [
+    {
+      "name": "Flight Helmet",
+      "path": "../models/FlightHelmet/FlightHelmet.gltf",
+      "position": [0.0, 0.42, -0.2],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.55, 1.55, 1.55]
+    }
+  ],
+  "lights": [
+    {
+      "name": "Key spotlight",
+      "kind": "spot",
+      "enabled": true,
+      "casts_shadows": true,
+      "position": [3.2, 6.5, 5.0],
+      "direction": [-0.38, -0.76, -0.52],
+      "color": [1.0, 0.78, 0.48],
+      "intensity": 180.0,
+      "range": 16.0,
+      "inner_cone_degrees": 18.0,
+      "outer_cone_degrees": 36.0
+    },
+    {
+      "name": "Cool fill spotlight",
+      "kind": "spot",
+      "enabled": true,
+      "casts_shadows": true,
+      "position": [-4.5, 3.8, 1.5],
+      "direction": [0.72, -0.55, -0.42],
+      "color": [0.12, 0.42, 1.0],
+      "intensity": 75.0,
+      "range": 13.0,
+      "inner_cone_degrees": 16.0,
+      "outer_cone_degrees": 34.0
+    },
+    {
+      "name": "Rear magenta rim",
+      "kind": "point",
+      "enabled": true,
+      "casts_shadows": false,
+      "position": [0.0, 3.5, -4.8],
+      "direction": [0.0, -1.0, 0.0],
+      "color": [0.9, 0.08, 0.4],
+      "intensity": 48.0,
+      "range": 11.0,
+      "inner_cone_degrees": 20.0,
+      "outer_cone_degrees": 30.0
+    }
+  ],
+  "objects": [
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 0,
+        "material_id": 0
+      },
+      "name": "Shadow catcher floor",
+      "position": [0.0, -0.12, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [7.0, 0.12, 7.0]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 0,
+        "material_id": 0
+      },
+      "name": "Helmet pedestal",
+      "position": [0.0, 0.12, -0.2],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [2.0, 0.12, 1.8]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 0,
+        "material_id": 0
+      },
+      "name": "Left shadow pillar",
+      "position": [-2.7, 0.75, -0.7],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [0.28, 0.75, 0.28]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 0,
+        "material_id": 0
+      },
+      "name": "Right shadow pillar",
+      "position": [2.7, 0.95, -1.1],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [0.28, 0.95, 0.28]
+    },
+    {
+      "source": {
+        "type": "built_in",
+        "mesh_id": 2,
+        "material_id": 0
+      },
+      "name": "Foreground shadow sphere",
+      "position": [0.0, 0.52, 2.8],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [0.52, 0.52, 0.52]
+    },
+    {
+      "source": {
+        "type": "asset",
+        "path": "../models/FlightHelmet/FlightHelmet.gltf",
+        "instance_index": 0
+      },
+      "model_group": 0,
+      "name": "Helmet body",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "source": {
+        "type": "asset",
+        "path": "../models/FlightHelmet/FlightHelmet.gltf",
+        "instance_index": 1
+      },
+      "model_group": 0,
+      "name": "Helmet shell",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "source": {
+        "type": "asset",
+        "path": "../models/FlightHelmet/FlightHelmet.gltf",
+        "instance_index": 2
+      },
+      "model_group": 0,
+      "name": "Helmet lenses",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "source": {
+        "type": "asset",
+        "path": "../models/FlightHelmet/FlightHelmet.gltf",
+        "instance_index": 3
+      },
+      "model_group": 0,
+      "name": "Helmet metal details",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "source": {
+        "type": "asset",
+        "path": "../models/FlightHelmet/FlightHelmet.gltf",
+        "instance_index": 4
+      },
+      "model_group": 0,
+      "name": "Helmet leather",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "source": {
+        "type": "asset",
+        "path": "../models/FlightHelmet/FlightHelmet.gltf",
+        "instance_index": 5
+      },
+      "model_group": 0,
+      "name": "Helmet visor",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "scale": [1.0, 1.0, 1.0]
+    }
+  ],
+  "camera": {
+    "position": [6.0, 4.5, 9.0],
+    "yaw": -2.16,
+    "pitch": -0.35,
+    "up": [0.0, 1.0, 0.0]
+  },
+  "renderer_settings": {
+    "key_light_yaw_degrees": -135.0,
+    "key_light_elevation_degrees": -48.0,
+    "key_light_intensity": 0.24,
+    "fill_light_intensity": 0.08,
+    "environment_intensity": 0.45,
+    "exposure_ev": 0.0,
+    "shadows_enabled": true,
+    "shadow_pcf_samples": 8,
+    "debug_view": 0,
+    "unlocked_fps": true,
+    "render_scale": 1.0,
+    "msaa_samples": 4
+  }
+}

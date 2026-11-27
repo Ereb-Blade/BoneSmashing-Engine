@@ -133,6 +133,11 @@ struct SkinMatrices {
 @group(0) @binding(3) var<uniform> shadow_matrix: mat4x4<f32>;
 @group(0) @binding(4) var t_shadow: texture_depth_2d;
 @group(0) @binding(5) var s_shadow: sampler_comparison;
+struct SpotShadowMatrices {
+    matrices: array<mat4x4<f32>, 4>,
+};
+@group(0) @binding(6) var<uniform> spot_shadow_matrices: SpotShadowMatrices;
+@group(0) @binding(7) var t_spot_shadow: texture_depth_2d_array;
 
 @group(1) @binding(0) var t_diffuse: texture_2d<f32>;
 @group(1) @binding(1) var s_diffuse: sampler;
@@ -243,6 +248,8 @@ fn evaluate_direct_light(
 fn evaluate_local_lights(
     world_pos: vec3<f32>,
     normal: vec3<f32>,
+    offset_normal: vec3<f32>,
+    face_normal: vec3<f32>,
     view_dir: vec3<f32>,
     base_color: vec3<f32>,
     metallic: f32,
@@ -276,6 +283,16 @@ fn evaluate_local_lights(
         let attenuation = range_factor * range_factor / max(distance_squared, 0.01);
         let radiance = local.color_intensity.rgb
             * (local.color_intensity.w * attenuation * spot_factor);
+        var visibility = 1.0;
+        if local.spot_angles.z > 0.5 {
+            visibility = spotlight_shadow_visibility(
+                world_pos,
+                offset_normal,
+                face_normal,
+                light_dir,
+                u32(local.spot_angles.z + 0.5) - 1u,
+            );
+        }
         contribution += evaluate_direct_light(
             normal,
             view_dir,
@@ -286,7 +303,7 @@ fn evaluate_local_lights(
             roughness,
             f0,
             specular_weight,
-        );
+        ) * visibility;
     }
     return contribution;
 }
@@ -542,6 +559,83 @@ fn shadow_visibility(
             t_shadow,
             s_shadow,
             uv + SHADOW_PCF_OFFSETS[index] * texel,
+            projected.z - bias,
+        );
+    }
+    return visibility / 16.0;
+}
+
+fn spotlight_shadow_visibility(
+    world_pos: vec3<f32>,
+    offset_normal: vec3<f32>,
+    face_normal: vec3<f32>,
+    light_dir: vec3<f32>,
+    shadow_layer: u32,
+) -> f32 {
+    let normal_light = clamp(dot(face_normal, light_dir), 0.0, 1.0);
+    let offset_normal_light = clamp(dot(offset_normal, light_dir), 0.0, 1.0);
+    let normal_bias = 0.008 * (1.0 - offset_normal_light);
+    let light_clip = spot_shadow_matrices.matrices[shadow_layer]
+        * vec4<f32>(world_pos + offset_normal * normal_bias, 1.0);
+    let projected = light_clip.xyz / light_clip.w;
+    let uv = projected.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    if projected.z <= 0.0 || projected.z >= 1.0
+        || any(uv <= vec2<f32>(0.0)) || any(uv >= vec2<f32>(1.0)) {
+        return 1.0;
+    }
+
+    let texel = 1.0 / vec2<f32>(textureDimensions(t_spot_shadow));
+    let bias = max(0.00025 * (1.0 - normal_light), 0.00008);
+    let pcf_samples = u32(light.render_options.x + 0.5);
+    if pcf_samples == 2u {
+        var visibility = 0.0;
+        for (var index = 0u; index < 2u; index += 1u) {
+            visibility += textureSampleCompare(
+                t_spot_shadow,
+                s_shadow,
+                uv + SHADOW_PCF_OFFSETS_2[index] * texel,
+                i32(shadow_layer),
+                projected.z - bias,
+            );
+        }
+        return visibility / 2.0;
+    }
+
+    if pcf_samples == 4u {
+        var visibility = 0.0;
+        for (var index = 0u; index < 4u; index += 1u) {
+            visibility += textureSampleCompare(
+                t_spot_shadow,
+                s_shadow,
+                uv + SHADOW_PCF_OFFSETS_4[index] * texel,
+                i32(shadow_layer),
+                projected.z - bias,
+            );
+        }
+        return visibility / 4.0;
+    }
+
+    if pcf_samples == 8u {
+        var visibility = 0.0;
+        for (var index = 0u; index < 8u; index += 1u) {
+            visibility += textureSampleCompare(
+                t_spot_shadow,
+                s_shadow,
+                uv + SHADOW_PCF_OFFSETS_8[index] * texel,
+                i32(shadow_layer),
+                projected.z - bias,
+            );
+        }
+        return visibility / 8.0;
+    }
+
+    var visibility = 0.0;
+    for (var index = 0u; index < 16u; index += 1u) {
+        visibility += textureSampleCompare(
+            t_spot_shadow,
+            s_shadow,
+            uv + SHADOW_PCF_OFFSETS[index] * texel,
+            i32(shadow_layer),
             projected.z - bias,
         );
     }
@@ -901,6 +995,8 @@ fn fs_glass(
         + evaluate_local_lights(
             v.world_pos,
             normal,
+            shadow_offset_normal,
+            geometric_normal,
             view_dir,
             vec3<f32>(0.0),
             0.0,
@@ -942,6 +1038,8 @@ fn fs_glass(
         direct_clearcoat += clearcoat_factor * evaluate_local_lights(
             v.world_pos,
             clearcoat_normal,
+            shadow_offset_normal,
+            geometric_normal,
             view_dir,
             vec3<f32>(0.0),
             1.0,
@@ -1251,6 +1349,8 @@ fn fs_main(
     radiance += evaluate_local_lights(
         v.world_pos,
         normal,
+        shadow_offset_normal,
+        geometric_normal,
         view_dir,
         surface_color.rgb,
         metallic,
@@ -1292,6 +1392,8 @@ fn fs_main(
         direct_clearcoat += clearcoat_factor * evaluate_local_lights(
             v.world_pos,
             clearcoat_normal,
+            shadow_offset_normal,
+            geometric_normal,
             view_dir,
             vec3<f32>(0.0),
             1.0,
@@ -1463,6 +1565,26 @@ impl RenderPipelineBundle {
                         binding: 5,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2Array,
+                            multisampled: false,
+                        },
                         count: None,
                     },
                 ],

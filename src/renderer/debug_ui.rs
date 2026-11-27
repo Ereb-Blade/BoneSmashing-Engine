@@ -7,8 +7,9 @@ use crate::renderer::material::MaterialParams;
 use crate::renderer::state::{ParsedAsset, RenderTimings, Renderer, RendererSettings, parse_asset};
 use crate::scene::{
     LoadedScene, LocalLight, LocalLightKind, MAX_ANIMATION_CROSSFADE_SECONDS, MAX_LOCAL_LIGHTS,
-    ModelAnimationClip, ModelAnimationPlayback, ModelAnimationTransition, ModelGroupId, ObjectId,
-    RenderObject, SceneEnvironment, Transform, World, load_scene,
+    MAX_LOCAL_SHADOW_SPOTLIGHTS, ModelAnimationClip, ModelAnimationPlayback,
+    ModelAnimationTransition, ModelGroupId, ObjectId, RenderObject, SceneEnvironment, Transform,
+    World, load_scene,
 };
 use glam::{EulerRot, Mat4, Quat, Vec3};
 use serde::Serialize;
@@ -379,6 +380,7 @@ struct ProfileRenderSettings {
 
 #[derive(Clone, Serialize)]
 struct ProfileSceneSnapshot {
+    objects: usize,
     draw_calls: usize,
     triangles: usize,
     meshes: usize,
@@ -395,7 +397,13 @@ struct ProfileSample {
     fps: f32,
     cpu_frame_ms: f32,
     cpu_ui_ms: f32,
+    cpu_world_update_ms: f32,
+    cpu_animation_ms: f32,
     cpu_scene_ms: f32,
+    cpu_world_transform_ms: f32,
+    cpu_scene_traversal_ms: f32,
+    cpu_batch_rebuild_ms: f32,
+    cpu_draw_prep_ms: f32,
     cpu_acquire_ms: f32,
     cpu_submit_ms: f32,
     gpu_sample_id: Option<u64>,
@@ -423,7 +431,13 @@ struct ProfileMetricSummary {
 #[derive(Serialize)]
 struct ProfileSummary {
     cpu_frame_ms: ProfileMetricSummary,
+    cpu_world_update_ms: ProfileMetricSummary,
+    cpu_animation_ms: ProfileMetricSummary,
     cpu_acquire_ms: ProfileMetricSummary,
+    cpu_world_transform_ms: ProfileMetricSummary,
+    cpu_scene_traversal_ms: ProfileMetricSummary,
+    cpu_batch_rebuild_ms: ProfileMetricSummary,
+    cpu_draw_prep_ms: ProfileMetricSummary,
     gpu_render_ms: ProfileMetricSummary,
     gpu_shadow_map_ms: ProfileMetricSummary,
     gpu_opaque_ms: ProfileMetricSummary,
@@ -506,6 +520,7 @@ impl ProfileCapture {
                 debug_view: settings.debug_view,
             },
             scene: ProfileSceneSnapshot {
+                objects: world.objects().len(),
                 draw_calls: timings.draw_calls,
                 triangles: timings.triangle_count,
                 meshes: timings.active_meshes,
@@ -550,7 +565,13 @@ impl ProfileCapture {
             fps,
             cpu_frame_ms,
             cpu_ui_ms: timings.ui_cpu_ms,
+            cpu_world_update_ms: timings.world_update_cpu_ms,
+            cpu_animation_ms: timings.animation_cpu_ms,
             cpu_scene_ms: timings.scene_cpu_ms,
+            cpu_world_transform_ms: timings.world_transform_cpu_ms,
+            cpu_scene_traversal_ms: timings.scene_traversal_cpu_ms,
+            cpu_batch_rebuild_ms: timings.batch_rebuild_cpu_ms,
+            cpu_draw_prep_ms: timings.draw_prep_cpu_ms,
             cpu_acquire_ms: timings.acquire_cpu_ms,
             cpu_submit_ms: timings.encode_submit_cpu_ms,
             gpu_sample_id: has_new_gpu_sample.then_some(timings.gpu_sample_id),
@@ -611,7 +632,7 @@ impl ProfileCapture {
             .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
         let path = directory.join(format!("profile-{written_at_unix_ms}.json"));
         let log = ProfileLog {
-            schema_version: 2,
+            schema_version: 3,
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
             written_at_unix_ms,
             scene_path: self.scene_path,
@@ -638,8 +659,26 @@ impl ProfileSummary {
             cpu_frame_ms: summarize_profile_metric(
                 samples.iter().map(|sample| sample.cpu_frame_ms),
             ),
+            cpu_world_update_ms: summarize_profile_metric(
+                samples.iter().map(|sample| sample.cpu_world_update_ms),
+            ),
+            cpu_animation_ms: summarize_profile_metric(
+                samples.iter().map(|sample| sample.cpu_animation_ms),
+            ),
             cpu_acquire_ms: summarize_profile_metric(
                 samples.iter().map(|sample| sample.cpu_acquire_ms),
+            ),
+            cpu_world_transform_ms: summarize_profile_metric(
+                samples.iter().map(|sample| sample.cpu_world_transform_ms),
+            ),
+            cpu_scene_traversal_ms: summarize_profile_metric(
+                samples.iter().map(|sample| sample.cpu_scene_traversal_ms),
+            ),
+            cpu_batch_rebuild_ms: summarize_profile_metric(
+                samples.iter().map(|sample| sample.cpu_batch_rebuild_ms),
+            ),
+            cpu_draw_prep_ms: summarize_profile_metric(
+                samples.iter().map(|sample| sample.cpu_draw_prep_ms),
             ),
             gpu_render_ms: summarize_profile_metric(
                 samples.iter().filter_map(|sample| sample.gpu_render_ms),
@@ -3043,6 +3082,14 @@ impl DebugUi {
                                 if let Some(SceneSelection::Light(index)) = selected_scene_item {
                                     if index < world.local_lights().len() {
                                         ui.separator();
+                                        let other_shadow_caster_count = world
+                                            .local_lights()
+                                            .iter()
+                                            .enumerate()
+                                            .filter(|(light_index, light)| {
+                                                *light_index != index && light.casts_shadows
+                                            })
+                                            .count();
                                         let parent_before = world.local_light_parent(index);
                                         let mut selected_parent = parent_before;
                                         let parent_options: Vec<_> = world
@@ -3125,6 +3172,43 @@ impl DebugUi {
                                                         "Spotlight",
                                                     );
                                                 });
+                                            if light.kind != LocalLightKind::Spot
+                                                && light.casts_shadows
+                                            {
+                                                light.casts_shadows = false;
+                                                scene_modified = true;
+                                            }
+                                            if light.kind == LocalLightKind::Spot {
+                                                let mut casts_shadows = light.casts_shadows;
+                                                if ui
+                                                    .checkbox(&mut casts_shadows, "Cast shadows")
+                                                    .changed()
+                                                {
+                                                    if casts_shadows
+                                                        && other_shadow_caster_count
+                                                            >= MAX_LOCAL_SHADOW_SPOTLIGHTS
+                                                    {
+                                                        self.scene_status = Some(Err(
+                                                            format!(
+                                                                "A scene can have at most {MAX_LOCAL_SHADOW_SPOTLIGHTS} shadow-casting spotlights"
+                                                            ),
+                                                        ));
+                                                    } else {
+                                                        light.casts_shadows = casts_shadows;
+                                                        scene_modified = true;
+                                                    }
+                                                }
+                                                if other_shadow_caster_count
+                                                    >= MAX_LOCAL_SHADOW_SPOTLIGHTS
+                                                    && !light.casts_shadows
+                                                {
+                                                    ui.weak(
+                                                        format!(
+                                                            "A maximum of {MAX_LOCAL_SHADOW_SPOTLIGHTS} spotlights can cast shadows."
+                                                        ),
+                                                    );
+                                                }
+                                            }
                                             let position_label = if selected_parent.is_some() {
                                                 "Local position"
                                             } else {
@@ -3265,6 +3349,18 @@ impl DebugUi {
                                         ui.small(format!(
                                             "Acquire {:.2} ms  |  Submit {:.2} ms",
                                             timings.acquire_cpu_ms, timings.encode_submit_cpu_ms
+                                        ));
+                                        ui.small(format!(
+                                            "Update {:.2} ms  |  Animation {:.2} ms  |  Transforms {:.2} ms",
+                                            timings.world_update_cpu_ms,
+                                            timings.animation_cpu_ms,
+                                            timings.world_transform_cpu_ms
+                                        ));
+                                        ui.small(format!(
+                                            "Traversal {:.2} ms  |  Batch rebuild {:.2} ms  |  Draw prep {:.2} ms",
+                                            timings.scene_traversal_cpu_ms,
+                                            timings.batch_rebuild_cpu_ms,
+                                            timings.draw_prep_cpu_ms
                                         ));
                                         let gpu_text = timings
                                             .gpu_frame_ms

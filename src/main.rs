@@ -24,5 +24,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     event_loop.run_app(&mut app)?;
+    if !app.benchmark_completed() {
+        return Err("Benchmark exited before all runs completed".into());
+    }
     Ok(())
 }

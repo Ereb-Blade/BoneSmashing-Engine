@@ -4,8 +4,8 @@ use crate::renderer::material::MaterialParams;
 use crate::renderer::state::{ParsedAsset, RendererSettings, parse_asset};
 use crate::scene::{
     AnimationKeyboardControl, DEFAULT_ANIMATION_CROSSFADE_SECONDS, LocalLight, LocalLightKind,
-    MAX_ANIMATION_CROSSFADE_SECONDS, MAX_LOCAL_LIGHTS, ModelGroupId, RenderObject, Transform,
-    World,
+    MAX_ANIMATION_CROSSFADE_SECONDS, MAX_LOCAL_LIGHTS, MAX_LOCAL_SHADOW_SPOTLIGHTS, ModelGroupId,
+    RenderObject, Transform, World,
 };
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
@@ -13,11 +13,15 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const SCENE_FORMAT_VERSION: u32 = 9;
+const SCENE_FORMAT_VERSION: u32 = 10;
 const MAX_SCENE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SCENE_OBJECTS: usize = 100_000;
 const MAX_SCENE_ASSETS: usize = 256;
 const MAX_SCENE_GROUPS: usize = 1_000;
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,6 +63,8 @@ pub struct SceneLight {
     pub name: String,
     pub kind: LocalLightKind,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub casts_shadows: bool,
     pub position: [f32; 3],
     pub direction: [f32; 3],
     pub color: [f32; 3],
@@ -76,6 +82,7 @@ impl SceneLight {
             name: light.name.clone(),
             kind: light.kind,
             enabled: light.enabled,
+            casts_shadows: light.casts_shadows,
             position: light.position,
             direction: light.direction,
             color: light.color,
@@ -95,6 +102,7 @@ impl SceneLight {
             }
         };
         light.enabled = self.enabled;
+        light.casts_shadows = self.casts_shadows;
         light.color = self.color;
         light.intensity = self.intensity;
         light.range = self.range;
@@ -503,6 +511,17 @@ impl SceneFile {
                 "Scene contains too many local lights (maximum: {MAX_LOCAL_LIGHTS})"
             ));
         }
+        if self
+            .lights
+            .iter()
+            .filter(|light| light.casts_shadows)
+            .count()
+            > MAX_LOCAL_SHADOW_SPOTLIGHTS
+        {
+            return Err(format!(
+                "Scene contains more than {MAX_LOCAL_SHADOW_SPOTLIGHTS} shadow-casting spotlights"
+            ));
+        }
         for (index, light) in self.lights.iter().enumerate() {
             if !light.to_local_light().is_valid() {
                 return Err(format!("Local light {index} has invalid settings"));
@@ -742,7 +761,7 @@ pub fn load_scene(path: &Path) -> Result<LoadedScene, String> {
     let mut file: SceneFile = serde_json::from_slice(&bytes)
         .map_err(|error| format!("Could not parse scene {}: {error}", path.display()))?;
     let legacy_scene = file.version == 1;
-    if matches!(file.version, 1..=8) {
+    if matches!(file.version, 1..=9) {
         file.version = SCENE_FORMAT_VERSION;
     }
     file.validate()?;
@@ -1110,7 +1129,8 @@ mod tests {
     fn saves_loads_and_validates_local_lights() {
         let mut world = World::new();
         let point = LocalLight::point("Key", [1.0, 2.0, 3.0]);
-        let spot = LocalLight::spot("Rim", [-1.0, 2.0, 0.0], [0.0, -1.0, 0.0]);
+        let mut spot = LocalLight::spot("Rim", [-1.0, 2.0, 0.0], [0.0, -1.0, 0.0]);
+        spot.casts_shadows = true;
         let parent = world.add_empty_node(
             "Lamp stand",
             Transform::from_translation(Vec3::new(1.0, 0.0, 0.0)),
@@ -1129,6 +1149,7 @@ mod tests {
         assert_eq!(decoded.lights[0].parent_group, None);
         assert_eq!(decoded.lights[1].name, "Rim");
         assert_eq!(decoded.lights[1].parent_group, Some(0));
+        assert!(decoded.lights[1].casts_shadows);
 
         let restored = build_world(&decoded, 0, 0, HashMap::new()).unwrap();
         assert_eq!(restored.local_lights(), world.local_lights());
@@ -1150,13 +1171,27 @@ mod tests {
                 .contains("Local light 0 has invalid settings")
         );
 
-        let mut invalid_parent = decoded;
+        let mut invalid_parent = decoded.clone();
         invalid_parent.lights[1].parent_group = Some(2);
         assert!(
             invalid_parent
                 .validate()
                 .unwrap_err()
                 .contains("references an unknown parent group")
+        );
+
+        let mut multiple_shadow_casters = decoded;
+        let shadow_caster_template = multiple_shadow_casters.lights[1].clone();
+        for index in 0..=MAX_LOCAL_SHADOW_SPOTLIGHTS {
+            let mut shadow_caster = shadow_caster_template.clone();
+            shadow_caster.name = format!("Shadow caster {index}");
+            multiple_shadow_casters.lights.push(shadow_caster);
+        }
+        assert!(
+            multiple_shadow_casters
+                .validate()
+                .unwrap_err()
+                .contains("shadow-casting spotlights")
         );
     }
 
@@ -1703,6 +1738,8 @@ mod tests {
             loaded.file.lights[1].kind,
             crate::scene::LocalLightKind::Spot
         );
+        assert!(loaded.file.lights.iter().all(|light| !light.casts_shadows));
+        assert_eq!(loaded.file.version, SCENE_FORMAT_VERSION);
         let environment_path = loaded
             .file
             .environment
@@ -1723,6 +1760,26 @@ mod tests {
             .unwrap()
             .into_rgb32f();
         assert_eq!(hdr.width(), hdr.height() * 2);
+    }
+
+    #[test]
+    fn spotlight_shadow_gallery_scene_loads_with_two_shadow_casting_spotlights() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("scenes")
+            .join("spotlight_shadow_gallery.bse-scene");
+        let loaded = load_scene(&path).unwrap();
+        let shadow_casters: Vec<_> = loaded
+            .file
+            .lights
+            .iter()
+            .filter(|light| light.casts_shadows)
+            .collect();
+
+        assert_eq!(loaded.assets.len(), 1);
+        assert_eq!(shadow_casters.len(), 2);
+        assert_eq!(shadow_casters[0].kind, crate::scene::LocalLightKind::Spot);
+        assert!(loaded.file.renderer_settings.unwrap().shadows_enabled);
     }
 
     #[test]

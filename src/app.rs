@@ -33,9 +33,12 @@ use crate::scene::{
 #[derive(Clone, Debug)]
 pub struct BenchmarkConfig {
     pub scene_path: PathBuf,
+    pub object_count: Option<usize>,
+    pub runs: u32,
     pub width: u32,
     pub height: u32,
     pub render_scale: Option<f32>,
+    pub shadows_enabled: Option<bool>,
     pub shadow_pcf_samples: Option<u32>,
     pub msaa_samples: Option<u32>,
     pub fullscreen: bool,
@@ -45,9 +48,12 @@ impl BenchmarkConfig {
     pub fn from_args(mut args: impl Iterator<Item = String>) -> Result<Option<Self>, String> {
         let mut benchmark = false;
         let mut scene_path = None;
+        let mut object_count = None;
+        let mut runs = 1;
         let mut width = 1280;
         let mut height = 720;
         let mut render_scale = None;
+        let mut shadows_enabled = None;
         let mut shadow_pcf_samples = None;
         let mut msaa_samples = None;
         let mut fullscreen = false;
@@ -80,6 +86,33 @@ impl BenchmarkConfig {
                         .ok_or_else(|| "--benchmark-scene requires a scene path".to_owned())?;
                     scene_path = Some(PathBuf::from(value));
                 }
+                "--benchmark-objects" => {
+                    benchmark = true;
+                    let value = args.next().ok_or_else(|| {
+                        "--benchmark-objects requires 1000, 10000, or 100000".to_owned()
+                    })?;
+                    let count = value.parse::<usize>().map_err(|_| {
+                        "--benchmark-objects requires 1000, 10000, or 100000".to_owned()
+                    })?;
+                    if ![1_000, 10_000, 100_000].contains(&count) {
+                        return Err(
+                            "--benchmark-objects requires 1000, 10000, or 100000".to_owned()
+                        );
+                    }
+                    object_count = Some(count);
+                }
+                "--benchmark-runs" => {
+                    benchmark = true;
+                    let value = args.next().ok_or_else(|| {
+                        "--benchmark-runs requires a value from 1 to 10".to_owned()
+                    })?;
+                    runs = value
+                        .parse::<u32>()
+                        .map_err(|_| "--benchmark-runs requires a value from 1 to 10".to_owned())?;
+                    if !(1..=10).contains(&runs) {
+                        return Err("--benchmark-runs requires a value from 1 to 10".to_owned());
+                    }
+                }
                 "--benchmark-render-scale" => {
                     benchmark = true;
                     let value = args.next().ok_or_else(|| {
@@ -94,6 +127,10 @@ impl BenchmarkConfig {
                         );
                     }
                     render_scale = Some(scale);
+                }
+                "--benchmark-shadows" => {
+                    benchmark = true;
+                    shadows_enabled = Some(true);
                 }
                 "--benchmark-shadow-pcf-samples" => {
                     benchmark = true;
@@ -140,6 +177,9 @@ impl BenchmarkConfig {
         if !benchmark {
             return Ok(None);
         }
+        if object_count.is_some() && scene_path.is_some() {
+            return Err("--benchmark-objects cannot be combined with --benchmark-scene".to_owned());
+        }
         let scene_path = scene_path.unwrap_or_else(|| {
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("assets")
@@ -148,14 +188,38 @@ impl BenchmarkConfig {
         });
         Ok(Some(Self {
             scene_path,
+            object_count,
+            runs,
             width,
             height,
             render_scale,
+            shadows_enabled,
             shadow_pcf_samples,
             msaa_samples,
             fullscreen,
         }))
     }
+}
+
+fn build_object_benchmark_world(object_count: usize) -> World {
+    let mut world = World::new();
+    let columns = 100;
+    let spacing = 0.75;
+    for index in 0..object_count {
+        let column = index % columns;
+        let row = index / columns;
+        let position = Vec3::new(
+            column as f32 * spacing - (columns as f32 - 1.0) * spacing * 0.5,
+            0.0,
+            -(row as f32 * spacing + 3.0),
+        );
+        world.add_object(RenderObject::new(
+            Transform::new(position, Quat::IDENTITY, Vec3::splat(0.25)),
+            MESH_CUBE,
+            MATERIAL_DEFAULT,
+        ));
+    }
+    world
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -339,6 +403,7 @@ pub struct App {
     renderer: Option<Renderer>,
     benchmark: Option<BenchmarkConfig>,
     benchmark_capture_started: bool,
+    benchmark_run_index: u32,
     benchmark_finished: bool,
     input: Input,
     camera: Camera,
@@ -370,6 +435,7 @@ impl App {
             renderer: None,
             benchmark: None,
             benchmark_capture_started: false,
+            benchmark_run_index: 0,
             benchmark_finished: false,
             input: Input::new(),
             camera: Camera {
@@ -399,6 +465,10 @@ impl App {
         let mut app = Self::new();
         app.benchmark = Some(benchmark);
         app
+    }
+
+    pub fn benchmark_completed(&self) -> bool {
+        self.benchmark.is_none() || self.benchmark_finished
     }
 
     fn import_asset(
@@ -987,7 +1057,8 @@ impl ApplicationHandler for App {
                 self.benchmark.clone(),
                 self.renderer.as_mut(),
                 self.debug_ui.as_mut(),
-            ) {
+            ) && benchmark.object_count.is_none()
+            {
                 match crate::scene::load_scene(&benchmark.scene_path)
                     .and_then(|loaded| Self::restore_scene(renderer, loaded))
                 {
@@ -1005,6 +1076,9 @@ impl ApplicationHandler for App {
                             if let Some(render_scale) = benchmark.render_scale {
                                 settings.render_scale = render_scale;
                             }
+                            if let Some(shadows_enabled) = benchmark.shadows_enabled {
+                                settings.shadows_enabled = shadows_enabled;
+                            }
                             if let Some(shadow_pcf_samples) = benchmark.shadow_pcf_samples {
                                 settings.shadow_pcf_samples = shadow_pcf_samples;
                             }
@@ -1021,12 +1095,16 @@ impl ApplicationHandler for App {
                                 );
                             }
                         } else if benchmark.render_scale.is_some()
+                            || benchmark.shadows_enabled.is_some()
                             || benchmark.shadow_pcf_samples.is_some()
                             || benchmark.msaa_samples.is_some()
                         {
                             let mut settings = renderer.settings();
                             if let Some(render_scale) = benchmark.render_scale {
                                 settings.render_scale = render_scale;
+                            }
+                            if let Some(shadows_enabled) = benchmark.shadows_enabled {
+                                settings.shadows_enabled = shadows_enabled;
                             }
                             if let Some(shadow_pcf_samples) = benchmark.shadow_pcf_samples {
                                 settings.shadow_pcf_samples = shadow_pcf_samples;
@@ -1057,6 +1135,23 @@ impl ApplicationHandler for App {
                         return;
                     }
                 }
+            } else if let (Some(benchmark), Some(renderer), Some(debug_ui)) = (
+                self.benchmark.clone(),
+                self.renderer.as_mut(),
+                self.debug_ui.as_mut(),
+            ) && let Some(object_count) = benchmark.object_count
+            {
+                self.world = build_object_benchmark_world(object_count);
+                let mut settings = renderer.settings();
+                settings.render_scale = benchmark.render_scale.unwrap_or(1.0);
+                settings.shadows_enabled = benchmark.shadows_enabled.unwrap_or(false);
+                settings.shadow_pcf_samples = benchmark.shadow_pcf_samples.unwrap_or(8);
+                settings.msaa_samples = benchmark.msaa_samples.unwrap_or(1);
+                settings.unlocked_fps = true;
+                renderer.set_settings(settings);
+                let scene_path = PathBuf::from(format!("synthetic://objects/{object_count}"));
+                debug_ui.scene_loaded(scene_path, None);
+                eprintln!("Synthetic benchmark scene loaded: {object_count} objects");
             } else {
                 self.world.add_object(RenderObject::new(
                     Transform::from_translation(Vec3::new(0.0, -1.0, 0.0)),
@@ -1391,8 +1486,13 @@ impl ApplicationHandler for App {
                 }
                 self.input.reset_mouse_delta();
 
+                let world_update_started = Instant::now();
                 if !profile_capture_active {
                     self.world.update(dt);
+                }
+                let world_update_cpu_ms = world_update_started.elapsed().as_secs_f32() * 1000.0;
+                let animation_started = Instant::now();
+                if !profile_capture_active {
                     App::update_animations(
                         &mut self.world,
                         &mut self.animation_models,
@@ -1402,6 +1502,8 @@ impl ApplicationHandler for App {
                         dt,
                     );
                 }
+                let animation_cpu_ms = animation_started.elapsed().as_secs_f32() * 1000.0;
+                renderer.record_update_timings(world_update_cpu_ms, animation_cpu_ms);
 
                 if let Some(debug_ui) = self.debug_ui.as_mut() {
                     if let Some(path) = debug_ui.take_scene_save_request() {
@@ -1525,7 +1627,7 @@ impl ApplicationHandler for App {
                         );
                         self.benchmark_capture_started = true;
                     }
-                    if self.benchmark.is_some()
+                    if let Some(benchmark) = self.benchmark.as_ref()
                         && self.benchmark_capture_started
                         && !self
                             .debug_ui
@@ -1536,11 +1638,29 @@ impl ApplicationHandler for App {
                         && let Some(status) = debug_ui.take_profile_status()
                     {
                         match status {
-                            Ok(path) => println!("{path}"),
-                            Err(error) => eprintln!("{error}"),
+                            Ok(path) => {
+                                self.benchmark_run_index += 1;
+                                println!(
+                                    "Benchmark run {}/{}: {path}",
+                                    self.benchmark_run_index, benchmark.runs
+                                );
+                                if self.benchmark_run_index < benchmark.runs {
+                                    debug_ui.start_profile_capture(
+                                        &self.camera,
+                                        renderer,
+                                        &self.world,
+                                        renderer.current_timings(),
+                                    );
+                                } else {
+                                    self.benchmark_finished = true;
+                                    event_loop.exit();
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("Benchmark capture failed: {error}");
+                                event_loop.exit();
+                            }
                         }
-                        self.benchmark_finished = true;
-                        event_loop.exit();
                     }
                     self.displayed_cpu_frame_time = render_started.elapsed().as_secs_f32() * 1000.0;
                 }
@@ -1565,6 +1685,7 @@ mod tests {
                 "1920x1080".to_owned(),
                 "--benchmark-render-scale".to_owned(),
                 "0.5".to_owned(),
+                "--benchmark-shadows".to_owned(),
                 "--benchmark-shadow-pcf-samples".to_owned(),
                 "4".to_owned(),
                 "--benchmark-msaa-samples".to_owned(),
@@ -1580,9 +1701,12 @@ mod tests {
             config.scene_path,
             PathBuf::from("assets/scenes/test.bse-scene")
         );
+        assert_eq!(config.object_count, None);
+        assert_eq!(config.runs, 1);
         assert_eq!(config.width, 1920);
         assert_eq!(config.height, 1080);
         assert_eq!(config.render_scale, Some(0.5));
+        assert_eq!(config.shadows_enabled, Some(true));
         assert_eq!(config.shadow_pcf_samples, Some(4));
         assert_eq!(config.msaa_samples, Some(4));
         assert!(config.fullscreen);
@@ -1596,7 +1720,10 @@ mod tests {
 
         assert_eq!(config.width, 1280);
         assert_eq!(config.height, 720);
+        assert_eq!(config.object_count, None);
+        assert_eq!(config.runs, 1);
         assert_eq!(config.render_scale, None);
+        assert_eq!(config.shadows_enabled, None);
         assert_eq!(config.shadow_pcf_samples, None);
         assert_eq!(config.msaa_samples, None);
         assert!(!config.fullscreen);
@@ -1613,6 +1740,49 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn benchmark_arguments_accept_fixed_object_counts_and_multiple_runs() {
+        let config = BenchmarkConfig::from_args(
+            [
+                "--benchmark-objects".to_owned(),
+                "10000".to_owned(),
+                "--benchmark-runs".to_owned(),
+                "3".to_owned(),
+            ]
+            .into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(config.object_count, Some(10_000));
+        assert_eq!(config.runs, 3);
+    }
+
+    #[test]
+    fn benchmark_arguments_reject_unsupported_object_counts_and_run_counts() {
+        for arguments in [
+            vec!["--benchmark-objects".to_owned(), "5000".to_owned()],
+            vec!["--benchmark-runs".to_owned(), "0".to_owned()],
+            vec!["--benchmark-runs".to_owned(), "11".to_owned()],
+            vec![
+                "--benchmark-objects".to_owned(),
+                "1000".to_owned(),
+                "--benchmark-scene".to_owned(),
+                "scene.bse-scene".to_owned(),
+            ],
+        ] {
+            assert!(BenchmarkConfig::from_args(arguments.into_iter()).is_err());
+        }
+    }
+
+    #[test]
+    fn synthetic_benchmark_worlds_have_the_requested_population() {
+        for object_count in [1_000, 10_000, 100_000] {
+            let world = build_object_benchmark_world(object_count);
+            assert_eq!(world.objects().len(), object_count);
+        }
     }
 
     #[test]
